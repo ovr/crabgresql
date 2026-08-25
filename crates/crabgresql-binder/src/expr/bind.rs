@@ -291,11 +291,10 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
 /// Bind an `a[i]` subscript: a single integer index on an array, whose result
 /// type is the array's element type.
 ///
-/// The base may be qualified (`t.a[1]`). The parser only folds a dotted path
-/// into a `CompoundIdentifier` when *every* link is an identifier, so a
-/// trailing subscript leaves the whole path here as `root` plus a chain of
-/// `Dot`s — those dots are the column reference, not field access, and resolve
-/// through [`bind_compound`].
+/// The parser only folds a dotted path into a `CompoundIdentifier` when *every*
+/// link is an identifier, so a trailing subscript strands the whole path here as
+/// `root` plus a chain of `Dot`s. Those dots are a qualified column reference,
+/// not field access.
 ///
 /// TODO: support array slices (`a[1:3]`) and chained/multi-dimensional
 /// subscripts, both rejected here with `0A000`.
@@ -309,9 +308,8 @@ fn bind_subscript(
             "multi-dimensional or field subscripting is not supported yet",
         )
     };
-    // Anything but "a path, then exactly one subscript at the end" is a feature
-    // this build does not have: a second subscript needs multi-dimensional
-    // arrays, a dot *after* a subscript needs composite types.
+    // A second subscript would need multi-dimensional arrays, a dot *after* a
+    // subscript composite types — neither of which this build represents.
     let Some((ast::AccessExpr::Subscript(subscript), path)) = access_chain.split_last() else {
         return Err(unsupported());
     };
@@ -326,8 +324,8 @@ fn bind_subscript(
     let base = if path.is_empty() {
         bind_scalar(root, scope)?
     } else {
-        // A dotted path only names a column when it is identifiers all the way
-        // down; `f(x).c[1]` is field access on a composite result instead.
+        // Only an all-identifier path names a column; `f(x).c[1]` reads a field
+        // off a composite result instead, which is the refusal above.
         let mut parts = Vec::with_capacity(path.len() + 1);
         let ast::Expr::Identifier(root_ident) = root else {
             return Err(unsupported());
@@ -1408,9 +1406,9 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         ast::Expr::AtTimeZone { .. } | ast::Expr::AtLocal { .. } => "timezone".into(),
         // An `ARRAY[...]` constructor is named "array" in PG.
         ast::Expr::Array(_) => "array".into(),
-        // `a[i]` subscript takes its base's name (`a[1]` → "a"); a non-name
-        // base falls through to `?column?`. A qualified base is named after its
-        // *last* path element, not the qualifier (`t.a[1]` → "a").
+        // `a[i]` subscript takes its base's name (`a[1]` → "a"), and a
+        // qualified base its *last* path element, not the qualifier
+        // (`t.a[1]` → "a").
         ast::Expr::CompoundFieldAccess { root, access_chain } => {
             last_path_element(access_chain).map_or_else(|| output_name(root), output_name)
         }
@@ -1467,9 +1465,8 @@ fn subquery_output_name(query: &ast::Query) -> String {
     }
 }
 
-/// The last dotted element of a `CompoundFieldAccess` chain — the column a
-/// qualified subscript reads (`t.a[1]` → `a`). `None` for a bare subscript,
-/// whose name comes from the root instead.
+/// The column a qualified subscript reads: `t.a[1]` → `a`. `None` when the
+/// access carries no path, leaving the root as the column.
 fn last_path_element(chain: &[ast::AccessExpr]) -> Option<&ast::Expr> {
     chain.iter().rev().find_map(|link| match link {
         ast::AccessExpr::Dot(expr) => Some(expr),
@@ -1481,11 +1478,10 @@ fn last_path_element(chain: &[ast::AccessExpr]) -> Option<&ast::Expr> {
 /// — PG's strength-2 name that survives an enclosing cast, so `a[1]::text` is
 /// still "a". A cast, value, or function argument has no such name.
 ///
-/// PG keeps the name through a cast for bases this does not: a constructor or
-/// function base is strength 2 there, so `(ARRAY[1,2])[1]::text` is "array" and
-/// `(string_to_array('a,b',','))[1]::text` is "string_to_array", where this
-/// answers "text". That gap is not about subscripts — bare `ARRAY[1,2]::text[]`
-/// has it too — and closing it means modelling name strength, not adding arms.
+/// PG also keeps the name of a constructor or function base, which this does
+/// not: `(ARRAY[1,2])[1]::text` is "array" there and "text" here. The gap is
+/// not about subscripts — bare `ARRAY[1,2]::text[]` has it too — and closing it
+/// means modelling name strength rather than adding arms.
 fn column_name(expr: &ast::Expr) -> Option<String> {
     match expr {
         ast::Expr::Identifier(ident) => Some(normalize_ident(ident)),

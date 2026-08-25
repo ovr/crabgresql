@@ -39,7 +39,7 @@ fn err(sql: &str) -> anyhow::Result<BindError> {
 }
 
 /// The parser hands a qualified subscript over as a root plus a chain of dots,
-/// never as a `CompoundIdentifier`, so `t.a[1]` has to resolve the path itself.
+/// never as a `CompoundIdentifier`, so the binder resolves the path itself.
 #[test]
 fn a_qualified_subscript_binds_like_a_bare_one() -> anyhow::Result<()> {
     for sql in [
@@ -60,8 +60,7 @@ fn a_qualified_subscript_binds_like_a_bare_one() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// PG names the column after the last path element, not the qualifier — and
-/// that name is strength 2, so it survives a cast the way a bare column's does.
+/// The name is PG's strength 2, so a cast does not replace it with the type.
 #[test]
 fn a_qualified_subscript_is_named_after_the_column() -> anyhow::Result<()> {
     for sql in [
@@ -93,8 +92,8 @@ fn a_qualified_subscript_works_outside_the_target_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Only the qualified-column shape comes out of the catch-all; the features
-/// that need types this build does not have stay `0A000`.
+/// Only the qualified-column shape was taken out of the catch-all; the shapes
+/// that need types this build has no representation for stay `0A000`.
 #[test]
 fn the_unsupported_subscript_shapes_keep_their_errors() -> anyhow::Result<()> {
     let slice = err("SELECT arr.a[1:2] FROM arr")?;
