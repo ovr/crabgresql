@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{
     DomainCheck, DomainInfo, EnumInfo, RoutineImpl, RoutineKind as ApiRoutineKind, RoutineSig,
-    TypeCatalog, UserCast, UserType,
+    SqlBody, TypeCatalog, UserCast, UserType,
 };
 use crabgresql_types::PgType;
 
@@ -288,7 +288,14 @@ fn domain_mut<'a>(cat: &'a mut CatalogInner, name: &str) -> Result<&'a mut Domai
 /// or a `LANGUAGE plpgsql` routine carrying its body verbatim.
 pub enum FuncBody {
     Internal(String),
-    Sql(String),
+    Sql {
+        /// The normalized `SELECT <expr>` the binder inlines at call time —
+        /// what the routine *runs*, whichever form it was written in.
+        src: String,
+        /// The SQL-standard body, when the declaration used one. `None` for a
+        /// quoted `AS '<body>'`.
+        sql_body: Option<SqlBody>,
+    },
     PlPgSql(String),
 }
 
@@ -297,16 +304,39 @@ impl FuncBody {
     pub fn lang_oid(&self) -> u32 {
         match self {
             FuncBody::Internal(_) => lang::INTERNAL,
-            FuncBody::Sql(_) => lang::SQL,
+            FuncBody::Sql { .. } => lang::SQL,
             FuncBody::PlPgSql(_) => lang::PLPGSQL,
         }
     }
 
-    /// The body text as written — PG's `pg_proc.prosrc`. For a
-    /// `LANGUAGE internal` routine this is the C symbol name, as in PG.
+    /// The body text as written. For a `LANGUAGE internal` routine this is the
+    /// C symbol name, as in PG; for a SQL one it is the text the binder
+    /// re-parses to inline the call.
     pub fn src(&self) -> &str {
         match self {
-            FuncBody::Internal(s) | FuncBody::Sql(s) | FuncBody::PlPgSql(s) => s,
+            FuncBody::Internal(s) | FuncBody::PlPgSql(s) => s,
+            FuncBody::Sql { src, .. } => src,
+        }
+    }
+
+    /// `pg_proc.prosrc`, which is *not* [`Self::src`] for a standard body:
+    /// PostgreSQL keeps such a body in `prosqlbody` alone and leaves `prosrc`
+    /// an empty string. Verified on 18.4 for both the `RETURN` and the
+    /// `BEGIN ATOMIC` form.
+    pub fn prosrc(&self) -> &str {
+        match self {
+            FuncBody::Sql {
+                sql_body: Some(_), ..
+            } => "",
+            other => other.src(),
+        }
+    }
+
+    /// The standard-form body, for the reader that renders it back.
+    pub fn sql_body(&self) -> Option<&SqlBody> {
+        match self {
+            FuncBody::Sql { sql_body, .. } => sql_body.as_ref(),
+            _ => None,
         }
     }
 }
@@ -501,8 +531,12 @@ pub struct FuncInfo {
     pub volatility: Volatility,
     pub strict: bool,
     pub secdef: bool,
-    /// `pg_proc.prosrc` — the body as written.
+    /// `pg_proc.prosrc` — the body as written, and empty for a routine whose
+    /// body is the standard form below.
     pub src: String,
+    /// `pg_proc.prosqlbody`: the body of a routine declared with a SQL-standard
+    /// `RETURN` / `BEGIN ATOMIC` body.
+    pub sql_body: Option<SqlBody>,
 }
 
 struct CastEntry {
@@ -1453,7 +1487,8 @@ impl GlobalCatalog {
                 volatility: f.volatility,
                 strict: f.strict,
                 secdef: f.secdef,
-                src: f.body.src().to_string(),
+                src: f.body.prosrc().to_string(),
+                sql_body: f.body.sql_body().cloned(),
             })
             .collect();
         out.sort_by_key(|f| f.oid);
@@ -1790,7 +1825,7 @@ impl TypeCatalog for GlobalCatalog {
                 // A `LANGUAGE internal` entry is an I/O symbol used to bootstrap
                 // a type, not something a query can call.
                 let imp = match &f.body {
-                    FuncBody::Sql(body) => RoutineImpl::Sql(body.clone()),
+                    FuncBody::Sql { src, .. } => RoutineImpl::Sql(src.clone()),
                     FuncBody::PlPgSql(_) => RoutineImpl::PlPgSql,
                     FuncBody::Internal(_) => return None,
                 };
@@ -2323,7 +2358,10 @@ mod tests {
                 (TypeRef::Builtin(PgType::Int4), None),
             ],
             TypeRef::Builtin(PgType::Int8),
-            FuncBody::Sql("SELECT $1 + $2".into()),
+            FuncBody::Sql {
+                src: "SELECT $1 + $2".into(),
+                sql_body: None,
+            },
         ))?;
 
         let sigs = cat.routines("add");
@@ -2347,7 +2385,10 @@ mod tests {
             "add",
             vec![(TypeRef::Builtin(PgType::Int4), None)],
             TypeRef::Builtin(PgType::Int4),
-            FuncBody::Sql("SELECT $1".into()),
+            FuncBody::Sql {
+                src: "SELECT $1".into(),
+                sql_body: None,
+            },
         ))?;
         assert_eq!(cat.routines("add").len(), 2);
 
@@ -2360,7 +2401,10 @@ mod tests {
                     (TypeRef::Builtin(PgType::Int4), None),
                 ],
                 TypeRef::Builtin(PgType::Int4),
-                FuncBody::Sql("SELECT 0".into()),
+                FuncBody::Sql {
+                    src: "SELECT 0".into(),
+                    sql_body: None,
+                },
             ))
             .expect_err("a function with an already-declared signature must be rejected");
         assert_eq!(err.code, sqlstate::DUPLICATE_FUNCTION);
@@ -2438,14 +2482,20 @@ mod tests {
             "f",
             vec![(TypeRef::Builtin(PgType::Int4), None)],
             TypeRef::Builtin(PgType::Int4),
-            FuncBody::Sql("SELECT $1".into()),
+            FuncBody::Sql {
+                src: "SELECT $1".into(),
+                sql_body: None,
+            },
         ))?;
 
         let mut with_out = func(
             "f",
             vec![(TypeRef::Builtin(PgType::Int4), None)],
             TypeRef::Builtin(PgType::Int4),
-            FuncBody::Sql("SELECT $1".into()),
+            FuncBody::Sql {
+                src: "SELECT $1".into(),
+                sql_body: None,
+            },
         );
         with_out.args.push(RoutineArg {
             ty: TypeRef::Builtin(PgType::Int4),

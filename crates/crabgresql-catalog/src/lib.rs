@@ -1464,7 +1464,7 @@ impl SystemCatalog {
         (rule.oid == oid).then_some(rule.view_oid)
     }
 
-    /// Everything the `pg_get_function_*` trio renders about the function `oid`:
+    /// Everything the `pg_get_function_*` family renders about the function `oid`:
     /// built-in rows first, then this session's `CREATE FUNCTION` routines,
     /// exactly as [`SystemCatalog::proc_name`]. See [`ProcInfo`] for the two
     /// columns [`StoredProc`] expands on the way out.
@@ -1483,6 +1483,9 @@ impl SystemCatalog {
                     prorettype: row.prorettype,
                     proretset: row.proretset,
                     prokind: row.prokind.chars().next().unwrap_or('f'),
+                    // No built-in row carries a SQL-standard body: every one of
+                    // them is `LANGUAGE internal` or `c`.
+                    prosqlbody: None,
                 }
                 .into(),
             );
@@ -1497,6 +1500,7 @@ impl SystemCatalog {
                 prorettype: routine.ret_type,
                 proretset: routine.retset,
                 prokind: routine.kind,
+                prosqlbody: routine.sql_body,
             }
             .into(),
         )

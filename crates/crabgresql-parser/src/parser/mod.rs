@@ -5564,11 +5564,32 @@ impl<'a> Parser<'a> {
             } else if self.parse_keyword(Keyword::RETURN) {
                 ensure_not_set(&body.function_body, "RETURN")?;
                 body.function_body = Some(CreateFunctionBody::Return(self.parse_expr()?));
+            } else if self.parse_keywords(&[Keyword::BEGIN, Keyword::ATOMIC]) {
+                ensure_not_set(&body.function_body, "BEGIN ATOMIC")?;
+                body.function_body = Some(CreateFunctionBody::BeginAtomic(
+                    self.parse_atomic_block_statements()?,
+                ));
             } else {
                 break;
             }
         }
         Ok(body)
+    }
+
+    /// The statements of a `BEGIN ATOMIC ... END` routine body, each terminated
+    /// by its own semicolon. PostgreSQL's grammar requires the terminator even
+    /// on the last one, and an empty block (`BEGIN ATOMIC END`) is legal.
+    ///
+    /// The trailing `END` is *not* followed by a semicolon here: that one
+    /// terminates the `CREATE FUNCTION` statement itself, so it is left for the
+    /// statement loop to consume.
+    fn parse_atomic_block_statements(&mut self) -> Result<Vec<Statement>, ParserError> {
+        let mut statements = Vec::new();
+        while !self.parse_keyword(Keyword::END) {
+            statements.push(self.parse_statement()?);
+            self.expect_token(&Token::SemiColon)?;
+        }
+        Ok(statements)
     }
 
     fn parse_function_return_type(&mut self) -> Result<FunctionReturnType, ParserError> {
@@ -19391,6 +19412,53 @@ mod tests {
         let dialects = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
         dialects.verified_stmt("DO LANGUAGE plpgsql $$ BEGIN END $$");
         dialects.verified_stmt("DO $$ BEGIN END $$");
+    }
+
+    /// The SQL-standard routine body: a statement block bound at definition
+    /// time. Every statement carries its own terminator, including the last,
+    /// and the `END` closes the block rather than the statement.
+    #[test]
+    fn parse_create_function_takes_an_atomic_block() {
+        let stmt = match parse_pg(
+            "CREATE FUNCTION f(a int, b int) RETURNS int LANGUAGE SQL \
+             BEGIN ATOMIC SELECT a + b; END",
+        )
+        .expect("parse")
+        .pop()
+        {
+            Some(Statement::CreateFunction(stmt)) => stmt,
+            other => panic!("expected CREATE FUNCTION, got {other:?}"),
+        };
+        match stmt.function_body {
+            Some(CreateFunctionBody::BeginAtomic(statements)) => {
+                assert_eq!(statements.len(), 1);
+                assert_eq!(statements[0].to_string(), "SELECT a + b");
+            }
+            other => panic!("expected BeginAtomic, got {other:?}"),
+        }
+    }
+
+    /// A block may hold more than one statement, or none at all — PostgreSQL
+    /// accepts `BEGIN ATOMIC END` for a void-returning routine.
+    #[test]
+    fn parse_create_function_atomic_block_round_trips() {
+        let dialects = TestedDialects::new(vec![Box::new(PostgreSqlDialect {})]);
+        dialects.verified_stmt(
+            "CREATE FUNCTION f(a INT) RETURNS INT LANGUAGE SQL BEGIN ATOMIC SELECT a; END",
+        );
+        dialects.verified_stmt(
+            "CREATE FUNCTION f(a INT) RETURNS INT LANGUAGE SQL \
+             BEGIN ATOMIC SELECT a; SELECT a + 1; END",
+        );
+        dialects.verified_stmt("CREATE FUNCTION f() RETURNS void LANGUAGE SQL BEGIN ATOMIC END");
+    }
+
+    /// A missing statement terminator is a parse error, not a silently short
+    /// block: `SELECT a END` would otherwise read `END` as part of the query.
+    #[test]
+    fn parse_create_function_atomic_block_requires_terminators() {
+        parse_pg("CREATE FUNCTION f(a int) RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT a END")
+            .expect_err("an unterminated statement in an atomic block must be rejected");
     }
 
     fn create_procedure(sql: &str) -> CreateProcedure {

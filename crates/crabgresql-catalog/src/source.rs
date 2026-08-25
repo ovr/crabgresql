@@ -7,7 +7,7 @@
 
 use crabgresql_storage_api::pgstat::{DbStatSnapshot, IndexStatSnapshot, RelStatSnapshot};
 use crabgresql_storage_api::{
-    Column, IndexMetadata, RelStats, RelationFilenodes, RelationMetadata, TableSchema,
+    Column, IndexMetadata, RelStats, RelationFilenodes, RelationMetadata, SqlBody, TableSchema,
 };
 use crabgresql_types::{ByteaOutput, PgType};
 
@@ -346,8 +346,14 @@ pub struct CatalogRoutine {
     pub volatile: char,
     pub strict: bool,
     pub secdef: bool,
-    /// `pg_proc.prosrc` — the body as written.
+    /// `pg_proc.prosrc` — the body as written, and empty for a routine whose
+    /// body is the standard form below: PostgreSQL stores the body in
+    /// `prosqlbody` alone and leaves `prosrc` an empty string.
     pub src: String,
+    /// `pg_proc.prosqlbody`, for a routine written with a SQL-standard body.
+    /// Backs `pg_get_function_sqlbody`; the column itself stays NULL (see
+    /// `crate::catalogs::proc`).
+    pub sql_body: Option<SqlBody>,
 }
 
 /// One role, as `pg_authid` shows it. The five relations derived from that one

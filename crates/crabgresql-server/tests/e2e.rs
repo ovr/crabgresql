@@ -17981,6 +17981,159 @@ async fn a_routine_over_a_user_type_records_its_oid() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pg_get_function_sqlbody` renders the SQL-standard body a routine was
+/// declared with, and answers NULL for one whose body is a quoted string —
+/// which is the test `pg_dump` makes to decide how to re-emit the function.
+///
+/// Every string here is PostgreSQL 18.4's, taken from the same statements.
+#[tokio::test]
+async fn pg_get_function_sqlbody_renders_a_standard_body() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION s_ret(a int) RETURNS int LANGUAGE SQL RETURN a + 1;
+             CREATE FUNCTION s_param(int) RETURNS int LANGUAGE SQL RETURN $1 + 1;
+             CREATE FUNCTION s_const() RETURNS int LANGUAGE SQL RETURN 1;
+             CREATE FUNCTION s_case(a int) RETURNS int LANGUAGE SQL
+               RETURN CASE WHEN a > 0 THEN a ELSE -a END;
+             CREATE FUNCTION s_atomic(a int) RETURNS int LANGUAGE SQL
+               BEGIN ATOMIC SELECT a; END;
+             CREATE FUNCTION s_atomic_expr(a int, b int) RETURNS int LANGUAGE SQL
+               BEGIN ATOMIC SELECT a + b; END;
+             CREATE FUNCTION s_atomic_call(a text) RETURNS text LANGUAGE SQL
+               BEGIN ATOMIC SELECT upper(a); END;
+             CREATE FUNCTION s_sub(a int[]) RETURNS int LANGUAGE SQL RETURN a[1];
+             CREATE FUNCTION s_atomic_sub(a int[]) RETURNS int LANGUAGE SQL
+               BEGIN ATOMIC SELECT a[1]; END;
+             CREATE FUNCTION s_atomic_sub_expr(a int[]) RETURNS int LANGUAGE SQL
+               BEGIN ATOMIC SELECT a[1] + 1; END;
+             CREATE FUNCTION s_quoted(a int) RETURNS int LANGUAGE SQL AS $$ SELECT a + 1 $$;
+             CREATE FUNCTION s_plpgsql(a int) RETURNS int LANGUAGE plpgsql
+               AS $$ BEGIN RETURN a; END $$;
+             CREATE PROCEDURE s_proc(a int) LANGUAGE plpgsql AS $$ BEGIN NULL; END $$",
+        )
+        .await?;
+    let body = async |name: &str| -> anyhow::Result<(Option<String>, String)> {
+        let row = client
+            .query_one(
+                "SELECT pg_get_function_sqlbody(oid), prosrc FROM pg_proc WHERE proname = $1",
+                &[&name],
+            )
+            .await?;
+        Ok((row.get(0), row.get(1)))
+    };
+
+    // The expression is re-rendered, not echoed: `pg_get_expr`'s non-pretty
+    // parenthesisation wraps every operator node and leaves a constant alone.
+    assert_eq!(
+        body("s_ret").await?,
+        (Some("RETURN (a + 1)".to_string()), String::new())
+    );
+    assert_eq!(body("s_param").await?.0.as_deref(), Some("RETURN ($1 + 1)"));
+    assert_eq!(body("s_const").await?.0.as_deref(), Some("RETURN 1"));
+    assert_eq!(
+        body("s_case").await?.0.as_deref(),
+        Some("RETURN CASE WHEN (a > 0) THEN a ELSE (- a) END")
+    );
+
+    // A `BEGIN ATOMIC` block prints its statement indented by one space, and
+    // gives every self-naming target an explicit alias — a bare column
+    // included, which is where this parts company with `pg_get_viewdef`.
+    assert_eq!(
+        body("s_atomic").await?.0.as_deref(),
+        Some("BEGIN ATOMIC\n SELECT a AS a;\nEND")
+    );
+    assert_eq!(
+        body("s_atomic_expr").await?.0.as_deref(),
+        Some("BEGIN ATOMIC\n SELECT (a + b);\nEND")
+    );
+    assert_eq!(
+        body("s_atomic_call").await?.0.as_deref(),
+        Some("BEGIN ATOMIC\n SELECT upper(a) AS upper;\nEND")
+    );
+
+    // A subscripted parameter is parenthesised, where a view's subscripted
+    // *column* is not (`arr[1]`): PostgreSQL wraps the container of a subscript
+    // unless it is a plain `Var`, and a routine's argument is a `Param`. The
+    // alias is the name of what is indexed, not of the subscript.
+    assert_eq!(body("s_sub").await?.0.as_deref(), Some("RETURN (a)[1]"));
+    assert_eq!(
+        body("s_atomic_sub").await?.0.as_deref(),
+        Some("BEGIN ATOMIC\n SELECT (a)[1] AS a;\nEND")
+    );
+    assert_eq!(
+        body("s_atomic_sub_expr").await?.0.as_deref(),
+        Some("BEGIN ATOMIC\n SELECT ((a)[1] + 1);\nEND")
+    );
+    // The body still runs, whichever form declared it.
+    let row = client
+        .query_one("SELECT s_atomic(41), s_atomic_expr(1, 2), s_ret(1)", &[])
+        .await?;
+    assert_eq!(
+        (
+            row.get::<_, i32>(0),
+            row.get::<_, i32>(1),
+            row.get::<_, i32>(2)
+        ),
+        (41, 3, 2)
+    );
+
+    // A quoted body has no standard body at all — and keeps its `prosrc`, which
+    // a standard one leaves empty.
+    assert_eq!(
+        body("s_quoted").await?,
+        (None, " SELECT a + 1 ".to_string())
+    );
+    assert_eq!(body("s_plpgsql").await?.0, None);
+    assert_eq!(body("s_proc").await?.0, None);
+
+    // STRICT, and an OID no function answers to is NULL rather than an error.
+    let row = client
+        .query_one(
+            "SELECT pg_get_function_sqlbody(999999) IS NULL, \
+                    pg_get_function_sqlbody(NULL::oid) IS NULL",
+            &[],
+        )
+        .await?;
+    assert!(row.get::<_, bool>(0), "a missing function is NULL");
+    assert!(row.get::<_, bool>(1), "a NULL argument is NULL");
+    Ok(())
+}
+
+/// Only the single-`SELECT` block this build can execute is accepted; the rest
+/// of the standard body grammar is refused at definition time rather than
+/// stored and failed on first call.
+#[tokio::test]
+async fn atomic_bodies_beyond_one_select_are_refused() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+    let client = connect(spawn_server().await).await;
+    for (sql, why) in [
+        (
+            "CREATE FUNCTION a_multi(a int) RETURNS int LANGUAGE SQL \
+             BEGIN ATOMIC SELECT a; SELECT a + 1; END",
+            "a multi-statement block",
+        ),
+        (
+            "CREATE FUNCTION a_dml(a int) RETURNS int LANGUAGE SQL \
+             BEGIN ATOMIC INSERT INTO nosuch VALUES (1); END",
+            "a non-SELECT statement",
+        ),
+    ] {
+        let e = client
+            .batch_execute(sql)
+            .await
+            .expect_err(&format!("{why} must be rejected"));
+        let e = e.as_db_error().expect("database error");
+        assert_eq!(e.code(), &SqlState::FEATURE_NOT_SUPPORTED, "{why}");
+        assert!(
+            e.message().contains("BEGIN ATOMIC"),
+            "{why}: {}",
+            e.message()
+        );
+    }
+    Ok(())
+}
+
 /// A relation a view reads only from an expression subquery is a dependency:
 /// `pg_depend` records the edge, and `DROP` refuses to strand the view.
 #[tokio::test]

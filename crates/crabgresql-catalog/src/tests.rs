@@ -2651,6 +2651,7 @@ fn wide_fixture() -> SystemCatalog {
             strict: false,
             secdef: false,
             src: "begin return a; end".to_string(),
+            sql_body: None,
         }])
         .cursors(vec![CatalogCursor {
             name: "c".to_string(),
