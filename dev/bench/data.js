@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787684769569,
+  "lastUpdate": 1787684774688,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -58216,6 +58216,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 17831.03517,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6659fab014ab48dfe830df9342334fee592867f0",
+          "message": "feat: Support the information_schema type-shape helpers (#280)\n\nMake the seven `information_schema._pg_*` helpers callable functions:\n`_pg_char_max_length`, `_pg_char_octet_length`, `_pg_numeric_precision`,\n`_pg_numeric_precision_radix`, `_pg_numeric_scale`, `_pg_datetime_precision`\nand `_pg_interval_type`.",
+          "timestamp": "2026-08-25T20:15:35+02:00",
+          "tree_id": "ffb14733b9ab704949466ecb671bd574eaab6c15",
+          "url": "https://github.com/ovr/crabgresql/commit/6659fab014ab48dfe830df9342334fee592867f0"
+        },
+        "date": 1787684774550,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1189.204277,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 17787.011862,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
