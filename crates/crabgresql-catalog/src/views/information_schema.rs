@@ -1,6 +1,6 @@
 //! The SQL-standard `information_schema` views served as relations.
 
-use crabgresql_storage_api::TableSchema;
+use crabgresql_storage_api::{TableSchema, pg_typmod};
 use crabgresql_types::{PgType, Value};
 
 use crate::RelKind;
@@ -17,59 +17,36 @@ struct TypeAttributes {
     character_octets: Value,
     numeric_precision: Value,
     numeric_radix: Value,
+    numeric_scale: Value,
     datetime_precision: Value,
     interval_type: Value,
 }
 
+/// PostgreSQL defines these two views *in terms of* the
+/// `information_schema._pg_*` functions, so both go through the one
+/// implementation those functions use — that is what keeps a view column and a
+/// direct call from drifting apart.
+///
+/// `typmod` arrives **declared** — a `varchar(10)` column stores 10 — while the
+/// shared answers are stated over PostgreSQL's `atttypmod` encoding, where the
+/// same column reads 14. [`pg_typmod`] is the conversion the catalog boundary
+/// already uses, so it is the one applied here.
 fn type_attributes(ty: PgType, typmod: i32) -> TypeAttributes {
-    let (character_length, character_octets) = match ty {
-        PgType::Varchar | PgType::Bpchar if typmod >= 0 => {
-            (Value::Int4(typmod), Value::Int4(typmod * 4))
-        }
-        PgType::Bit | PgType::Varbit if typmod >= 0 => (Value::Int4(typmod), Value::Null),
-        _ => (Value::Null, Value::Null),
-    };
-    let (numeric_precision, numeric_radix) = match ty {
-        PgType::Int2 => (Value::Int4(16), Value::Int4(2)),
-        PgType::Int4 => (Value::Int4(32), Value::Int4(2)),
-        PgType::Int8 => (Value::Int4(64), Value::Int4(2)),
-        PgType::Float4 => (Value::Int4(24), Value::Int4(2)),
-        PgType::Float8 => (Value::Int4(53), Value::Int4(2)),
-        _ => (Value::Null, Value::Null),
-    };
-    // `datetime_precision` is the declared fractional-second precision,
-    // defaulting to the 6 every datetime type keeps. `interval_type` names the
-    // fields the modifier admits, uppercased and with the precision appended
-    // (`DAY TO SECOND(4)`); a full-range `interval(3)` reports NULL there and
-    // carries its precision only in `datetime_precision`.
-    let (datetime_precision, interval_type) = match ty {
-        PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz => {
-            let p = if typmod >= 0 { typmod } else { 6 };
-            (Value::Int4(p), Value::Null)
-        }
-        PgType::Interval => {
-            let (range, precision) = crabgresql_types::interval::unpack_typmod(typmod);
-            let spelling = crabgresql_types::interval::range_name(range).map(|fields| {
-                let mut s = fields.to_ascii_uppercase();
-                if let Some(p) = precision {
-                    s.push_str(&format!("({p})"));
-                }
-                Value::Text(s)
-            });
-            (
-                Value::Int4(precision.map_or(6, i32::from)),
-                spelling.unwrap_or(Value::Null),
-            )
-        }
-        _ => (Value::Null, Value::Null),
-    };
+    use crabgresql_types::info_schema as shape;
+    let typmod = pg_typmod(ty, typmod);
+    // The four answers that strip the varlena header can only overflow on a
+    // modifier no catalog row holds (they need one near `i32`'s ends); a
+    // `Value::Null` is the closest thing a view column has to the error a direct
+    // call would raise.
+    let int = |v: Option<i32>| v.map_or(Value::Null, Value::Int4);
     TypeAttributes {
-        character_length,
-        character_octets,
-        numeric_precision,
-        numeric_radix,
-        datetime_precision,
-        interval_type,
+        character_length: int(shape::char_max_length(ty, typmod).unwrap_or(None)),
+        character_octets: int(shape::char_octet_length(ty, typmod).unwrap_or(None)),
+        numeric_precision: int(shape::numeric_precision(ty, typmod).unwrap_or(None)),
+        numeric_radix: int(shape::numeric_precision_radix(ty, typmod)),
+        numeric_scale: int(shape::numeric_scale(ty, typmod).unwrap_or(None)),
+        datetime_precision: int(shape::datetime_precision(ty, typmod)),
+        interval_type: shape::interval_type(ty, typmod).map_or(Value::Null, Value::Text),
     }
 }
 
@@ -219,8 +196,7 @@ pub(crate) fn domains_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 collation_name,
                 attrs.numeric_precision,
                 attrs.numeric_radix,
-                // numeric_scale
-                Value::Null,
+                attrs.numeric_scale,
                 attrs.datetime_precision,
                 attrs.interval_type,
                 // interval_precision, as in `columns`: always NULL, the value
@@ -472,6 +448,7 @@ pub(crate) fn columns_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                         character_octets,
                         numeric_precision: precision,
                         numeric_radix: radix,
+                        numeric_scale,
                         datetime_precision,
                         interval_type,
                     } = type_attributes(ty, typmod);
@@ -506,8 +483,7 @@ pub(crate) fn columns_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                         character_octets,
                         precision,
                         radix,
-                        // numeric_scale
-                        Value::Null,
+                        numeric_scale,
                         datetime_precision,
                         interval_type,
                         // `interval_precision` is always NULL in PostgreSQL too:

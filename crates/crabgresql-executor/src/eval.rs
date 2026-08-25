@@ -2056,6 +2056,11 @@ mod format_type_tests {
             ft(oid::INTERVAL, Some(402653184)),
             "interval minute to second(0)"
         );
+        // Past the six digits an interval value can hold. PostgreSQL prints the
+        // declared precision unclamped, the same way `time(n)` above does —
+        // 18.4 renders these two verbatim.
+        assert_eq!(ft(oid::INTERVAL, Some(268435465)), "interval second(9)");
+        assert_eq!(ft(oid::INTERVAL, Some(268435527)), "interval second(71)");
         // A `reg*` type spells as its own name.
         assert_eq!(ft(oid::REGCLASS, None), "regclass");
         // An array formats its element type, carrying the modifier, plus `[]`.

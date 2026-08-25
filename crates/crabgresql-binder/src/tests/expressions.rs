@@ -779,6 +779,60 @@ fn privilege_functions_resolve_by_argument_spelling() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The seven `information_schema._pg_*` helpers share one signature, so what
+/// this pins is the mapping from name to question and to return type. The
+/// `information_schema.` qualifier is dropped like any other, so both spellings
+/// reach the same signature.
+#[test]
+fn information_schema_type_attributes_bind() -> anyhow::Result<()> {
+    use crate::InfoSchemaTypeAttr as Attr;
+    for (name, attr, ret) in [
+        ("_pg_char_max_length", Attr::CharMaxLength, PgType::Int4),
+        ("_pg_char_octet_length", Attr::CharOctetLength, PgType::Int4),
+        (
+            "_pg_numeric_precision",
+            Attr::NumericPrecision,
+            PgType::Int4,
+        ),
+        (
+            "_pg_numeric_precision_radix",
+            Attr::NumericPrecisionRadix,
+            PgType::Int4,
+        ),
+        ("_pg_numeric_scale", Attr::NumericScale, PgType::Int4),
+        (
+            "_pg_datetime_precision",
+            Attr::DatetimePrecision,
+            PgType::Int4,
+        ),
+        ("_pg_interval_type", Attr::IntervalType, PgType::Text),
+    ] {
+        for sql in [
+            format!("SELECT information_schema.{name}(1043::oid, 14)"),
+            format!("SELECT {name}(1043::oid, 14)"),
+        ] {
+            let ValuesPlan { rows, .. } = bound_values(&sql)?;
+            let BoundExpr::FuncCall { func, ret: got, .. } = &rows[0][0] else {
+                bail!("expected a function call for `{sql}`");
+            };
+            assert_eq!(*func, crate::ScalarFn::InfoSchemaTypeAttr(attr), "{sql}");
+            assert_eq!(*got, ret, "{sql}");
+        }
+    }
+    // An untyped first argument still reaches the `oid` parameter, which is how
+    // PostgreSQL's own view definitions call these.
+    let ValuesPlan { rows, .. } = bound_values("SELECT _pg_numeric_scale(1700, 327686)")?;
+    let BoundExpr::FuncCall { args, .. } = &rows[0][0] else {
+        bail!("expected a function call");
+    };
+    assert_eq!(args[0].ty(), PgType::Oid);
+    assert_eq!(args[1].ty(), PgType::Int4);
+    // A wrong arity is 42883, not a mis-resolved call.
+    let e = bind_err("SELECT _pg_char_max_length(1043::oid)")?;
+    assert_eq!(e.code, "42883");
+    Ok(())
+}
+
 /// `pg_size_pretty` is the opposite case: two ordinary signatures over numbers,
 /// neither of which an integer or an untyped literal can choose between — which
 /// is exactly the `42725` PostgreSQL raises there.

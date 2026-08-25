@@ -504,8 +504,28 @@ pub fn pack_typmod(range: u16, precision: Option<u8>) -> i32 {
     ((range as i32) << 16) | (p as i32)
 }
 
+/// The precision a modifier *declares*, exactly as written and with no clamp —
+/// what `format_type` and `information_schema` print.
+///
+/// Distinct from the precision [`unpack_typmod`] returns, which is clamped to
+/// the digits a value can actually hold. That clamp is right for truncating a
+/// value and wrong for printing a type name: PostgreSQL renders
+/// `format_type(1186, 268435527)` as `interval second(71)`.
+pub fn declared_precision(typmod: i32) -> Option<i32> {
+    if typmod < 0 {
+        return None;
+    }
+    match (typmod & 0xFFFF) as u16 {
+        NO_PRECISION => None,
+        p => Some(i32::from(p)),
+    }
+}
+
 /// Split a modifier back into its range mask and precision. A negative modifier
 /// (no modifier at all) yields the full range and no precision.
+///
+/// The precision is clamped to what a value can hold; for the number a type
+/// name should print, use [`declared_precision`].
 pub fn unpack_typmod(typmod: i32) -> (u16, Option<u8>) {
     if typmod < 0 {
         return (FULL_RANGE, None);

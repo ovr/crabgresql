@@ -25,7 +25,7 @@ use crabgresql_types::{
 };
 
 use crate::ExecError;
-use crate::eval::{array_elems, uuid_of};
+use crate::eval::{arith_error, array_elems, uuid_of};
 use crate::hash;
 
 const RADIANS_PER_DEGREE: f64 = 0.017_453_292_519_943_295;
@@ -321,6 +321,40 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 sqlstate::INTERNAL_ERROR,
                 "catalog function reached the pure scalar evaluator",
             ));
+        }
+        // The `information_schema` type-shape helpers, which *are* pure: the
+        // only OIDs they answer for are built-ins, so a domain or a
+        // `CREATE TYPE` type falls out as NULL through `PgType::from_oid`
+        // without the catalog being asked. STRICT, so the NULL short-circuit
+        // above has already handled a NULL argument.
+        ScalarFn::InfoSchemaTypeAttr(attr) => {
+            let ty = PgType::from_oid(crabgresql_types::compare::oid_of(&args[0]));
+            let typmod = i4(&args[1]);
+            let Some(ty) = ty else {
+                return Ok(Value::Null);
+            };
+            use crabgresql_binder::InfoSchemaTypeAttr as Attr;
+            use crabgresql_types::info_schema as shape;
+            let int = |v: Option<i32>| Ok(v.map_or(Value::Null, Value::Int4));
+            return match attr {
+                Attr::CharMaxLength => shape::char_max_length(ty, typmod)
+                    .map_err(arith_error)
+                    .and_then(int),
+                Attr::CharOctetLength => shape::char_octet_length(ty, typmod)
+                    .map_err(arith_error)
+                    .and_then(int),
+                Attr::NumericPrecision => shape::numeric_precision(ty, typmod)
+                    .map_err(arith_error)
+                    .and_then(int),
+                Attr::NumericPrecisionRadix => int(shape::numeric_precision_radix(ty, typmod)),
+                Attr::NumericScale => shape::numeric_scale(ty, typmod)
+                    .map_err(arith_error)
+                    .and_then(int),
+                Attr::DatetimePrecision => int(shape::datetime_precision(ty, typmod)),
+                Attr::IntervalType => {
+                    Ok(shape::interval_type(ty, typmod).map_or(Value::Null, Value::Text))
+                }
+            };
         }
         // Likewise the deparse/formatting functions, dispatched by `eval` because
         // they are not uniformly STRICT.

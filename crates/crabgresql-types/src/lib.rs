@@ -21,6 +21,7 @@ pub mod formatting;
 pub mod formatting_num;
 pub mod geo;
 pub mod hex;
+pub mod info_schema;
 pub mod interval;
 pub mod intlit;
 pub mod json;
@@ -1102,13 +1103,13 @@ impl PgType {
             // `interval` is the one type whose modifier is two things at once:
             // the fields it admits, spelled out, then the precision.
             PgType::Interval if m >= 0 => {
-                let (range, precision) = interval::unpack_typmod(m);
+                let (range, _) = interval::unpack_typmod(m);
                 let mut s = name.to_string();
                 if let Some(fields) = interval::range_name(range) {
                     s.push(' ');
                     s.push_str(fields);
                 }
-                if let Some(p) = precision {
+                if let Some(p) = interval::declared_precision(m) {
                     s.push_str(&format!("({p})"));
                 }
                 s

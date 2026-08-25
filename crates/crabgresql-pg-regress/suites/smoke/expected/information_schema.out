@@ -52,3 +52,162 @@ SELECT * FROM tables;
 ERROR:  relation "tables" does not exist
 INSERT INTO information_schema.tables VALUES (1);
 ERROR:  permission denied for table tables
+-- The seven `_pg_*` type-shape helpers the `columns` and `domains` views are
+-- defined over. Called directly with the (typid, atttypmod) pairs PostgreSQL
+-- stores, so no catalog lookup is involved.
+SELECT information_schema._pg_char_max_length(1043, 14) AS varchar10,
+       information_schema._pg_char_max_length(1042, 9) AS char5,
+       information_schema._pg_char_max_length(1043, -1) AS varchar_any,
+       information_schema._pg_char_max_length(1560, 3) AS bit3,
+       information_schema._pg_char_max_length(1562, 8) AS varbit8,
+       information_schema._pg_char_max_length(25, -1) AS text,
+       information_schema._pg_char_max_length(23, -1) AS int4;
+ varchar10 | char5 | varchar_any | bit3 | varbit8 | text | int4 
+-----------+-------+-------------+------+---------+------+------
+        10 |     5 |             |    3 |       8 |      |     
+(1 row)
+
+SELECT information_schema._pg_char_octet_length(1043, 14) AS varchar10,
+       information_schema._pg_char_octet_length(1043, -1) AS varchar_any,
+       information_schema._pg_char_octet_length(25, -1) AS text,
+       information_schema._pg_char_octet_length(1560, 3) AS bit3,
+       information_schema._pg_char_octet_length(23, -1) AS int4;
+ varchar10 | varchar_any |    text    | bit3 | int4 
+-----------+-------------+------------+------+------
+        40 |  1073741824 | 1073741824 |      |     
+(1 row)
+
+SELECT information_schema._pg_numeric_precision(21, -1) AS int2,
+       information_schema._pg_numeric_precision(23, -1) AS int4,
+       information_schema._pg_numeric_precision(20, -1) AS int8,
+       information_schema._pg_numeric_precision(700, -1) AS float4,
+       information_schema._pg_numeric_precision(701, -1) AS float8,
+       information_schema._pg_numeric_precision(1700, 327686) AS numeric_5_2,
+       information_schema._pg_numeric_precision(1700, -1) AS numeric_any,
+       information_schema._pg_numeric_precision(25, -1) AS text;
+ int2 | int4 | int8 | float4 | float8 | numeric_5_2 | numeric_any | text 
+------+------+------+--------+--------+-------------+-------------+------
+   16 |   32 |   64 |     24 |     53 |           5 |             |     
+(1 row)
+
+SELECT information_schema._pg_numeric_precision_radix(23, -1) AS int4,
+       information_schema._pg_numeric_precision_radix(701, -1) AS float8,
+       information_schema._pg_numeric_precision_radix(1700, 327686) AS numeric_5_2,
+       information_schema._pg_numeric_precision_radix(1700, -1) AS numeric_any,
+       information_schema._pg_numeric_precision_radix(25, -1) AS text;
+ int4 | float8 | numeric_5_2 | numeric_any | text 
+------+--------+-------------+-------------+------
+    2 |      2 |          10 |          10 |     
+(1 row)
+
+-- `numeric(4,-2)` stores 264194, and the scale half is read unsigned: 2046.
+SELECT information_schema._pg_numeric_scale(23, -1) AS int4,
+       information_schema._pg_numeric_scale(701, -1) AS float8,
+       information_schema._pg_numeric_scale(1700, 327686) AS numeric_5_2,
+       information_schema._pg_numeric_scale(1700, 264194) AS numeric_4_neg2,
+       information_schema._pg_numeric_scale(1700, -1) AS numeric_any,
+       information_schema._pg_numeric_scale(25, -1) AS text;
+ int4 | float8 | numeric_5_2 | numeric_4_neg2 | numeric_any | text 
+------+--------+-------------+----------------+-------------+------
+    0 |        |           2 |           2046 |             |     
+(1 row)
+
+SELECT information_schema._pg_datetime_precision(1082, -1) AS date,
+       information_schema._pg_datetime_precision(1083, -1) AS time_any,
+       information_schema._pg_datetime_precision(1083, 3) AS time3,
+       information_schema._pg_datetime_precision(1184, -1) AS timestamptz_any,
+       information_schema._pg_datetime_precision(1186, -1) AS interval_any,
+       information_schema._pg_datetime_precision(1186, 470286340) AS day_to_second4,
+       information_schema._pg_datetime_precision(23, -1) AS int4;
+ date | time_any | time3 | timestamptz_any | interval_any | day_to_second4 | int4 
+------+----------+-------+-----------------+--------------+----------------+------
+    0 |        6 |     3 |               6 |            6 |              4 |     
+(1 row)
+
+SELECT information_schema._pg_interval_type(1186, -1) AS interval_any,
+       information_schema._pg_interval_type(1186, 327679) AS year,
+       information_schema._pg_interval_type(1186, 458751) AS year_to_month,
+       information_schema._pg_interval_type(1186, 470351871) AS day_to_second,
+       information_schema._pg_interval_type(1186, 470286340) AS day_to_second4,
+       information_schema._pg_interval_type(1186, 268435459) AS second3,
+       information_schema._pg_interval_type(1114, 3) AS timestamp3;
+ interval_any | year | year_to_month | day_to_second |  day_to_second4  |  second3  | timestamp3 
+--------------+------+---------------+---------------+------------------+-----------+------------
+              | YEAR | YEAR TO MONTH | DAY TO SECOND | DAY TO SECOND(4) | SECOND(3) | 
+(1 row)
+
+-- The precision is printed as declared, past the six digits a value can hold,
+-- and agrees with what _pg_datetime_precision and format_type report.
+SELECT information_schema._pg_interval_type(1186, 268435465) AS second9,
+       information_schema._pg_datetime_precision(1186, 268435465) AS second9_precision,
+       format_type(1186, 268435465) AS second9_format,
+       information_schema._pg_interval_type(1186, 268435527) AS second71;
+  second9  | second9_precision |   second9_format   |  second71  
+-----------+-------------------+--------------------+------------
+ SECOND(9) |                 9 | interval second(9) | SECOND(71)
+(1 row)
+
+-- NULL in either argument is NULL out; an OID no built-in answers to is NULL.
+SELECT information_schema._pg_char_max_length(NULL, 14) AS null_typid,
+       information_schema._pg_char_max_length(1043, NULL) AS null_typmod,
+       information_schema._pg_numeric_precision(999999, -1) AS unknown_typid,
+       information_schema._pg_interval_type(NULL, -1) AS null_interval;
+ null_typid | null_typmod | unknown_typid | null_interval 
+------------+-------------+---------------+---------------
+            |             |               | 
+(1 row)
+
+-- The same answers reached through the views the helpers define.
+CREATE TABLE is_shape (
+  a numeric(5,2),
+  b varchar(10),
+  c char(5),
+  d text,
+  e interval day to second(4),
+  f bit(3),
+  g timestamp(3),
+  h int4,
+  i float8,
+  j date
+);
+SELECT column_name, character_maximum_length, character_octet_length,
+       numeric_precision, numeric_precision_radix, numeric_scale,
+       datetime_precision, interval_type
+  FROM information_schema.columns
+ WHERE table_name = 'is_shape'
+ ORDER BY ordinal_position;
+ column_name | character_maximum_length | character_octet_length | numeric_precision | numeric_precision_radix | numeric_scale | datetime_precision |  interval_type   
+-------------+--------------------------+------------------------+-------------------+-------------------------+---------------+--------------------+------------------
+ a           |                          |                        |                 5 |                      10 |             2 |                    | 
+ b           |                       10 |                     40 |                   |                         |               |                    | 
+ c           |                        5 |                     20 |                   |                         |               |                    | 
+ d           |                          |             1073741824 |                   |                         |               |                    | 
+ e           |                          |                        |                   |                         |               |                  4 | DAY TO SECOND(4)
+ f           |                        3 |                        |                   |                         |               |                    | 
+ g           |                          |                        |                   |                         |               |                  3 | 
+ h           |                          |                        |                32 |                       2 |             0 |                    | 
+ i           |                          |                        |                53 |                       2 |               |                    | 
+ j           |                          |                        |                   |                         |               |                  0 | 
+(10 rows)
+
+DROP TABLE is_shape;
+-- `domains` answers the same seven questions off the domain's own modifier.
+CREATE DOMAIN is_money AS numeric(9,3);
+CREATE DOMAIN is_code AS varchar(8);
+CREATE DOMAIN is_span AS interval hour to minute;
+SELECT domain_name, character_maximum_length, character_octet_length,
+       numeric_precision, numeric_precision_radix, numeric_scale,
+       datetime_precision, interval_type
+  FROM information_schema.domains
+ WHERE domain_schema = 'public' AND domain_name LIKE 'is\_%'
+ ORDER BY domain_name;
+ domain_name | character_maximum_length | character_octet_length | numeric_precision | numeric_precision_radix | numeric_scale | datetime_precision | interval_type  
+-------------+--------------------------+------------------------+-------------------+-------------------------+---------------+--------------------+----------------
+ is_code     |                        8 |                     32 |                   |                         |               |                    | 
+ is_money    |                          |                        |                 9 |                      10 |             3 |                    | 
+ is_span     |                          |                        |                   |                         |               |                  6 | HOUR TO MINUTE
+(3 rows)
+
+DROP DOMAIN is_money;
+DROP DOMAIN is_code;
+DROP DOMAIN is_span;
