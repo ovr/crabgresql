@@ -18007,6 +18007,15 @@ async fn pg_get_function_sqlbody_renders_a_standard_body() -> anyhow::Result<()>
                BEGIN ATOMIC SELECT a[1]; END;
              CREATE FUNCTION s_atomic_sub_expr(a int[]) RETURNS int LANGUAGE SQL
                BEGIN ATOMIC SELECT a[1] + 1; END;
+             CREATE FUNCTION s_sub_index(a int[], i int) RETURNS int LANGUAGE SQL
+               RETURN a[i + 1];
+             CREATE FUNCTION s_cast(a int) RETURNS text LANGUAGE SQL RETURN a::text;
+             CREATE FUNCTION s_atomic_cast(a int) RETURNS text LANGUAGE SQL
+               BEGIN ATOMIC SELECT a::text; END;
+             CREATE FUNCTION s_atomic_cast_expr(a int) RETURNS text LANGUAGE SQL
+               BEGIN ATOMIC SELECT (a + 1)::text; END;
+             CREATE FUNCTION s_atomic_array(a int[]) RETURNS int[] LANGUAGE SQL
+               BEGIN ATOMIC SELECT ARRAY[a[1], 2]; END;
              CREATE FUNCTION s_quoted(a int) RETURNS int LANGUAGE SQL AS $$ SELECT a + 1 $$;
              CREATE FUNCTION s_plpgsql(a int) RETURNS int LANGUAGE plpgsql
                AS $$ BEGIN RETURN a; END $$;
@@ -18064,6 +18073,29 @@ async fn pg_get_function_sqlbody_renders_a_standard_body() -> anyhow::Result<()>
     assert_eq!(
         body("s_atomic_sub_expr").await?.0.as_deref(),
         Some("BEGIN ATOMIC\n SELECT ((a)[1] + 1);\nEND")
+    );
+    // A subscript's index is deparsed, not echoed, so the operator inside it is
+    // wrapped like any other.
+    assert_eq!(
+        body("s_sub_index").await?.0.as_deref(),
+        Some("RETURN (a)[(i + 1)]")
+    );
+
+    // A cast node parenthesises its operand, and an operator inside one doubles
+    // up because it already wraps itself. The alias follows the operand's name,
+    // not the target type — the type only names a target that names nothing.
+    assert_eq!(body("s_cast").await?.0.as_deref(), Some("RETURN (a)::text"));
+    assert_eq!(
+        body("s_atomic_cast").await?.0.as_deref(),
+        Some("BEGIN ATOMIC\n SELECT (a)::text AS a;\nEND")
+    );
+    assert_eq!(
+        body("s_atomic_cast_expr").await?.0.as_deref(),
+        Some("BEGIN ATOMIC\n SELECT ((a + 1))::text AS text;\nEND")
+    );
+    assert_eq!(
+        body("s_atomic_array").await?.0.as_deref(),
+        Some("BEGIN ATOMIC\n SELECT ARRAY[(a)[1], 2] AS \"array\";\nEND")
     );
     // The body still runs, whichever form declared it.
     let row = client

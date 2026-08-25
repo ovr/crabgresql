@@ -39,6 +39,7 @@ pub use datatype::{
 };
 pub use domain::value_shape;
 pub(crate) use domain::{bind_domain, domain_collation, domain_of, undomain_binding, wrap_domain};
+pub(crate) use function_body::simple_body_select;
 pub use function_body::{bind_sql_function_body, inline_params};
 pub use literal::literal_int;
 pub use operators::bool_test_clause;

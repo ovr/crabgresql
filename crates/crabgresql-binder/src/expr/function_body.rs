@@ -54,52 +54,7 @@ pub fn bind_sql_function_body(
             ));
         }
     };
-    let unsupported: Option<&str> = if query.with.is_some() {
-        Some("WITH")
-    } else if query.order_by.is_some() {
-        Some("ORDER BY")
-    } else if query.limit_clause.is_some() {
-        Some("LIMIT/OFFSET")
-    } else if query.fetch.is_some() || !query.locks.is_empty() {
-        Some("this clause")
-    } else {
-        None
-    };
-    if let Some(clause) = unsupported {
-        return Err(BindError::feature_not_supported(format!(
-            "{clause} is not supported in a SQL function body yet"
-        )));
-    }
-    let select = match query.body.as_ref() {
-        ast::SetExpr::Select(select) => select,
-        _ => {
-            return Err(BindError::feature_not_supported(
-                "only a simple SELECT is supported in a SQL function body",
-            ));
-        }
-    };
-    let group_by_empty = matches!(
-        &select.group_by,
-        ast::GroupByExpr::Expressions(exprs, mods) if exprs.is_empty() && mods.is_empty()
-    );
-    let unsupported: Option<&str> = if !select.from.is_empty() {
-        Some("FROM")
-    } else if select.selection.is_some() {
-        Some("WHERE")
-    } else if !group_by_empty {
-        Some("GROUP BY")
-    } else if select.having.is_some() {
-        Some("HAVING")
-    } else if select.distinct.is_some() {
-        Some("DISTINCT")
-    } else {
-        None
-    };
-    if let Some(clause) = unsupported {
-        return Err(BindError::feature_not_supported(format!(
-            "{clause} is not supported in a SQL function body yet"
-        )));
-    }
+    let select = simple_body_select(query).map_err(BindError::feature_not_supported)?;
     let expr = match select.projection.as_slice() {
         [ast::SelectItem::UnnamedExpr(expr)] | [ast::SelectItem::ExprWithAlias { expr, .. }] => {
             expr
@@ -144,6 +99,54 @@ pub fn bind_sql_function_body(
         ));
     }
     Ok(bound)
+}
+
+/// The one query shape a `LANGUAGE SQL` body may have in this build: a
+/// `FROM`-less `SELECT` with nothing but a target list. `Err` is the message
+/// naming what disqualifies it.
+///
+/// Shared with [`crate::ruleutils::sqlbody_statement`], which renders such a
+/// body back, so that the set of shapes accepted and the set rendered cannot
+/// drift apart: a clause admitted here but unknown to the renderer would be
+/// dropped from the printed body without a word, which `pg_dump` would then
+/// restore as a routine that means something else. The list is expected to
+/// shrink as the TODO on [`bind_sql_function_body`] is worked off.
+pub(crate) fn simple_body_select(query: &ast::Query) -> Result<&ast::Select, &'static str> {
+    if query.with.is_some() {
+        return Err("WITH is not supported in a SQL function body yet");
+    }
+    if query.order_by.is_some() {
+        return Err("ORDER BY is not supported in a SQL function body yet");
+    }
+    if query.limit_clause.is_some() {
+        return Err("LIMIT/OFFSET is not supported in a SQL function body yet");
+    }
+    if query.fetch.is_some() || !query.locks.is_empty() {
+        return Err("this clause is not supported in a SQL function body yet");
+    }
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err("only a simple SELECT is supported in a SQL function body");
+    };
+    if !select.from.is_empty() {
+        return Err("FROM is not supported in a SQL function body yet");
+    }
+    if select.selection.is_some() {
+        return Err("WHERE is not supported in a SQL function body yet");
+    }
+    let group_by_empty = matches!(
+        &select.group_by,
+        ast::GroupByExpr::Expressions(exprs, mods) if exprs.is_empty() && mods.is_empty()
+    );
+    if !group_by_empty {
+        return Err("GROUP BY is not supported in a SQL function body yet");
+    }
+    if select.having.is_some() {
+        return Err("HAVING is not supported in a SQL function body yet");
+    }
+    if select.distinct.is_some() {
+        return Err("DISTINCT is not supported in a SQL function body yet");
+    }
+    Ok(select)
 }
 
 /// Coerce a SQL function body's result to the declared return type, in PG's

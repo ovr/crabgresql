@@ -47,8 +47,17 @@ CREATE FUNCTION body_quoted(a int) RETURNS int LANGUAGE SQL AS $$ SELECT a + 1 $
 -- column, and an argument is not one.
 CREATE FUNCTION body_sub(a int[]) RETURNS int LANGUAGE SQL RETURN a[1];
 CREATE FUNCTION body_atomic_sub(a int[]) RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT a[1] + 1; END;
+-- A subscript's index is deparsed like any other expression, so the operator in
+-- it is wrapped; a cast parenthesises its operand, and the alias follows the
+-- operand's own name rather than the target type -- the type names only a
+-- target that names nothing.
+CREATE FUNCTION body_index(a int[], i int) RETURNS int LANGUAGE SQL RETURN a[i + 1];
+CREATE FUNCTION body_cast(a int) RETURNS text LANGUAGE SQL BEGIN ATOMIC SELECT a::text; END;
+CREATE FUNCTION body_cast_expr(a int) RETURNS text LANGUAGE SQL BEGIN ATOMIC SELECT (a + 1)::text; END;
+CREATE FUNCTION body_array(a int[]) RETURNS int[] LANGUAGE SQL BEGIN ATOMIC SELECT ARRAY[a[1], 2]; END;
 SELECT body_ret(1), body_atomic(1, 2), body_atomic_col(41), body_quoted(1);
 SELECT body_sub(ARRAY[7, 8]), body_atomic_sub(ARRAY[7, 8]);
+SELECT body_index(ARRAY[7, 8], 1), body_cast(3), body_cast_expr(3), body_array(ARRAY[7, 8]);
 SELECT proname, prosrc, pg_get_function_sqlbody(oid) AS sqlbody
   FROM pg_proc WHERE proname LIKE 'body\_%' ORDER BY proname;
 -- Clean up (this suite shares one database across tests).

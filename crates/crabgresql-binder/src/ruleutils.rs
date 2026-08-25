@@ -38,6 +38,8 @@ use crabgresql_parser::ast;
 use crabgresql_storage_api::TypeCatalog;
 use crabgresql_types::{FmtCtx, Numeric, PgType, Value, cast, interval, text, timestamptz};
 
+use crate::expr::simple_body_select;
+
 /// `pretty`-printed `pg_get_viewdef`. Returns `None` if `sql` does not re-parse
 /// as a single `SELECT`, in which case the caller reports the view as
 /// unavailable rather than emitting something misleading.
@@ -444,30 +446,76 @@ fn is_bare_column(e: &ast::Expr) -> bool {
 /// name at all, which the two readers spell differently (a view writes
 /// `AS "?column?"`, a SQL body writes no alias).
 fn figure_colname(e: &ast::Expr) -> Option<String> {
+    colname_of(e).0
+}
+
+/// A name a node owns outright, as against one it merely offers. PostgreSQL's
+/// `FigureColname` reports both, and the difference decides who wins when
+/// names nest: a cast keeps its operand's name only if that name is `Owned`.
+///
+/// So `a::text` is `a` and `upper(a)::text` is `upper`, but `(a + 1)::text` is
+/// `text` — and `1::int::text` is `text` rather than `int`, which is the case
+/// a plain "recurse, else use the type" rule gets wrong. Verified on 18.4.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NameStrength {
+    /// No name at all: the `?column?` case.
+    None,
+    /// A name an enclosing cast may override — a cast's own target type, or
+    /// the `case` a `CASE` falls back on.
+    Offered,
+    /// A name taken from the thing itself: a column, a field, a function.
+    Owned,
+}
+
+fn colname_of(e: &ast::Expr) -> (Option<String>, NameStrength) {
+    let owned = |name: Option<String>| match name {
+        Some(name) => (Some(name), NameStrength::Owned),
+        None => (None, NameStrength::None),
+    };
     match e {
-        ast::Expr::Identifier(i) => Some(name_of(i)),
-        ast::Expr::CompoundIdentifier(parts) => parts.last().map(name_of),
-        ast::Expr::Function(f) => f
-            .name
-            .0
-            .last()
-            .and_then(|p| p.as_ident())
-            .map(|i| i.value.to_ascii_lowercase()),
-        ast::Expr::Cast { data_type, .. } => Some(type_name(data_type)),
-        ast::Expr::Nested(inner) => figure_colname(inner),
+        ast::Expr::Identifier(i) => owned(Some(name_of(i))),
+        ast::Expr::CompoundIdentifier(parts) => owned(parts.last().map(name_of)),
+        ast::Expr::Function(f) => owned(
+            f.name
+                .0
+                .last()
+                .and_then(|p| p.as_ident())
+                .map(|i| i.value.to_ascii_lowercase()),
+        ),
+        // The operand names the cast unless it has nothing better to offer than
+        // another type name.
+        ast::Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => match colname_of(inner) {
+            (name, NameStrength::Owned) => (name, NameStrength::Owned),
+            _ => (Some(type_name(data_type)), NameStrength::Offered),
+        },
+        // A `CASE` is named by its `ELSE` arm — `CASE WHEN … ELSE a END` is
+        // `a` — and falls back on `case`, which an enclosing cast overrides.
+        ast::Expr::Case { else_result, .. } => match else_result.as_deref().map(colname_of) {
+            Some((name, NameStrength::Owned)) => (name, NameStrength::Owned),
+            _ => (Some("case".to_string()), NameStrength::Offered),
+        },
+        // A constructor is named after what it constructs, strongly enough that
+        // a cast keeps it: `ARRAY[1, 2]::int[]` is still `array`.
+        ast::Expr::Array(_) => owned(Some("array".to_string())),
+        ast::Expr::Tuple(_) => owned(Some("row".to_string())),
+        ast::Expr::Nested(inner) => colname_of(inner),
         // A field access names itself after the field (`(p).x` is `x`); a
         // subscript keeps the name of what it indexes (`a[1]` is `a`), which is
         // why the chain is walked from the end rather than the root.
         ast::Expr::CompoundFieldAccess { root, access_chain } => {
             match access_chain.iter().rev().find_map(|a| match a {
-                ast::AccessExpr::Dot(e) => Some(figure_colname(e)),
+                ast::AccessExpr::Dot(e) => Some(colname_of(e)),
                 ast::AccessExpr::Subscript(_) => None,
             }) {
-                Some(name) => name,
-                None => figure_colname(root),
+                Some(named) => named,
+                None => colname_of(root),
             }
         }
-        _ => None,
+        _ => (None, NameStrength::None),
     }
 }
 
@@ -494,15 +542,19 @@ fn name_of(i: &ast::Ident) -> String {
 ///
 /// `None` for anything a `LANGUAGE SQL` body in this build cannot be — several
 /// statements, a `FROM` clause, a set operation — leaving the caller to echo
-/// the text as stored rather than print a body that means something else.
+/// the text as stored rather than print a body that means something else. The
+/// shape is decided by [`simple_body_select`], the same check `CREATE FUNCTION`
+/// validates against, so a clause this renderer does not know cannot reach it.
+///
+/// **Where a `CASE` target diverges from PostgreSQL:** PG breaks one across
+/// lines here and in a view (`SELECT\n         CASE\n             WHEN …`) and
+/// materialises the `ELSE NULL::<type>` the analyser inserted. Both come of
+/// deparsing a typed tree rather than text — the alias it carries (`AS "case"`)
+/// does match. The same gap shows in [`view_definition`]; a `RETURN CASE …` is
+/// on one line in PG too and differs only by that `ELSE`.
 pub fn sqlbody_statement(sql: &str, fmt: &FmtCtx) -> Option<String> {
     let query = parse_query(sql)?;
-    let ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
-    if !select.from.is_empty() || select.selection.is_some() || query.order_by.is_some() {
-        return None;
-    }
+    let select = simple_body_select(&query).ok()?;
     let cx = Cx {
         pretty: false,
         calls: None,
@@ -688,7 +740,7 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
                 true => format!("({})", expr(root, cx, 0)),
                 false => expr(root, cx, u8::MAX),
             };
-            let chain: String = access_chain.iter().map(|a| a.to_string()).collect();
+            let chain: String = access_chain.iter().map(|a| access(a, cx)).collect();
             format!("{root}{chain}")
         }
         ast::Expr::Cast {
@@ -704,7 +756,20 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
                 // already-deparsed expression non-idempotent.
                 match literal_of(inner) {
                     Some(v) => format!("{}::{}", value_body(v), type_name(data_type)),
-                    None => format!("{}::{}", expr(inner, cx, u8::MAX), type_name(data_type)),
+                    // Everything else is a cast *node*, and PostgreSQL wraps
+                    // its operand whenever it is not pretty-printing:
+                    // `(a)::text`, `(now())::date`, and `((a + 1))::text`
+                    // doubled up because an operator node already wraps itself
+                    // there. Asking to be pretty drops both layers, which is
+                    // what psql's `\d` shows.
+                    None => {
+                        let operand = expr(inner, cx, u8::MAX);
+                        let ty = type_name(data_type);
+                        match cx.pretty {
+                            true => format!("{operand}::{ty}"),
+                            false => format!("({operand})::{ty}"),
+                        }
+                    }
                 }
             }),
         // A bare string literal in an analysed tree is never untyped: it carries
@@ -740,6 +805,16 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
             out.push_str(" END");
             out
         }
+        // Walked rather than echoed so the rules that apply to an element apply
+        // inside a constructor too — `ARRAY[(a)[1], 2]` in a routine body.
+        ast::Expr::Array(arr) => {
+            let elems: Vec<String> = arr.elem.iter().map(|e| top_expr(e, cx)).collect();
+            let keyword = match arr.named {
+                true => "ARRAY",
+                false => "",
+            };
+            format!("{keyword}[{}]", elems.join(", "))
+        }
         other => other.to_string(),
     };
     // `AT TIME ZONE` / `AT LOCAL` are the one construct PG parenthesises even
@@ -751,6 +826,39 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
         prec != u8::MAX
     };
     if wrap { format!("({body})") } else { body }
+}
+
+/// One link of a subscript/field chain. The index is an expression like any
+/// other and is deparsed as one — `arr[(i + 1)]`, not the `arr[i + 1]` echoing
+/// the parser's own `Display` would give, which would also miss a qualifier
+/// dropped by [`Cx::unqualify`] and a `timestamptz` constant's session zone.
+///
+/// A field name is not a column reference, so it is spelled as an identifier
+/// rather than walked: `VALUE` and the CHECK qualifier have no business there.
+fn access(a: &ast::AccessExpr, cx: Cx) -> String {
+    match a {
+        ast::AccessExpr::Dot(ast::Expr::Identifier(field)) => format!(".{}", ident(field)),
+        ast::AccessExpr::Dot(other) => format!(".{other}"),
+        ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+            format!("[{}]", top_expr(index, cx))
+        }
+        ast::AccessExpr::Subscript(ast::Subscript::Slice {
+            lower_bound,
+            upper_bound,
+            stride,
+        }) => {
+            let bound =
+                |e: &Option<ast::Expr>| e.as_ref().map(|e| top_expr(e, cx)).unwrap_or_default();
+            let mut out = format!("[{}:{}", bound(lower_bound), bound(upper_bound));
+            // PostgreSQL has no stride; it can only come from another dialect's
+            // text, so it is echoed rather than given a rendering of its own.
+            if let Some(stride) = stride {
+                out.push_str(&format!(":{}", top_expr(stride, cx)));
+            }
+            out.push(']');
+            out
+        }
+    }
 }
 
 fn function(f: &ast::Function, cx: Cx) -> String {
@@ -1022,13 +1130,86 @@ mod tests {
     }
 
     /// A body this build cannot execute is reported as unrenderable rather than
-    /// half-printed: the caller echoes the stored text instead.
+    /// half-printed: the caller echoes the stored text instead. The shape comes
+    /// from [`simple_body_select`], so a clause that would be dropped silently
+    /// — `LIMIT` here — declines along with the rest.
     #[test]
     fn declines_a_sql_body_it_cannot_render() {
         let fmt = FmtCtx::utc_default();
         assert_eq!(sqlbody_statement("SELECT a FROM t", &fmt), None);
         assert_eq!(sqlbody_statement("SELECT 1 UNION SELECT 2", &fmt), None);
         assert_eq!(sqlbody_statement("INSERT INTO t VALUES (1)", &fmt), None);
+        assert_eq!(sqlbody_statement("SELECT 1 LIMIT 1", &fmt), None);
+        assert_eq!(sqlbody_statement("SELECT DISTINCT 1", &fmt), None);
+        assert_eq!(
+            sqlbody_statement("WITH c AS (SELECT 1) SELECT 1", &fmt),
+            None
+        );
+    }
+
+    /// PostgreSQL's `FigureColname`, which decides the `AS` a target carries.
+    /// The cases that need its *strength* rule are the nested ones: a cast
+    /// keeps a name its operand owns and overrides one merely offered, so
+    /// `a::text` is `a` while `1::int::text` is `text` rather than `int`.
+    /// Every string pinned against 18.4.
+    #[test]
+    fn names_a_target_the_way_figure_colname_does() {
+        let name = |sql: &str| {
+            let e = parse_expression(sql).expect("parsed");
+            figure_colname(&e)
+        };
+        assert_eq!(name("a::text").as_deref(), Some("a"));
+        assert_eq!(name("upper(a)::text").as_deref(), Some("upper"));
+        assert_eq!(name("(a + 1)::text").as_deref(), Some("text"));
+        assert_eq!(name("1::int::text").as_deref(), Some("text"));
+        assert_eq!(name("arr[i + 1]").as_deref(), Some("arr"));
+        assert_eq!(name("(arr[1])::text").as_deref(), Some("arr"));
+        // A `CASE` is named by its `ELSE` arm, and falls back on `case` — which
+        // an enclosing cast is then free to override.
+        assert_eq!(name("CASE WHEN a > 0 THEN a END").as_deref(), Some("case"));
+        assert_eq!(
+            name("CASE WHEN true THEN 1 ELSE a END").as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            name("(CASE WHEN a > 0 THEN a END)::text").as_deref(),
+            Some("text")
+        );
+        assert_eq!(name("ARRAY[1, 2]").as_deref(), Some("array"));
+        assert_eq!(name("ARRAY[1, 2]::int[]").as_deref(), Some("array"));
+        assert_eq!(name("a + b"), None);
+    }
+
+    /// A cast node's operand is parenthesised when not pretty-printing, and an
+    /// operator node inside one doubles up because it already wraps itself. A
+    /// *literal* keeps its bare label — it is a constant carrying its own type,
+    /// not a coercion. Pinned against 18.4's `pg_get_expr`.
+    #[test]
+    fn parenthesises_a_cast_operand() {
+        let fmt = FmtCtx::utc_default();
+        let plain = |sql: &str| stored_expr(sql, false, &fmt).expect("rendered");
+        let pretty = |sql: &str| stored_expr(sql, true, &fmt).expect("rendered");
+        assert_eq!(plain("a::text"), "(a)::text");
+        assert_eq!(plain("(a + 1)::text"), "((a + 1))::text");
+        assert_eq!(plain("upper(a::text)"), "upper((a)::text)");
+        assert_eq!(plain("arr[1]::text"), "(arr[1])::text");
+        assert_eq!(plain("'x'::text"), "'x'::text");
+        assert_eq!(plain("NULL::text"), "NULL::text");
+        // Asking to be pretty drops the wrapping, which is the form psql's `\d`
+        // shows.
+        assert_eq!(pretty("a::text"), "a::text");
+        assert_eq!(pretty("(a + 1)::text"), "(a + 1)::text");
+    }
+
+    /// A subscript's index is an expression like any other, so it is deparsed
+    /// rather than echoed: `arr[(i + 1)]`, as 18.4 prints it.
+    #[test]
+    fn deparses_a_subscript_index() {
+        let fmt = FmtCtx::utc_default();
+        let plain = |sql: &str| stored_expr(sql, false, &fmt).expect("rendered");
+        assert_eq!(plain("arr[i + 1]"), "arr[(i + 1)]");
+        assert_eq!(plain("arr[1]"), "arr[1]");
+        assert_eq!(plain("ARRAY[arr[1], 2]"), "ARRAY[arr[1], 2]");
     }
 
     /// A `CASE` is deparsed branch by branch, so the operators inside one are
