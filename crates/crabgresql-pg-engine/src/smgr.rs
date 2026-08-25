@@ -13,6 +13,13 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::page::{self, BLCKSZ, Page};
 
+/// Directory under the data directory holding one file per heap/index relation.
+///
+/// Public through the crate root because the data directory's skeleton is
+/// created in one place now (`crabgresql_server::initdb`), and a second copy of
+/// this string there would drift from this one unnoticed.
+pub const BASE_SUBDIR: &str = "base";
+
 /// A relation's physical file identity (PostgreSQL's `relfilenode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RelFileNode(pub u32);
@@ -68,7 +75,7 @@ pub struct StorageManager {
 
 impl StorageManager {
     pub fn open(data_dir: &std::path::Path) -> std::io::Result<StorageManager> {
-        let base = data_dir.join("base");
+        let base = data_dir.join(BASE_SUBDIR);
         std::fs::create_dir_all(&base)?;
         Ok(StorageManager {
             base,

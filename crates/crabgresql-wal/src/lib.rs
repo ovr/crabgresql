@@ -35,7 +35,9 @@ mod segment;
 mod wal;
 
 pub use ckpt::{CHECKPOINT_ONLINE, CHECKPOINT_SHUTDOWN, Checkpoint};
-pub use control::{ControlFile, control_path, read_control, write_control};
+pub use control::{
+    CONTROL_SUBDIR, ControlFile, control_is_foreign, control_path, read_control, write_control,
+};
 pub use fsutil::sync_dir;
 pub use record::{Lsn, LsnRange, WalError, WalRecord};
 pub use recovery::{RecoveryResult, recover};

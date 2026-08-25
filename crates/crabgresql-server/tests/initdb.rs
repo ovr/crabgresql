@@ -1,0 +1,375 @@
+//! Creating a cluster: what `crabgresql initdb` leaves on disk, and which
+//! directories the server agrees to open.
+//!
+//! The cases that matter here are the refusals. A data directory is identified
+//! by one file, and every mistake this module exists to catch — a typo in `-D`,
+//! a cluster from another version, a half-created one — is a directory that
+//! *almost* looks right.
+
+use std::fs;
+use std::path::Path;
+
+use crabgresql_server::initdb::{self, InitOptions, Outcome, PG_VERSION_FILE};
+
+/// Everything a cluster is made of, checked by opening it rather than by
+/// listing what we just wrote.
+fn assert_is_cluster(dir: &Path) {
+    for sub in ["base", "global", "pg_wal", "pg_xact", "stats", "parquet"] {
+        assert!(
+            dir.join(sub).is_dir(),
+            "{sub} should exist under the cluster"
+        );
+    }
+    let version = fs::read_to_string(dir.join(PG_VERSION_FILE)).expect("a version stamp");
+    assert_eq!(
+        version,
+        format!("{}\n", crabgresql_types::version::MAJOR_VERSION),
+        "the stamp carries this server's major version, newline included"
+    );
+    crabgresql_wal::read_control(dir)
+        .expect("the control file should be readable")
+        .expect("initdb publishes a control file");
+}
+
+#[cfg(unix)]
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+}
+
+#[test]
+fn initdb_creates_a_cluster_the_engine_can_open() -> anyhow::Result<()> {
+    let parent = tempfile::tempdir()?;
+    // A directory that does not exist yet: `initdb -D ./pgdata` on a fresh host
+    // is the common case, and it must not require a `mkdir` first.
+    let dir = parent.path().join("pgdata");
+
+    assert_eq!(
+        initdb::init_data_dir(&dir, &InitOptions::default())?,
+        Outcome::Created
+    );
+    assert_is_cluster(&dir);
+
+    // The proof that the skeleton is the *right* skeleton: the engine opens it,
+    // runs recovery over an empty log, and checkpoints.
+    let (engine, txnmgr) = crabgresql_server::open_pg_engine(&dir)?;
+    drop((engine, txnmgr));
+
+    Ok(())
+}
+
+/// Everything under a data directory is readable as plain bytes, so the
+/// directory's mode is the only thing between a local account and every table.
+#[cfg(unix)]
+#[test]
+fn a_cluster_is_owner_only() -> anyhow::Result<()> {
+    let parent = tempfile::tempdir()?;
+    let dir = parent.path().join("pgdata");
+    initdb::init_data_dir(&dir, &InitOptions::default())?;
+
+    assert_eq!(mode(&dir), 0o700, "the data directory");
+    for sub in ["base", "global", "pg_wal", "pg_xact", "stats", "parquet"] {
+        assert_eq!(mode(&dir.join(sub)), 0o700, "{sub}");
+    }
+    assert_eq!(mode(&dir.join(PG_VERSION_FILE)), 0o600, "the version stamp");
+
+    Ok(())
+}
+
+/// An existing directory handed over by a container runtime or an installer
+/// arrives world-readable; initializing it has to correct that, or the
+/// restriction is advisory.
+#[cfg(unix)]
+#[test]
+fn an_existing_empty_directory_has_its_mode_corrected() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir()?;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))?;
+
+    assert_eq!(
+        initdb::init_data_dir(dir.path(), &InitOptions::default())?,
+        Outcome::Created
+    );
+    assert_eq!(mode(dir.path()), 0o700);
+
+    Ok(())
+}
+
+/// `lost+found` is the mount point's, not the cluster's — without this
+/// exception no ext4 mount could be a data directory.
+#[test]
+fn a_directory_holding_only_lost_and_found_is_empty() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::create_dir(dir.path().join("lost+found"))?;
+
+    assert_eq!(
+        initdb::init_data_dir(dir.path(), &InitOptions::default())?,
+        Outcome::Created
+    );
+    assert_is_cluster(dir.path());
+
+    Ok(())
+}
+
+#[test]
+fn initdb_refuses_a_directory_that_already_holds_a_cluster() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    initdb::init_data_dir(dir.path(), &InitOptions::default())?;
+    let control_before = fs::read(crabgresql_wal::control_path(dir.path()))?;
+
+    let error = initdb::init_data_dir(dir.path(), &InitOptions::default())
+        .expect_err("a second initdb must not silently succeed");
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(
+        error.to_string().contains("already contains"),
+        "unhelpful: {error}"
+    );
+    assert_eq!(
+        fs::read(crabgresql_wal::control_path(dir.path()))?,
+        control_before,
+        "the refused call must not have written anything"
+    );
+
+    // The server, unlike initdb, expects to find a cluster there.
+    assert_eq!(
+        initdb::ensure_initialized(dir.path())?,
+        Outcome::AlreadyInitialized
+    );
+
+    Ok(())
+}
+
+/// The typo case: `-D ~/src` must be an error, not a new cluster scattered
+/// through somebody's source tree.
+#[test]
+fn a_non_empty_foreign_directory_is_refused() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(dir.path().join("notes.txt"), "not a database")?;
+
+    for result in [
+        initdb::init_data_dir(dir.path(), &InitOptions::default()),
+        initdb::ensure_initialized(dir.path()),
+    ] {
+        let error = result.expect_err("a foreign directory must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("is not a crabgresql data directory"),
+            "unhelpful: {error}"
+        );
+    }
+    assert!(
+        !dir.path().join("base").exists(),
+        "a refused directory must be left alone"
+    );
+
+    Ok(())
+}
+
+/// Lay out what a PostgreSQL data directory looks like from here: the same
+/// `PG_VERSION` this build stamps (PG 19 is the parity target), and a control
+/// file we did not write. `stamped` says whether the version file is there at
+/// all — a directory whose stamp was removed must not pass for one of our own
+/// pre-stamp clusters either.
+fn fake_postgres_cluster(dir: &Path, stamped: bool) -> anyhow::Result<Vec<u8>> {
+    fs::create_dir_all(dir.join("global"))?;
+    fs::create_dir_all(dir.join("base/1"))?;
+    // PostgreSQL's `pg_control` opens with a 64-bit system identifier, so its
+    // first bytes are effectively random — never our magic.
+    let control: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+    fs::write(crabgresql_wal::control_path(dir), &control)?;
+    if stamped {
+        fs::write(
+            dir.join(PG_VERSION_FILE),
+            format!("{}\n", crabgresql_types::version::MAJOR_VERSION),
+        )?;
+    }
+    Ok(control)
+}
+
+/// The refusal that protects somebody *else's* data. A PostgreSQL 19 cluster
+/// carries the same stamp we do, so without the control file's magic we would
+/// open one — and the startup checkpoint would overwrite its `pg_control`.
+#[test]
+fn a_postgresql_data_directory_is_refused_intact() -> anyhow::Result<()> {
+    for stamped in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let control = fake_postgres_cluster(dir.path(), stamped)?;
+
+        for result in [
+            initdb::init_data_dir(dir.path(), &InitOptions::default()),
+            initdb::ensure_initialized(dir.path()),
+        ] {
+            let error = result.expect_err("somebody else's cluster must be refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("looks like a PostgreSQL data directory"),
+                "unhelpful (stamped: {stamped}): {error}"
+            );
+        }
+
+        assert_eq!(
+            fs::read(crabgresql_wal::control_path(dir.path()))?,
+            control,
+            "the refused directory's control file must be untouched"
+        );
+        assert_eq!(
+            dir.path().join(PG_VERSION_FILE).exists(),
+            stamped,
+            "a refusal must not stamp the directory either"
+        );
+    }
+
+    Ok(())
+}
+
+/// The other side of that check: a control file of *ours* that no longer
+/// verifies still belongs to us. `read_control` folds it into "absent" and
+/// recovery replays the whole stream — refusing instead would turn a
+/// recoverable cluster into an unopenable one.
+#[test]
+fn our_own_corrupt_control_file_is_still_ours() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    initdb::init_data_dir(dir.path(), &InitOptions::default())?;
+
+    let path = crabgresql_wal::control_path(dir.path());
+    let mut bytes = fs::read(&path)?;
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF; // breaks the CRC, keeps the magic
+    fs::write(&path, &bytes)?;
+
+    assert_eq!(
+        initdb::ensure_initialized(dir.path())?,
+        Outcome::AlreadyInitialized
+    );
+    let (engine, txnmgr) = crabgresql_server::open_pg_engine(dir.path())?;
+    drop((engine, txnmgr));
+
+    Ok(())
+}
+
+/// `-D /srv/db/pgdata` on a host where `/srv/db` does not exist yet: the
+/// directory a person types is created with its parents, as PostgreSQL's
+/// `initdb` does.
+#[test]
+fn a_data_directory_is_created_with_its_parents() -> anyhow::Result<()> {
+    let parent = tempfile::tempdir()?;
+    let dir = parent.path().join("srv/db/pgdata");
+
+    assert_eq!(
+        initdb::init_data_dir(&dir, &InitOptions::default())?,
+        Outcome::Created
+    );
+    assert_is_cluster(&dir);
+
+    Ok(())
+}
+
+/// And when it cannot be created, the complaint has to name the path — the
+/// bare `NotFound` a caller gets from `std::fs` names nothing at all.
+#[test]
+fn a_path_that_cannot_be_created_names_itself() -> anyhow::Result<()> {
+    let parent = tempfile::tempdir()?;
+    fs::write(parent.path().join("in-the-way"), "occupied")?;
+    let dir = parent.path().join("in-the-way/pgdata");
+
+    let error = initdb::init_data_dir(&dir, &InitOptions::default())
+        .expect_err("a path under a file cannot be created");
+    assert!(
+        error.to_string().contains(&dir.display().to_string()),
+        "the complaint should name the path: {error}"
+    );
+
+    Ok(())
+}
+
+/// Data directories written before `PG_VERSION` existed hold real data. They
+/// are stamped and opened, not refused — the on-disk format is a compatibility
+/// boundary.
+#[test]
+fn a_cluster_from_before_the_version_stamp_is_adopted() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Exactly what a pre-initdb build leaves behind: whatever the engine
+    // happened to create, and no stamp.
+    let (engine, txnmgr) = crabgresql_server::open_pg_engine(dir.path())?;
+    drop((engine, txnmgr));
+    assert!(!dir.path().join(PG_VERSION_FILE).exists());
+
+    assert_eq!(
+        initdb::ensure_initialized(dir.path())?,
+        Outcome::AdoptedLegacy
+    );
+    assert_is_cluster(dir.path());
+    // Stamped once: the next start is an ordinary one.
+    assert_eq!(
+        initdb::ensure_initialized(dir.path())?,
+        Outcome::AlreadyInitialized
+    );
+
+    let (engine, txnmgr) = crabgresql_server::open_pg_engine(dir.path())?;
+    drop((engine, txnmgr));
+
+    Ok(())
+}
+
+/// Adoption has to tighten the directory too. A cluster created before this
+/// module existed was never restricted to its owner, and leaving it that way
+/// would make `0700` a thing new clusters happen to get rather than a property
+/// of a crabgresql cluster.
+#[cfg(unix)]
+#[test]
+fn an_adopted_cluster_is_restricted_too() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir()?;
+    let (engine, txnmgr) = crabgresql_server::open_pg_engine(dir.path())?;
+    drop((engine, txnmgr));
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))?;
+
+    assert_eq!(
+        initdb::ensure_initialized(dir.path())?,
+        Outcome::AdoptedLegacy
+    );
+    assert_eq!(mode(dir.path()), 0o700);
+
+    Ok(())
+}
+
+/// A cluster of another major version may decode or may not; guessing wrong
+/// corrupts it, so the stamp is checked before anything is opened.
+#[test]
+fn a_cluster_from_another_version_is_refused() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    initdb::init_data_dir(dir.path(), &InitOptions::default())?;
+    fs::write(dir.path().join(PG_VERSION_FILE), "12\n")?;
+
+    let error = initdb::ensure_initialized(dir.path())
+        .expect_err("an incompatible cluster must not be opened");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    let message = error.to_string();
+    assert!(
+        message.contains("initialized by crabgresql 12")
+            && message.contains(crabgresql_types::version::MAJOR_VERSION),
+        "the complaint should name both versions: {message}"
+    );
+
+    Ok(())
+}
+
+/// `--no-sync` trades durability for speed; it must not trade away any of the
+/// directory's contents.
+#[test]
+fn no_sync_writes_the_same_cluster() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    initdb::init_data_dir(dir.path(), &InitOptions { sync: false })?;
+    assert_is_cluster(dir.path());
+
+    let (engine, txnmgr) = crabgresql_server::open_pg_engine(dir.path())?;
+    drop((engine, txnmgr));
+
+    Ok(())
+}

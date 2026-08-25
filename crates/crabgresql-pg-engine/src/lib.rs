@@ -73,7 +73,12 @@ use crate::smgr::StorageManager;
 
 pub use crate::bufpool::{BufferPoolPolicy, PoolStats};
 pub use crate::flush::{BufferFlushPolicy, BufferedRelation};
-pub use crate::smgr::RelFileNode;
+pub use crate::relstats::STATS_SUBDIR;
+pub use crate::smgr::{BASE_SUBDIR, RelFileNode};
+
+/// Directory under the data directory holding one subdirectory per Parquet
+/// relation. Public for the same reason as [`BASE_SUBDIR`].
+pub const PARQUET_SUBDIR: &str = "parquet";
 
 /// A TRUNCATE swap replayed from the WAL during recovery, awaiting a verdict:
 /// its swap is applied to the catalog only if `xid` committed. Collected by the
@@ -954,7 +959,7 @@ impl PgEngine {
                  are then restored from the log), then start again",
                 relation.name,
                 relation.error,
-                self.data_dir.join("parquet").display(),
+                self.data_dir.join(PARQUET_SUBDIR).display(),
                 relation.rel,
             )));
         }
@@ -1642,7 +1647,7 @@ impl PgEngine {
     pub fn gc_orphan_parquet_dirs(&self) -> std::io::Result<()> {
         let live: std::collections::HashSet<u32> =
             self.catalog.live_relfilenodes().into_iter().collect();
-        let root = self.data_dir.join("parquet");
+        let root = self.data_dir.join(PARQUET_SUBDIR);
         let entries = match std::fs::read_dir(&root) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1686,7 +1691,7 @@ impl PgEngine {
                 self.stats_store.unlink(RelFileNode(rel));
             }
         }
-        let base = self.data_dir.join("base");
+        let base = self.data_dir.join(BASE_SUBDIR);
         let entries = match std::fs::read_dir(&base) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),

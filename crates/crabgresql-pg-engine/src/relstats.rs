@@ -39,7 +39,8 @@ use crabgresql_types::datum::{decode_datum, encode_datum};
 use crate::smgr::RelFileNode;
 
 /// Directory under the data directory holding one file per analyzed relation.
-const STATS_SUBDIR: &str = "stats";
+/// Public for the same reason as [`crate::BASE_SUBDIR`].
+pub const STATS_SUBDIR: &str = "stats";
 
 /// File header. A file that does not start with it is from a future or foreign
 /// writer and is ignored, exactly as an unparseable one is.
