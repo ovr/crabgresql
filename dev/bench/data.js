@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787648314528,
+  "lastUpdate": 1787648317062,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -57568,6 +57568,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 20141.268751,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "86c45681eba1ca56c3396c69b9f909e55d4c2a8d",
+          "message": "feat: Support pg_has_role and the has_*_privilege families (#279)",
+          "timestamp": "2026-08-25T10:07:33+02:00",
+          "tree_id": "31599cc4022de758cec0aa519da537590524c37c",
+          "url": "https://github.com/ovr/crabgresql/commit/86c45681eba1ca56c3396c69b9f909e55d4c2a8d"
+        },
+        "date": 1787648316950,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1225.784473,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 17831.03517,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
