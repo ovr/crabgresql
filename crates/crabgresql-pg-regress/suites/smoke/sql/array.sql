@@ -31,7 +31,9 @@ SELECT id, a, t, a[1] AS a1 FROM arr ORDER BY id;
 -- a subscript on a qualified column, by table name and by alias; the unaliased
 -- one is named after the column, not the qualifier
 SELECT arr.a[1], x.t[2] FROM arr AS x, arr WHERE arr.id = x.id AND arr.a[2] = 2;
-SELECT id FROM arr WHERE arr.a[1] = 1 ORDER BY arr.a[3];
+SELECT id, arr.a[2] FROM arr WHERE arr.a[2] IS NOT NULL ORDER BY arr.a[2] DESC;
+-- the subscript's name is strength 2, so it survives a cast
+SELECT arr.a[1]::text FROM arr WHERE id = 1;
 
 -- element-wise ordering (shorter array is less on a common prefix)
 SELECT a FROM (VALUES

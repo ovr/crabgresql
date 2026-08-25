@@ -1408,18 +1408,12 @@ pub(crate) fn output_name(expr: &ast::Expr) -> String {
         ast::Expr::AtTimeZone { .. } | ast::Expr::AtLocal { .. } => "timezone".into(),
         // An `ARRAY[...]` constructor is named "array" in PG.
         ast::Expr::Array(_) => "array".into(),
-        // `a[i]` subscript keeps the base's name, like a bare column through a
-        // cast (`a[1]` → "a"); a non-name base falls through to `?column?`. A
-        // qualified base is named after its *last* path element, not the
-        // qualifier (`t.a[1]` → "a").
-        ast::Expr::CompoundFieldAccess { root, access_chain } => access_chain
-            .iter()
-            .rev()
-            .find_map(|link| match link {
-                ast::AccessExpr::Dot(expr) => Some(output_name(expr)),
-                ast::AccessExpr::Subscript(_) => None,
-            })
-            .unwrap_or_else(|| output_name(root)),
+        // `a[i]` subscript takes its base's name (`a[1]` → "a"); a non-name
+        // base falls through to `?column?`. A qualified base is named after its
+        // *last* path element, not the qualifier (`t.a[1]` → "a").
+        ast::Expr::CompoundFieldAccess { root, access_chain } => {
+            last_path_element(access_chain).map_or_else(|| output_name(root), output_name)
+        }
         // A bare CASE expression is named "case" in PG.
         ast::Expr::Case { .. } => "case".into(),
         // CEIL/FLOOR special syntax is named after the function.
@@ -1473,14 +1467,33 @@ fn subquery_output_name(query: &ast::Query) -> String {
     }
 }
 
-/// The name of a bare column reference (through parens), if any — PG's
-/// strength-2 name that survives an enclosing cast. A cast, value, or function
-/// argument has no such name.
+/// The last dotted element of a `CompoundFieldAccess` chain — the column a
+/// qualified subscript reads (`t.a[1]` → `a`). `None` for a bare subscript,
+/// whose name comes from the root instead.
+fn last_path_element(chain: &[ast::AccessExpr]) -> Option<&ast::Expr> {
+    chain.iter().rev().find_map(|link| match link {
+        ast::AccessExpr::Dot(expr) => Some(expr),
+        ast::AccessExpr::Subscript(_) => None,
+    })
+}
+
+/// The name of a bare column reference (through parens and subscripts), if any
+/// — PG's strength-2 name that survives an enclosing cast, so `a[1]::text` is
+/// still "a". A cast, value, or function argument has no such name.
+///
+/// PG keeps the name through a cast for bases this does not: a constructor or
+/// function base is strength 2 there, so `(ARRAY[1,2])[1]::text` is "array" and
+/// `(string_to_array('a,b',','))[1]::text` is "string_to_array", where this
+/// answers "text". That gap is not about subscripts — bare `ARRAY[1,2]::text[]`
+/// has it too — and closing it means modelling name strength, not adding arms.
 fn column_name(expr: &ast::Expr) -> Option<String> {
     match expr {
         ast::Expr::Identifier(ident) => Some(normalize_ident(ident)),
         ast::Expr::CompoundIdentifier(parts) => parts.last().map(normalize_ident),
         ast::Expr::Nested(inner) => column_name(inner),
+        ast::Expr::CompoundFieldAccess { root, access_chain } => {
+            last_path_element(access_chain).map_or_else(|| column_name(root), column_name)
+        }
         _ => None,
     }
 }

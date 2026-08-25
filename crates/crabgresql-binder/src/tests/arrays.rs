@@ -60,10 +60,16 @@ fn a_qualified_subscript_binds_like_a_bare_one() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// PG names the column after the last path element, not the qualifier.
+/// PG names the column after the last path element, not the qualifier — and
+/// that name is strength 2, so it survives a cast the way a bare column's does.
 #[test]
 fn a_qualified_subscript_is_named_after_the_column() -> anyhow::Result<()> {
-    for sql in ["SELECT a[1] FROM arr", "SELECT arr.a[1] FROM arr"] {
+    for sql in [
+        "SELECT a[1] FROM arr",
+        "SELECT arr.a[1] FROM arr",
+        "SELECT a[1]::text FROM arr",
+        "SELECT arr.a[1]::text FROM arr",
+    ] {
         let names: Vec<String> = output_columns_of(&bind(sql)?)?
             .into_iter()
             .map(|c| c.name)
