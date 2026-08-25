@@ -1379,7 +1379,6 @@ pub enum ArgForm {
     /// A name to resolve — `name` for a role, `text` for most objects, `name`
     /// for `pg_has_role`'s role argument.
     Name,
-    /// An OID, taken as it stands.
     Oid,
     /// A column number (`int2`), for [`AclClass::Column`] only.
     Attnum,

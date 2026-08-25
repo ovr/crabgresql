@@ -1272,8 +1272,6 @@ pub(crate) static RESTRICTED_CATALOGS: &[&str] = &[
     "pg_user_mapping",
 ];
 
-/// Whether PUBLIC may `SELECT` from the `pg_catalog` relation `name` — true for
-/// every one this build serves but [`RESTRICTED_CATALOGS`].
 pub(crate) fn public_reads(name: &str) -> bool {
     RESTRICTED_CATALOGS.binary_search(&name).is_err()
 }

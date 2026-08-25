@@ -1541,10 +1541,7 @@ impl SystemCatalog {
     /// itself.
     ///
     /// The walk is transitive over the membership edges, mirroring
-    /// `RoleStore::is_member_of` in the server's role catalog — with one
-    /// difference the options force: a chain confers `USAGE` only while every
-    /// edge on it inherits, so the inheriting closure is walked separately from
-    /// the plain one.
+    /// `RoleStore::is_member_of` in the server's role catalog.
     pub fn role_membership(&self, member: u32, role: u32) -> RoleMembership {
         let superuser = self.roles().iter().any(|r| r.oid == member && r.superuser);
         if superuser {
@@ -1653,8 +1650,6 @@ impl SystemCatalog {
                 granted_to_public: false,
             });
         }
-        // An index or a TOAST relation: neither is a sequence, and both are
-        // ordinary objects of the bootstrap superuser.
         let indexes = self.index_oids();
         let index = offset - relations.len();
         if let Some(entry) = indexes.get(index)

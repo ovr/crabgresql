@@ -45,7 +45,7 @@
 
 use crabgresql_binder::{AclClass, ArgForm, PrivCall};
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_types::{RegKind, Value};
+use crabgresql_types::{RegKind, Value, compare};
 
 use crate::{CatalogOps, ExecError, ObjectAcl, RoleMembership};
 
@@ -68,7 +68,6 @@ fn privilege_names(class: AclClass) -> &'static [&'static str] {
             "TRIGGER",
             "MAINTAIN",
         ],
-        // A column carries only the four privileges that can be granted on one.
         AclClass::Column | AclClass::AnyColumn => &["SELECT", "INSERT", "UPDATE", "REFERENCES"],
         AclClass::Sequence => &["SELECT", "UPDATE", "USAGE"],
         AclClass::Schema => &["CREATE", "USAGE"],
@@ -81,11 +80,7 @@ fn privilege_names(class: AclClass) -> &'static [&'static str] {
 /// One privilege the argument string asked about.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Privilege {
-    /// Index into [`privilege_names`] for the class — which is all the identity
-    /// a privilege needs here.
     name: &'static str,
-    /// Whether the call asked for the grant option rather than the privilege
-    /// itself.
     grant_option: bool,
 }
 
@@ -226,7 +221,6 @@ fn relation_class(class: AclClass) -> bool {
     )
 }
 
-/// Whether the role holds one privilege over another role.
 fn holds_role(privilege: Privilege, membership: RoleMembership) -> bool {
     if privilege.grant_option {
         return membership.admin;
@@ -278,7 +272,7 @@ fn holds_object(
 /// The role argument: a stored name matched exactly, or an OID as it stands.
 fn resolve_role(form: ArgForm, value: &Value, ops: &dyn CatalogOps) -> Result<u32, ExecError> {
     match form {
-        ArgForm::Oid => Ok(oid_of(value)),
+        ArgForm::Oid => Ok(compare::oid_of(value)),
         _ => {
             let name = text(value);
             ops.role_oid(name).ok_or_else(|| {
@@ -301,7 +295,7 @@ fn resolve_object(
     ops: &dyn CatalogOps,
 ) -> Result<u32, ExecError> {
     if form == ArgForm::Oid {
-        return Ok(oid_of(value));
+        return Ok(compare::oid_of(value));
     }
     let name = text(value);
     let oid = match class {
@@ -333,9 +327,7 @@ fn resolve_object(
             sqlstate::UNDEFINED_FUNCTION,
             format!("function \"{name}\" does not exist"),
         )?,
-        // Neither catalog has a row in this build, so every name misses. Written
-        // as a lookup rather than as a constant error so the day one exists this
-        // answers for it.
+        // Neither catalog has a row in this build, so every name misses.
         //
         // TODO: resolve against `pg_foreign_server` / `pg_foreign_data_wrapper`
         // once `CREATE SERVER` exists.
@@ -383,7 +375,6 @@ fn column_exists(
     ))
 }
 
-/// An OID that must not be `InvalidOid`, with the miss the class reports.
 fn nonzero(oid: u32, state: &'static str, message: String) -> Result<u32, ExecError> {
     match oid {
         0 => Err(ExecError::new(state, message)),
@@ -398,10 +389,4 @@ fn text(value: &Value) -> &str {
         Value::Text(s) => s,
         _ => "",
     }
-}
-
-/// The OID of an argument the binder declared `oid`, which the coercion has
-/// already made one.
-fn oid_of(value: &Value) -> u32 {
-    crabgresql_types::compare::oid_of(value)
 }

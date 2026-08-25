@@ -3901,7 +3901,6 @@ fn pg_depend_records_the_graph_postgres_records() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One role, non-superuser, for the membership tests below.
 fn plain_role(oid: u32, name: &str) -> CatalogRole {
     CatalogRole {
         oid,
@@ -3915,7 +3914,6 @@ fn plain_role(oid: u32, name: &str) -> CatalogRole {
     }
 }
 
-/// One membership edge, with the three options a grant carries.
 fn membership(role: u32, member: u32, inherit: bool, set: bool, admin: bool) -> CatalogRoleMember {
     CatalogRoleMember {
         oid: 20000 + role * 100 + member,
@@ -3958,7 +3956,6 @@ fn membership_privileges_follow_the_options_along_the_whole_chain() {
     assert!(!indirect.inherits, "a non-inheriting edge breaks the chain");
     assert!(indirect.set, "every edge on the chain is settable");
 
-    // Nothing flows the other way.
     assert!(!cat.role_membership(16400, 16402).member);
 }
 
