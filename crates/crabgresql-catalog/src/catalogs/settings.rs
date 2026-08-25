@@ -61,9 +61,11 @@ pub(crate) fn pg_settings_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Text(s.source.to_string()),
                 text(s.min_val),
                 text(s.max_val),
-                s.enumvals.map_or(Value::Null, |vals| Value::Array {
-                    elem: PgType::Text,
-                    elems: vals.iter().map(|v| Value::Text(v.to_string())).collect(),
+                s.enumvals.map_or(Value::Null, |vals| {
+                    Value::array_1d(
+                        PgType::Text,
+                        vals.iter().map(|v| Value::Text(v.to_string())).collect(),
+                    )
                 }),
                 Value::Text(s.boot_val.to_string()),
                 Value::Text(s.reset_val.clone()),

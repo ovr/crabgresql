@@ -90,9 +90,11 @@ pub(super) fn for_each_node_mut(expr: &mut BoundExpr, f: &mut dyn FnMut(&mut Bou
                 for_each_node_mut(elem, f);
             }
         }
-        BoundExpr::Subscript { base, index, .. } => {
+        BoundExpr::Subscript { base, indexes, .. } => {
             for_each_node_mut(base, f);
-            for_each_node_mut(index, f);
+            for i in indexes {
+                for_each_node_mut(i, f);
+            }
         }
         BoundExpr::Case { whens, else_, .. } => {
             for (condition, result) in whens {

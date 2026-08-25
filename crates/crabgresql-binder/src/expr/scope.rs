@@ -578,14 +578,20 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             ret: *ret,
         },
 
-        BoundExpr::ArrayCtor { elem, ty, elems } => BoundExpr::ArrayCtor {
+        BoundExpr::ArrayCtor {
+            elem,
+            nested,
+            ty,
+            elems,
+        } => BoundExpr::ArrayCtor {
             elem: *elem,
+            nested: *nested,
             ty: *ty,
             elems: elems.iter().map(|a| outerize_columns(a, level)).collect(),
         },
-        BoundExpr::Subscript { base, index, ty } => BoundExpr::Subscript {
+        BoundExpr::Subscript { base, indexes, ty } => BoundExpr::Subscript {
             base: Box::new(outerize_columns(base, level)),
-            index: Box::new(outerize_columns(index, level)),
+            indexes: indexes.iter().map(|i| outerize_columns(i, level)).collect(),
             ty: *ty,
         },
         BoundExpr::Case { whens, else_, ty } => BoundExpr::Case {

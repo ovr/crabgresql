@@ -201,7 +201,7 @@ fn slots_of(ty: PgType, stats: &ColStats, fmt: &FmtCtx) -> [Option<Slot>; SLOTS]
 
 fn mcv_values(ty: PgType, stats: &ColStats, fmt: &FmtCtx) -> Option<String> {
     let values: Vec<Value> = stats.mcv.iter().map(|(v, _)| v.clone()).collect();
-    (!values.is_empty()).then(|| crabgresql_types::array::format(ty, &values, fmt))
+    (!values.is_empty()).then(|| crabgresql_types::array::format_1d(ty, &values, fmt))
 }
 
 fn mcv_freqs(stats: &ColStats) -> Option<String> {
@@ -213,7 +213,7 @@ fn mcv_freqs(stats: &ColStats) -> Option<String> {
 
 fn histogram_bounds(ty: PgType, stats: &ColStats, fmt: &FmtCtx) -> Option<String> {
     (!stats.histogram.is_empty())
-        .then(|| crabgresql_types::array::format(ty, &stats.histogram, fmt))
+        .then(|| crabgresql_types::array::format_1d(ty, &stats.histogram, fmt))
 }
 
 /// A `real` as PostgreSQL prints it inside one of these arrays: through

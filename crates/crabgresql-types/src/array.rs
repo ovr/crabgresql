@@ -1,14 +1,94 @@
-//! One-dimensional array I/O (`array_out` / `array_in`) and the element↔array
-//! OID mapping.
+//! Array I/O (`array_out` / `array_in`) and the element↔array OID mapping.
 //!
 //! Clean-room (see AGENTS.md): this reproduces PostgreSQL's *observable* array
-//! text format — the `{...}` syntax, its quoting/escaping rules, and the
+//! text format — the `{...}` syntax, nested braces for the higher dimensions,
+//! the `[lower:upper]=` dimension prefix, the quoting/escaping rules, and the
 //! case-insensitive unquoted `NULL` element — implemented independently.
 //!
-//! TODO: support multi-dimensional arrays; only 1-D is handled, and a nested
-//! `{` is rejected as a malformed literal.
+//! Arrays are *not* nested values: an array has a dimension list and a single
+//! flat, row-major element list, which is why `int[]` and `int[][]` are the same
+//! type (`_int4`) and dimensionality belongs to the value. See [`ArrayDim`].
 
 use crate::{FmtCtx, PgType, Value, cast, oid};
+
+/// The most dimensions an array value may have. PostgreSQL's `MAXDIM`; a
+/// literal that nests deeper is rejected with `54000`.
+pub const MAXDIM: usize = 6;
+
+/// One dimension of an array: its lower subscript bound and its length.
+///
+/// `lower` is 1 for every array PostgreSQL builds itself, but a literal may fix
+/// another one (`'[2:3]={1,2}'::int[]`), and that bound is part of the value —
+/// it shifts subscripts, prints back out as a `[lower:upper]=` prefix, and makes
+/// the value unequal to the same elements at the default bound.
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArrayDim {
+    pub lower: i32,
+    pub len: i32,
+}
+
+impl ArrayDim {
+    /// A dimension of `len` elements at the default lower bound of 1.
+    pub fn new(len: usize) -> Self {
+        ArrayDim {
+            lower: 1,
+            len: len as i32,
+        }
+    }
+
+    /// The highest valid subscript — what `array_upper` reports.
+    pub fn upper(&self) -> i32 {
+        // Both bounds are held to `i32` range by `array_in`, so this cannot wrap
+        // for a value that exists.
+        self.lower + self.len - 1
+    }
+}
+
+/// The dimension list of a 1-D array of `len` elements, or the empty list when
+/// `len` is 0 — an empty array has *no* dimensions in PostgreSQL, which is why
+/// `array_dims('{}'::int[])` and `array_length('{}'::int[], 1)` are both NULL.
+pub fn dims_1d(len: usize) -> Vec<ArrayDim> {
+    if len == 0 {
+        Vec::new()
+    } else {
+        vec![ArrayDim::new(len)]
+    }
+}
+
+/// Stack the operands of a nested `ARRAY[…]` constructor
+/// (`ARRAY[[1,2],[3,4]]`, `ARRAY[ARRAY[…]]`) into one array with one more
+/// dimension, or `None` if they do not all have the same shape.
+///
+/// The operands are already row-major, so the result's elements are simply
+/// theirs concatenated; only the dimension list grows, by the operand count at
+/// the front.
+pub fn stack(elem: PgType, operands: &[Value]) -> Option<Value> {
+    let mut dims: Option<&[ArrayDim]> = None;
+    let mut elems = Vec::new();
+    for operand in operands {
+        // A NULL operand has no shape to stack, so it cannot take part.
+        let Value::Array {
+            dims: sub,
+            elems: e,
+            ..
+        } = operand
+        else {
+            return None;
+        };
+        match dims {
+            None => dims = Some(sub),
+            Some(established) if established == sub => {}
+            Some(_) => return None,
+        }
+        elems.extend(e.iter().cloned());
+    }
+    let mut dims = dims.unwrap_or_default().to_vec();
+    // Every operand was itself empty, so the whole constructor is: no dimensions.
+    if !dims.is_empty() {
+        dims.insert(0, ArrayDim::new(operands.len()));
+    }
+    Some(Value::Array { elem, dims, elems })
+}
 
 /// SQLSTATE + message (+ optional DETAIL) for a failed array input (`array_in`).
 /// The DETAIL is either one of PG's `array_in` lines (e.g. `Unexpected ","
@@ -51,6 +131,22 @@ const fn detail_delim(delim: char) -> &'static str {
 }
 const DETAIL_RBRACE: &str = "Unexpected \"}\" character.";
 const DETAIL_LBRACE: &str = "Unexpected \"{\" character.";
+/// Sub-arrays that disagree about their shape, either in depth (`{{1,2},3}`) or
+/// in length (`{{1,2},{3}}`).
+const DETAIL_RAGGED: &str =
+    "Multidimensional arrays must have sub-arrays with matching dimensions.";
+/// A `[l:u]…` prefix not followed by `=`.
+const DETAIL_NO_EQUALS: &str = "Missing \"=\" after array dimensions.";
+/// A `[l:u]…=` prefix that disagrees with the braces after it, in either the
+/// number of dimensions or a length.
+const DETAIL_DIM_MISMATCH: &str = "Specified array dimensions do not match array contents.";
+
+/// `54000` (`program_limit_exceeded`) — more brace levels than [`MAXDIM`].
+const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+/// `2202E` (`array_subscript_error`) — a `[l:u]` prefix whose upper bound is
+/// below its lower bound. Note this is *not* a malformed literal to PostgreSQL:
+/// the syntax parsed fine, the bounds it names are the problem.
+const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";
 
 /// The array type OID for an element type OID (`int4` → `_int4` = 1007), or
 /// `None` when this build has no array type for that element.
@@ -138,31 +234,75 @@ const ARRAY_OID_PAIRS: &[(u32, u32)] = &[
     (oid::INT2VECTOR, oid::INT2VECTOR_ARRAY),
 ];
 
-/// `array_out`: render a 1-D array as `{e1,e2,...}`. A NULL element prints as an
-/// unquoted `NULL`; any other element is rendered with its own output function
-/// and double-quoted when it is empty, equals `NULL` case-insensitively, or
-/// contains a delimiter, brace, quote, backslash, or whitespace.
-pub fn format(elem: PgType, elems: &[Value], fmt: &FmtCtx) -> String {
+/// `array_out`: render an array as `{e1,e2,...}`, one brace level per dimension
+/// (`{{1,2},{3,4}}` for a 2×2). A NULL element prints as an unquoted `NULL`; any
+/// other element is rendered with its own output function and double-quoted when
+/// it is empty, equals `NULL` case-insensitively, or contains a delimiter, brace,
+/// quote, backslash, or whitespace.
+///
+/// When *any* dimension has a lower bound other than 1, the whole value is
+/// prefixed with its dimensions (`[2:3][0:1]={{1,2},{3,4}}`) so that the text
+/// round-trips through [`array_in`]; at the default bounds the prefix is omitted.
+pub fn format(elem: PgType, dims: &[ArrayDim], elems: &[Value], fmt: &FmtCtx) -> String {
+    if dims.is_empty() {
+        return String::from("{}");
+    }
     let delim = elem.typdelim();
-    let mut out = String::from("{");
-    for (i, v) in elems.iter().enumerate() {
-        if i > 0 {
-            out.push(delim);
+    let mut out = String::new();
+    if dims.iter().any(|d| d.lower != 1) {
+        for d in dims {
+            out.push_str(&format!("[{}:{}]", d.lower, d.upper()));
         }
-        match v {
-            Value::Null => out.push_str("NULL"),
-            _ => {
-                let s = v.encode_text_with(fmt).unwrap_or_default();
-                if needs_quote(&s, delim) {
-                    push_quoted(&mut out, &s);
-                } else {
-                    out.push_str(&s);
+        out.push('=');
+    }
+    format_slice(&mut out, dims, elems, delim, fmt);
+    out
+}
+
+/// The 1-D form, for callers that build their arrays flat and never carry a
+/// dimension list of their own.
+pub fn format_1d(elem: PgType, elems: &[Value], fmt: &FmtCtx) -> String {
+    format(elem, &dims_1d(elems.len()), elems, fmt)
+}
+
+/// Emit one brace group. `dims` is the *remaining* dimension list, `elems` the
+/// row-major slice this group covers; the recursion splits that slice into
+/// `dims[0].len` equal chunks, one per sub-group.
+fn format_slice(out: &mut String, dims: &[ArrayDim], elems: &[Value], delim: char, fmt: &FmtCtx) {
+    out.push('{');
+    match dims.split_first() {
+        // Innermost level: the elements themselves.
+        Some((_, [])) => {
+            for (i, v) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push(delim);
+                }
+                match v {
+                    Value::Null => out.push_str("NULL"),
+                    _ => {
+                        let s = v.encode_text_with(fmt).unwrap_or_default();
+                        if needs_quote(&s, delim) {
+                            push_quoted(out, &s);
+                        } else {
+                            out.push_str(&s);
+                        }
+                    }
                 }
             }
         }
+        Some((first, rest)) => {
+            let stride = rest.iter().map(|d| d.len as usize).product::<usize>();
+            for i in 0..first.len as usize {
+                if i > 0 {
+                    out.push(delim);
+                }
+                let from = i * stride;
+                format_slice(out, rest, &elems[from..from + stride], delim, fmt);
+            }
+        }
+        None => {}
     }
     out.push('}');
-    out
 }
 
 /// C's `isspace` over ASCII — the six characters PG's `array_isspace` and
@@ -194,30 +334,226 @@ fn push_quoted(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// `array_in`: parse a 1-D array literal `{...}` into element values, coercing
-/// each element token to `elem` through the shared cast machinery (so an element
-/// parses exactly like the same scalar literal). An unquoted, case-insensitive
-/// `NULL` token is a NULL element; a quoted `"NULL"` is the text "NULL".
-pub fn array_in(input: &str, elem: PgType, fmt: &FmtCtx) -> Result<Vec<Value>, ArrayError> {
+/// `array_in`: parse an array literal into its dimensions and its row-major
+/// element list, coercing each element token to `elem` through the shared cast
+/// machinery (so an element parses exactly like the same scalar literal). An
+/// unquoted, case-insensitive `NULL` token is a NULL element; a quoted `"NULL"`
+/// is the text "NULL".
+///
+/// Dimensionality is read off the brace nesting: every group at a given depth
+/// must hold the same number of children, and scalars may only appear at the
+/// deepest level, or the literal is malformed. An optional `[lower:upper]…=`
+/// prefix fixes the subscript bounds and must agree with the braces that follow.
+/// A literal with no elements at all (`{}`, and also `{{}}`) has *no*
+/// dimensions.
+pub fn array_in(
+    input: &str,
+    elem: PgType,
+    fmt: &FmtCtx,
+) -> Result<(Vec<ArrayDim>, Vec<Value>), ArrayError> {
     let delim = elem.typdelim();
     let trimmed = input.trim();
     let mut chars = trimmed.chars().peekable();
-    if chars.next() != Some('{') {
+    let declared = read_dimension_prefix(&mut chars, input)?;
+    if chars.peek() != Some(&'{') {
         return Err(malformed(input, DETAIL_START));
     }
-    let mut elems = Vec::new();
+    let mut scan = Scan {
+        input,
+        delim,
+        elem,
+        fmt,
+        counts: [None; MAXDIM],
+        leaf_level: None,
+        elems: Vec::new(),
+    };
+    scan.group(&mut chars, 0)?;
     skip_ws(&mut chars);
-    // An empty array literal `{}` yields no elements.
-    if chars.peek() == Some(&'}') {
-        chars.next();
-        skip_ws(&mut chars);
-        if chars.next().is_some() {
-            return Err(malformed(input, DETAIL_JUNK));
-        }
-        return Ok(elems);
+    if chars.next().is_some() {
+        return Err(malformed(input, DETAIL_JUNK));
     }
+    // No scalar anywhere means an empty array, whatever the brace nesting was.
+    let Some(ndims) = scan.leaf_level else {
+        // A prefix still has to be self-consistent, but `[l:u]` with a positive
+        // length cannot describe an empty literal.
+        if declared
+            .as_ref()
+            .is_some_and(|d| d.iter().any(|d| d.len > 0))
+        {
+            return Err(malformed(input, DETAIL_DIM_MISMATCH));
+        }
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut dims: Vec<ArrayDim> = scan.counts[..ndims]
+        .iter()
+        .map(|len| ArrayDim::new(len.expect("every level above a scalar was scanned")))
+        .collect();
+    if let Some(declared) = declared {
+        if declared.len() != dims.len()
+            || declared
+                .iter()
+                .zip(&dims)
+                .any(|(d, actual)| d.len != actual.len)
+        {
+            return Err(malformed(input, DETAIL_DIM_MISMATCH));
+        }
+        dims = declared;
+    }
+    Ok((dims, scan.elems))
+}
+
+/// Read an optional `[lower:upper][lower:upper]…=` prefix, leaving the iterator
+/// on the first `{`. `None` when the literal does not start with `[`.
+fn read_dimension_prefix(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    input: &str,
+) -> Result<Option<Vec<ArrayDim>>, ArrayError> {
+    if chars.peek() != Some(&'[') {
+        return Ok(None);
+    }
+    let mut dims = Vec::new();
+    while chars.peek() == Some(&'[') {
+        chars.next();
+        if dims.len() == MAXDIM {
+            return Err(too_many_dimensions());
+        }
+        let lower = read_bound(chars, input, ':')?;
+        let upper = read_bound(chars, input, ']')?;
+        if upper < lower {
+            // Not a malformed literal to PostgreSQL — the syntax parsed, the
+            // bounds are what it objects to.
+            return Err(ArrayError {
+                sqlstate: ARRAY_SUBSCRIPT_ERROR,
+                message: "upper bound cannot be less than lower bound".to_string(),
+                detail: None,
+            });
+        }
+        // Held in i64 so a `[-2147483648:2147483647]` prefix cannot wrap the
+        // length it implies.
+        let len = i64::from(upper) - i64::from(lower) + 1;
+        let len = i32::try_from(len).map_err(|_| too_many_dimensions())?;
+        dims.push(ArrayDim { lower, len });
+    }
+    if chars.next() != Some('=') {
+        return Err(malformed(input, DETAIL_NO_EQUALS));
+    }
+    Ok(Some(dims))
+}
+
+/// One signed decimal bound of a `[lower:upper]` pair, up to `terminator`.
+fn read_bound(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    input: &str,
+    terminator: char,
+) -> Result<i32, ArrayError> {
+    let mut s = String::new();
     loop {
-        let (token, quoted) = read_element(&mut chars, input, delim)?;
+        match chars.next() {
+            Some(c) if c == terminator => break,
+            Some(c) => s.push(c),
+            None => return Err(malformed(input, DETAIL_EOF)),
+        }
+    }
+    s.trim()
+        .parse::<i32>()
+        .map_err(|_| malformed(input, DETAIL_START))
+}
+
+/// The `54000` raised when a literal nests more than [`MAXDIM`] brace levels.
+fn too_many_dimensions() -> ArrayError {
+    ArrayError {
+        sqlstate: PROGRAM_LIMIT_EXCEEDED,
+        message: format!("number of array dimensions exceeds the maximum allowed ({MAXDIM})"),
+        detail: None,
+    }
+}
+
+/// The state threaded through the brace scan: `counts[level]` is how many
+/// children a group at that level holds, established by the first such group and
+/// enforced on every later one, and `leaf_level` is the depth at which scalars
+/// were found — which is the array's dimensionality.
+struct Scan<'a> {
+    input: &'a str,
+    delim: char,
+    elem: PgType,
+    fmt: &'a FmtCtx,
+    /// Indexed by level, not by visit order — the scan is depth-first, so a
+    /// nested group pins its own level down before its parent does.
+    counts: [Option<usize>; MAXDIM],
+    leaf_level: Option<usize>,
+    elems: Vec<Value>,
+}
+
+impl Scan<'_> {
+    /// Scan one brace group sitting at `level`; its children are at `level + 1`.
+    /// Consumes the opening `{` through the matching `}`.
+    fn group(
+        &mut self,
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        level: usize,
+    ) -> Result<(), ArrayError> {
+        if level + 1 > MAXDIM {
+            return Err(too_many_dimensions());
+        }
+        // The caller only enters a group when it has seen the brace.
+        debug_assert_eq!(chars.peek(), Some(&'{'));
+        chars.next();
+        let mut count = 0usize;
+        skip_ws(chars);
+        if chars.peek() == Some(&'}') {
+            chars.next();
+            return self.record(level, 0);
+        }
+        loop {
+            skip_ws(chars);
+            if chars.peek() == Some(&'{') {
+                // A sub-array where a scalar was already seen at this depth is
+                // the ragged case (`{1,{2}}`).
+                if self.leaf_level == Some(level + 1) {
+                    return Err(malformed(self.input, DETAIL_RAGGED));
+                }
+                self.group(chars, level + 1)?;
+            } else {
+                self.scalar(chars, level + 1)?;
+            }
+            count += 1;
+            skip_ws(chars);
+            match chars.next() {
+                Some(c) if c == self.delim => skip_ws(chars),
+                Some('}') => break,
+                // EOF before a closing brace, or any other stray character.
+                None => return Err(malformed(self.input, DETAIL_EOF)),
+                Some(_) => return Err(malformed(self.input, detail_delim(self.delim))),
+            }
+        }
+        self.record(level, count)
+    }
+
+    /// Pin down (or check) how many children a group at `level` holds.
+    fn record(&mut self, level: usize, count: usize) -> Result<(), ArrayError> {
+        match self.counts[level] {
+            None => {
+                self.counts[level] = Some(count);
+                Ok(())
+            }
+            Some(established) if established == count => Ok(()),
+            Some(_) => Err(malformed(self.input, DETAIL_RAGGED)),
+        }
+    }
+
+    /// Read one element token at `level` and append its value.
+    fn scalar(
+        &mut self,
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        level: usize,
+    ) -> Result<(), ArrayError> {
+        // Scalars must all sit at the same depth; `{{1,2},3}` puts one shallower.
+        match self.leaf_level {
+            None => self.leaf_level = Some(level),
+            Some(l) if l == level => {}
+            Some(_) => return Err(malformed(self.input, DETAIL_RAGGED)),
+        }
+        let (token, quoted) = read_element(chars, self.input, self.delim)?;
         // An empty, unquoted, unescaped token (`{a,,c}`, `{1,}`, `{,1}`) is a
         // missing element, which PG rejects as malformed. A quoted `""` is a
         // legitimate empty-string element and keeps `quoted = true`. PG's DETAIL
@@ -225,37 +561,25 @@ pub fn array_in(input: &str, elem: PgType, fmt: &FmtCtx) -> Result<Vec<Value>, A
         if !quoted && token.is_empty() {
             let detail = match chars.peek() {
                 Some('}') => DETAIL_RBRACE,
-                Some(&c) if c == delim => detail_delim(delim),
+                Some(&c) if c == self.delim => detail_delim(self.delim),
                 _ => DETAIL_EOF,
             };
-            return Err(malformed(input, detail));
+            return Err(malformed(self.input, detail));
         }
         if !quoted && token.eq_ignore_ascii_case("null") {
-            elems.push(Value::Null);
+            self.elems.push(Value::Null);
         } else {
-            let v = cast::cast_value(Value::Text(token), elem, fmt).map_err(|e| ArrayError {
-                sqlstate: e.sqlstate,
-                message: e.message,
-                detail: e.detail,
+            let v = cast::cast_value(Value::Text(token), self.elem, self.fmt).map_err(|e| {
+                ArrayError {
+                    sqlstate: e.sqlstate,
+                    message: e.message,
+                    detail: e.detail,
+                }
             })?;
-            elems.push(v);
+            self.elems.push(v);
         }
-        skip_ws(&mut chars);
-        match chars.next() {
-            Some(c) if c == delim => {
-                skip_ws(&mut chars);
-            }
-            Some('}') => break,
-            // EOF before a closing brace, or any other stray character.
-            None => return Err(malformed(input, DETAIL_EOF)),
-            Some(_) => return Err(malformed(input, detail_delim(delim))),
-        }
+        Ok(())
     }
-    skip_ws(&mut chars);
-    if chars.next().is_some() {
-        return Err(malformed(input, DETAIL_JUNK));
-    }
-    Ok(elems)
 }
 
 fn skip_ws(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
@@ -345,34 +669,140 @@ fn read_element(
 mod tests {
     use super::*;
 
+    /// Just the elements of a literal, for the tests that do not care about its
+    /// shape.
+    fn parse(input: &str, elem: PgType) -> Result<Vec<Value>, ArrayError> {
+        Ok(array_in(input, elem, &FmtCtx::utc_default())?.1)
+    }
+
+    /// Parse and print back, which is the property most of these tests want.
+    fn round_trip(input: &str, elem: PgType) -> Result<String, ArrayError> {
+        let (dims, elems) = array_in(input, elem, &FmtCtx::utc_default())?;
+        Ok(format(elem, &dims, &elems, &FmtCtx::utc_default()))
+    }
+
     #[test]
     fn round_trips_int_array() -> Result<(), ArrayError> {
-        let elems = array_in("{1,2,3}", PgType::Int4, &FmtCtx::utc_default())?;
+        let (dims, elems) = array_in("{1,2,3}", PgType::Int4, &FmtCtx::utc_default())?;
         assert_eq!(elems, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
+        assert_eq!(dims, vec![ArrayDim { lower: 1, len: 3 }]);
         assert_eq!(
-            format(PgType::Int4, &elems, &FmtCtx::utc_default()),
+            format(PgType::Int4, &dims, &elems, &FmtCtx::utc_default()),
             "{1,2,3}"
         );
         Ok(())
     }
 
+    /// An empty array has *no* dimensions, however many brace levels the literal
+    /// spells it with — which is why `array_dims('{}'::int[])` is NULL in PG.
     #[test]
-    fn empty_array() -> Result<(), ArrayError> {
-        assert_eq!(
-            array_in("{}", PgType::Int4, &FmtCtx::utc_default())?,
-            vec![]
-        );
-        assert_eq!(format(PgType::Int4, &[], &FmtCtx::utc_default()), "{}");
+    fn empty_array_has_no_dimensions() -> Result<(), ArrayError> {
+        for input in ["{}", "{{}}", "{{},{}}"] {
+            let (dims, elems) = array_in(input, PgType::Int4, &FmtCtx::utc_default())?;
+            assert_eq!(elems, vec![], "for `{input}`");
+            assert_eq!(dims, vec![], "for `{input}`");
+            assert_eq!(round_trip(input, PgType::Int4)?, "{}", "for `{input}`");
+        }
+        assert_eq!(format(PgType::Int4, &[], &[], &FmtCtx::utc_default()), "{}");
         Ok(())
     }
 
     #[test]
+    fn round_trips_a_multi_dimensional_array() -> Result<(), ArrayError> {
+        let (dims, elems) = array_in("{{1,2,3},{4,5,6}}", PgType::Int4, &FmtCtx::utc_default())?;
+        // Row-major: the flat list reads across each row in turn.
+        assert_eq!(
+            elems,
+            (1..=6).map(Value::Int4).collect::<Vec<_>>(),
+            "elements are stored row-major"
+        );
+        assert_eq!(
+            dims,
+            vec![ArrayDim { lower: 1, len: 2 }, ArrayDim { lower: 1, len: 3 }]
+        );
+        assert_eq!(
+            round_trip("{{1,2,3},{4,5,6}}", PgType::Int4)?,
+            "{{1,2,3},{4,5,6}}"
+        );
+        // Three levels, and whitespace anywhere between the braces.
+        assert_eq!(
+            round_trip("{ { {1,2} , {3,4} } }", PgType::Int4)?,
+            "{{{1,2},{3,4}}}"
+        );
+        Ok(())
+    }
+
+    /// A `[lower:upper]=` prefix fixes the subscript bounds. It prints back out
+    /// only when some bound is not the default 1.
+    #[test]
+    fn dimension_prefix_round_trips() -> Result<(), ArrayError> {
+        let (dims, elems) = array_in("[2:3]={1,2}", PgType::Int4, &FmtCtx::utc_default())?;
+        assert_eq!(elems, vec![Value::Int4(1), Value::Int4(2)]);
+        assert_eq!(dims, vec![ArrayDim { lower: 2, len: 2 }]);
+        assert_eq!(round_trip("[2:3]={1,2}", PgType::Int4)?, "[2:3]={1,2}");
+        assert_eq!(
+            round_trip("[2:3][0:1]={{1,2},{3,4}}", PgType::Int4)?,
+            "[2:3][0:1]={{1,2},{3,4}}"
+        );
+        // At the default bounds the prefix is dropped again.
+        assert_eq!(round_trip("[1:2]={1,2}", PgType::Int4)?, "{1,2}");
+        Ok(())
+    }
+
+    #[test]
+    fn ragged_and_mismatched_literals_are_malformed() {
+        let d = |s: &str| {
+            array_in(s, PgType::Int4, &FmtCtx::utc_default())
+                .expect_err("a ragged array literal must be rejected")
+        };
+        // Sub-arrays of differing length, a scalar where a sub-array belongs,
+        // and a sub-array where a scalar belongs.
+        for s in ["{{1,2},{3}}", "{{1,2},3}", "{1,{2}}", "{{1},{{2}}}"] {
+            let e = d(s);
+            assert_eq!(e.sqlstate, INVALID_TEXT_REPRESENTATION, "for `{s}`");
+            assert_eq!(e.detail.as_deref(), Some(DETAIL_RAGGED), "for `{s}`");
+        }
+        // A prefix that disagrees with the braces, in a length or in the number
+        // of dimensions.
+        for s in ["[1:3]={1,2}", "[2:3][1:2]={1,2}"] {
+            assert_eq!(
+                d(s).detail.as_deref(),
+                Some(DETAIL_DIM_MISMATCH),
+                "for `{s}`"
+            );
+        }
+        assert_eq!(d("[1:2]{1,2}").detail.as_deref(), Some(DETAIL_NO_EQUALS));
+    }
+
+    /// PostgreSQL caps arrays at `MAXDIM` dimensions, and says so with `54000`
+    /// rather than calling the literal malformed.
+    #[test]
+    fn too_many_dimensions_is_a_program_limit() {
+        let e = array_in("{{{{{{{1}}}}}}}", PgType::Int4, &FmtCtx::utc_default())
+            .expect_err("seven dimensions must be rejected");
+        assert_eq!(e.sqlstate, PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(
+            e.message,
+            "number of array dimensions exceeds the maximum allowed (6)"
+        );
+        // Six is still fine.
+        assert!(array_in("{{{{{{1}}}}}}", PgType::Int4, &FmtCtx::utc_default()).is_ok());
+    }
+
+    /// An inverted `[upper:lower]` is not a *syntax* problem, so PG reports it as
+    /// an array-subscript error instead of a malformed literal.
+    #[test]
+    fn inverted_bounds_are_a_subscript_error() {
+        let e = array_in("[2:1]={}", PgType::Int4, &FmtCtx::utc_default())
+            .expect_err("an inverted bound pair must be rejected");
+        assert_eq!(e.sqlstate, ARRAY_SUBSCRIPT_ERROR);
+        assert_eq!(e.message, "upper bound cannot be less than lower bound");
+        assert_eq!(e.detail, None);
+    }
+
+    #[test]
     fn null_and_quoting() -> Result<(), ArrayError> {
-        let elems = array_in(
-            r#"{a,"b,c",NULL,"NULL",""}"#,
-            PgType::Text,
-            &FmtCtx::utc_default(),
-        )?;
+        let elems = parse(r#"{a,"b,c",NULL,"NULL",""}"#, PgType::Text)?;
         assert_eq!(
             elems,
             vec![
@@ -385,7 +815,7 @@ mod tests {
         );
         // Round-trip: the delimiter/empty/NULL-lookalike elements are quoted.
         assert_eq!(
-            format(PgType::Text, &elems, &FmtCtx::utc_default()),
+            round_trip(r#"{a,"b,c",NULL,"NULL",""}"#, PgType::Text)?,
             r#"{a,"b,c",NULL,"NULL",""}"#
         );
         Ok(())
@@ -393,14 +823,14 @@ mod tests {
 
     #[test]
     fn whitespace_between_elements_is_trimmed() -> Result<(), ArrayError> {
-        let elems = array_in("{ 1 , 2 , 3 }", PgType::Int4, &FmtCtx::utc_default())?;
+        let elems = parse("{ 1 , 2 , 3 }", PgType::Int4)?;
         assert_eq!(elems, vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]);
         Ok(())
     }
 
     #[test]
     fn backslash_escape_in_quotes() -> Result<(), ArrayError> {
-        let elems = array_in(r#"{"a\"b","c\\d"}"#, PgType::Text, &FmtCtx::utc_default())?;
+        let elems = parse(r#"{"a\"b","c\\d"}"#, PgType::Text)?;
         assert_eq!(
             elems,
             vec![Value::Text("a\"b".into()), Value::Text("c\\d".into())]
@@ -441,7 +871,7 @@ mod tests {
         assert!(array_in("{1,}", PgType::Text, &FmtCtx::utc_default()).is_err());
         assert!(array_in("{,1}", PgType::Text, &FmtCtx::utc_default()).is_err());
         assert_eq!(
-            array_in(r#"{a,"",c}"#, PgType::Text, &FmtCtx::utc_default())?,
+            parse(r#"{a,"",c}"#, PgType::Text)?,
             vec![
                 Value::Text("a".into()),
                 Value::Text(String::new()),
@@ -456,13 +886,10 @@ mod tests {
         // A backslash-escaped trailing space is significant and must survive the
         // unquoted trailing-whitespace trim; an unescaped one is dropped.
         assert_eq!(
-            array_in("{a\\ }", PgType::Text, &FmtCtx::utc_default())?,
+            parse("{a\\ }", PgType::Text)?,
             vec![Value::Text("a ".into())]
         );
-        assert_eq!(
-            array_in("{a }", PgType::Text, &FmtCtx::utc_default())?,
-            vec![Value::Text("a".into())]
-        );
+        assert_eq!(parse("{a }", PgType::Text)?, vec![Value::Text("a".into())]);
         Ok(())
     }
 
@@ -471,7 +898,7 @@ mod tests {
         // PG's array_out only treats ASCII whitespace as needing quotes; a
         // non-breaking space (U+00A0) is left bare.
         assert_eq!(
-            format(
+            format_1d(
                 PgType::Text,
                 &[Value::Text("a\u{00A0}b".into())],
                 &FmtCtx::utc_default()
@@ -484,11 +911,7 @@ mod tests {
     fn box_arrays_use_a_semicolon_delimiter() -> Result<(), ArrayError> {
         // `box` is the one built-in with `typdelim = ';'`, because its own
         // output text contains commas.
-        let elems = array_in(
-            "{(1,1),(0,0);(3,3),(2,2)}",
-            PgType::Box,
-            &FmtCtx::utc_default(),
-        )?;
+        let elems = parse("{(1,1),(0,0);(3,3),(2,2)}", PgType::Box)?;
         assert_eq!(
             elems,
             vec![
@@ -499,7 +922,7 @@ mod tests {
         // Round-trips unquoted: a comma is no longer the delimiter, so the
         // element text does not need quoting.
         assert_eq!(
-            format(PgType::Box, &elems, &FmtCtx::utc_default()),
+            round_trip("{(1,1),(0,0);(3,3),(2,2)}", PgType::Box)?,
             "{(1,1),(0,0);(3,3),(2,2)}"
         );
         Ok(())

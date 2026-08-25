@@ -72,6 +72,11 @@ const T_POLYGON: u8 = 43;
 const T_VECTOR: u8 = 44;
 const T_CHAR: u8 = 45;
 const T_CID: u8 = 46;
+/// An array carrying an explicit dimension list. Supersedes [`T_ARRAY`] for
+/// every shape that tag cannot describe — more than one dimension, or a lower
+/// bound other than 1 — while plain 1-D arrays keep writing [`T_ARRAY`] so that
+/// pages written before multi-dimensional arrays existed still decode.
+const T_ARRAY_ND: u8 = 47;
 
 // Tags at 200 and above are NOT value kinds. They are storage-layer markers that
 // an access method resolves before this codec is reached, and they live in their
@@ -324,12 +329,26 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
             out.push(T_TSQUERY);
             put_var(out, &crate::tsquery::encode(q));
         }
-        // A 1-D array: element type OID, element count, then per element a
-        // presence byte (0 = NULL, 1 = a self-describing datum). Elements recurse
-        // through `encode_datum`, so nested value types work automatically.
-        Value::Array { elem, elems } => {
-            out.push(T_ARRAY);
+        // An array: element type OID, element count, then per element a presence
+        // byte (0 = NULL, 1 = a self-describing datum). Elements recurse through
+        // `encode_datum`, so nested value types work automatically.
+        //
+        // The plain [`T_ARRAY`] form describes only the shape it was introduced
+        // with — one dimension at the default lower bound — so anything else
+        // takes [`T_ARRAY_ND`], which carries the dimension list. Keeping the
+        // common shape on the old tag is what lets pages written before
+        // multi-dimensional arrays existed keep decoding byte for byte.
+        Value::Array { elem, dims, elems } => {
+            let flat = matches!(dims.as_slice(), [] | [crate::ArrayDim { lower: 1, .. }]);
+            out.push(if flat { T_ARRAY } else { T_ARRAY_ND });
             out.extend_from_slice(&elem.oid().to_le_bytes());
+            if !flat {
+                out.push(dims.len() as u8);
+                for d in dims {
+                    out.extend_from_slice(&d.lower.to_le_bytes());
+                    out.extend_from_slice(&d.len.to_le_bytes());
+                }
+            }
             out.extend_from_slice(&(elems.len() as u32).to_le_bytes());
             for e in elems {
                 if matches!(e, Value::Null) {
@@ -580,9 +599,18 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
         T_TSQUERY => {
             Value::Tsquery(crate::tsquery::decode(r.var()).expect("stored tsquery decodes"))
         }
-        T_ARRAY => {
+        T_ARRAY | T_ARRAY_ND => {
             let elem_oid = r.u32();
             let elem = PgType::from_oid(elem_oid).expect("stored array element type re-resolves");
+            let dims = (tag == T_ARRAY_ND).then(|| {
+                let ndims = r.take(1)[0] as usize;
+                (0..ndims)
+                    .map(|_| crate::ArrayDim {
+                        lower: r.u32() as i32,
+                        len: r.u32() as i32,
+                    })
+                    .collect::<Vec<_>>()
+            });
             let count = r.u32() as usize;
             // Each element occupies at least one byte (its presence flag), so a
             // count larger than the bytes remaining is corrupt; cap the up-front
@@ -597,7 +625,10 @@ pub fn decode_datum(buf: &[u8], pos: &mut usize) -> Value {
                     elems.push(decode_datum(buf, &mut r.pos));
                 }
             }
-            Value::Array { elem, elems }
+            match dims {
+                Some(dims) => Value::Array { elem, dims, elems },
+                None => Value::array_1d(elem, elems),
+            }
         }
         T_VECTOR => {
             let kind = match r.take(1)[0] {
@@ -705,8 +736,12 @@ pub fn skip_datum(buf: &[u8], pos: &mut usize) {
             let count = r.u32() as usize;
             r.take(count.saturating_mul(width));
         }
-        T_ARRAY => {
+        tag @ (T_ARRAY | T_ARRAY_ND) => {
             r.take(4);
+            if tag == T_ARRAY_ND {
+                let ndims = r.take(1)[0] as usize;
+                r.take(ndims.saturating_mul(8));
+            }
             let count = r.u32();
             for _ in 0..count {
                 if r.take(1)[0] != 0 {
@@ -772,6 +807,31 @@ mod tests {
         decode_datum(&buf, &mut pos);
     }
 
+    /// A plain 1-D array must still go out on the tag it has always used, byte
+    /// for byte — pages written before multi-dimensional arrays existed decode
+    /// through that tag, and the on-disk format is not ours to change.
+    #[test]
+    fn one_dimensional_arrays_keep_the_original_tag() {
+        let mut buf = Vec::new();
+        encode_datum(
+            &Value::array_1d(PgType::Int4, vec![Value::Int4(1), Value::Null]),
+            &mut buf,
+        );
+        #[rustfmt::skip]
+        let expected: Vec<u8> = vec![
+            T_ARRAY,
+            23, 0, 0, 0, // element type OID, little-endian
+            2, 0, 0, 0,  // element count
+            1, T_INT4, 1, 0, 0, 0,
+            0,           // the NULL's presence byte, with no datum after it
+        ];
+        assert_eq!(buf, expected);
+        // The empty array shares that tag: it has no dimension list to record.
+        let mut empty = Vec::new();
+        encode_datum(&Value::array_1d(PgType::Int4, vec![]), &mut empty);
+        assert_eq!(empty[0], T_ARRAY);
+    }
+
     fn roundtrip(v: Value) {
         let mut buf = Vec::new();
         encode_datum(&v, &mut buf);
@@ -800,10 +860,7 @@ mod tests {
                 len: 12,
                 data: vec![0xAB, 0xC0],
             },
-            Value::Array {
-                elem: PgType::Text,
-                elems: vec![Value::Text("x".into()), Value::Null],
-            },
+            Value::array_1d(PgType::Text, vec![Value::Text("x".into()), Value::Null]),
             Value::Path(crate::geo::PathVal {
                 closed: true,
                 pts: vec![[1.0, 2.0], [3.0, 4.0]],
@@ -1049,21 +1106,40 @@ mod tests {
             );
         }
         // Arrays: 1-D, empty, NULL elements, and a text element type.
+        roundtrip(Value::array_1d(
+            PgType::Int4,
+            vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)],
+        ));
+        roundtrip(Value::array_1d(PgType::Int4, vec![]));
+        roundtrip(Value::array_1d(
+            PgType::Int8,
+            vec![Value::Int8(10), Value::Null, Value::Int8(-30)],
+        ));
+        roundtrip(Value::array_1d(
+            PgType::Text,
+            vec![Value::Text("a".into()), Value::Text("b,c".into())],
+        ));
+        // Shapes the plain `T_ARRAY` tag cannot describe: more than one
+        // dimension, and a lower bound other than 1.
         roundtrip(Value::Array {
             elem: PgType::Int4,
-            elems: vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)],
+            dims: vec![
+                crate::ArrayDim { lower: 1, len: 3 },
+                crate::ArrayDim { lower: 1, len: 2 },
+            ],
+            elems: vec![
+                Value::Int4(1),
+                Value::Null,
+                Value::Int4(3),
+                Value::Int4(4),
+                Value::Int4(5),
+                Value::Int4(6),
+            ],
         });
         roundtrip(Value::Array {
             elem: PgType::Int4,
-            elems: vec![],
-        });
-        roundtrip(Value::Array {
-            elem: PgType::Int8,
-            elems: vec![Value::Int8(10), Value::Null, Value::Int8(-30)],
-        });
-        roundtrip(Value::Array {
-            elem: PgType::Text,
-            elems: vec![Value::Text("a".into()), Value::Text("b,c".into())],
+            dims: vec![crate::ArrayDim { lower: -2, len: 2 }],
+            elems: vec![Value::Int4(1), Value::Int4(2)],
         });
         roundtrip(Value::Vector {
             kind: VectorKind::Oid,

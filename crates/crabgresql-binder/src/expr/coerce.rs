@@ -39,6 +39,7 @@ pub(super) fn bind_cast(
     {
         return Ok(Binding::Typed(BoundExpr::ArrayCtor {
             elem,
+            nested: false,
             ty: target,
             elems: Vec::new(),
         }));
@@ -65,6 +66,7 @@ pub(super) fn bind_cast(
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(Binding::Typed(BoundExpr::ArrayCtor {
             elem: PgType::Reg(kind),
+            nested: false,
             ty: target,
             elems,
         }));
@@ -1050,7 +1052,7 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, 
             // type's own input function, so it needs the same session zone and
             // transaction clock a scalar of that type would get.
             crabgresql_types::array::array_in(s, elem, fmt)
-                .map(|elems| Value::Array { elem, elems })
+                .map(|(dims, elems)| Value::Array { elem, dims, elems })
                 .map_err(|e| BindError::new(e.sqlstate, e.message).with_detail(e.detail))
         }
         // Both vector errors name the *element* type (`oid`/`smallint`), so the

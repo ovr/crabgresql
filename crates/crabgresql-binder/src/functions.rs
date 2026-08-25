@@ -864,14 +864,24 @@ pub enum ScalarFn {
     ArrayContainedBy,
     /// `array && array` — the arrays share at least one element.
     ArrayOverlap,
-    /// `array_length(array, dim int4) -> int4` (NULL for an empty array or a
-    /// dimension other than 1).
+    /// `array_length(array, dim int4) -> int4` — the length of that dimension,
+    /// NULL for an empty array or a dimension the value does not have.
     ArrayLength,
-    /// `array_upper(array, dim int4) -> int4` — the upper subscript bound. For
-    /// the 1-based 1-D arrays here this equals the length; NULL for an empty
-    /// array or a dimension other than 1.
+    /// `array_upper(array, dim int4) -> int4` — that dimension's upper subscript
+    /// bound, NULL under the same conditions as [`ScalarFn::ArrayLength`]. At the
+    /// default lower bound of 1 it equals the length.
     ArrayUpper,
-    /// `cardinality(array) -> int4` — the total number of elements.
+    /// `array_lower(array, dim int4) -> int4` — that dimension's lower subscript
+    /// bound, 1 unless a literal fixed another one.
+    ArrayLower,
+    /// `array_ndims(array) -> int4` — how many dimensions the value has, NULL for
+    /// an empty array.
+    ArrayNdims,
+    /// `array_dims(array) -> text` — every dimension as `[lower:upper]`, NULL for
+    /// an empty array.
+    ArrayDims,
+    /// `cardinality(array) -> int4` — the total number of elements, across all
+    /// dimensions.
     Cardinality,
     /// `array_to_string(array, delimiter text[, null_string text]) -> text`.
     /// Non-strict on the optional `null_string`: renders each element (NULLs
@@ -4445,6 +4455,9 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         "cardinality"
             | "array_length"
             | "array_upper"
+            | "array_lower"
+            | "array_ndims"
+            | "array_dims"
             | "array_append"
             | "array_prepend"
             | "array_cat"
@@ -5540,6 +5553,7 @@ fn pack_variadic_tail(
     let tail = args.split_off(sig.arg_types.len() - 1);
     args.push(BoundExpr::ArrayCtor {
         elem,
+        nested: false,
         ty: PgType::Array(elem.oid()),
         elems: tail,
     });

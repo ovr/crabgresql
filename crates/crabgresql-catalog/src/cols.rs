@@ -128,10 +128,7 @@ pub(crate) fn optional_array(elem: PgType, values: Vec<Value>) -> Value {
     if values.is_empty() {
         Value::Null
     } else {
-        Value::Array {
-            elem,
-            elems: values,
-        }
+        Value::array_1d(elem, values)
     }
 }
 
@@ -160,10 +157,10 @@ pub(crate) fn reg_array_type(kind: RegKind) -> PgType {
 /// that names nothing left falls back to its digits, which is what PostgreSQL
 /// renders for a type it genuinely cannot name.
 pub(crate) fn regtype_array(cat: &SystemCatalog, oids: &[u32]) -> Value {
-    Value::Array {
-        elem: PgType::Reg(RegKind::Type),
-        elems: oids.iter().map(|&oid| regtype_named(cat, oid)).collect(),
-    }
+    Value::array_1d(
+        PgType::Reg(RegKind::Type),
+        oids.iter().map(|&oid| regtype_named(cat, oid)).collect(),
+    )
 }
 
 /// One `regtype` datum, named the three-tier way [`regtype_array`] documents.

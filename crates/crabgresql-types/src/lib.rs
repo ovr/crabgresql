@@ -46,6 +46,7 @@ pub mod version;
 pub mod wire;
 pub mod xid;
 
+pub use array::ArrayDim;
 pub use bytea::ByteaOutput;
 pub use fmt::FmtCtx;
 pub use interval::Interval;
@@ -1506,12 +1507,21 @@ pub enum Value {
         ordinal: u32,
         label: String,
     },
-    /// A one-dimensional array. `elem` is the element type (so
-    /// [`Value::pg_type`] can report `PgType::Array(elem.oid())` even for an
-    /// empty array); `elems` are the element values, which may be
-    /// [`Value::Null`]. See [`crate::array`].
+    /// An array. `elem` is the element type (so [`Value::pg_type`] can report
+    /// `PgType::Array(elem.oid())` even for an empty array); `elems` are the
+    /// element values, which may be [`Value::Null`]. See [`crate::array`].
+    ///
+    /// Arrays are flat, never nested: `dims` gives the bounds of each dimension
+    /// and `elems` holds every element in row-major order, so
+    /// `elems.len() == dims.iter().map(|d| d.len).product()` always holds and
+    /// `dims.len() <= array::MAXDIM`. An **empty** array has an empty `dims` —
+    /// zero dimensions, not one dimension of length zero — which is what makes
+    /// `array_dims('{}'::int[])` NULL rather than `[1:0]`.
+    ///
+    /// Build a flat one with [`Value::array_1d`] rather than by hand.
     Array {
         elem: PgType,
+        dims: Vec<array::ArrayDim>,
         elems: Vec<Value>,
     },
     /// An `oidvector`/`int2vector`. `elems` are [`Value::Oid`]/[`Value::Int2`]
@@ -1524,6 +1534,17 @@ pub enum Value {
 }
 
 impl Value {
+    /// A one-dimensional array of `elems` at the default lower bound of 1 — the
+    /// shape every caller that builds an array flat wants. An empty `elems`
+    /// yields the zero-dimension empty array (see [`Value::Array`]).
+    pub fn array_1d(elem: PgType, elems: Vec<Value>) -> Value {
+        Value::Array {
+            elem,
+            dims: array::dims_1d(elems.len()),
+            elems,
+        }
+    }
+
     pub fn pg_type(&self) -> Option<PgType> {
         match self {
             Value::Null => None,
@@ -1647,7 +1668,7 @@ impl Value {
             // An enum prints as its label (PG's `enum_out`).
             Value::Enum { label, .. } => Some(label.clone()),
             // An array prints in PG's `{...}` form (`array_out`).
-            Value::Array { elem, elems } => Some(array::format(*elem, elems, fmt)),
+            Value::Array { elem, dims, elems } => Some(array::format(*elem, dims, elems, fmt)),
             // A vector prints space-separated and unbraced (`oidvectorout`).
             // Zone-independent: its elements are `oid`/`int2`.
             Value::Vector { elems, .. } => Some(vector::format(elems)),
@@ -1905,11 +1926,7 @@ mod tests {
         );
         assert_eq!(Value::Bytea(Vec::new()).deep_size_of(), size_of::<Value>());
         assert_eq!(
-            Value::Array {
-                elem: PgType::Int4,
-                elems: Vec::new()
-            }
-            .deep_size_of(),
+            Value::array_1d(PgType::Int4, Vec::new()).deep_size_of(),
             size_of::<Value>()
         );
     }
@@ -1972,10 +1989,10 @@ mod tests {
                 3,
             ),
             (
-                Value::Array {
-                    elem: PgType::Text,
-                    elems: vec![Value::Text("a".into()), Value::Text("b,c".into())],
-                },
+                Value::array_1d(
+                    PgType::Text,
+                    vec![Value::Text("a".into()), Value::Text("b,c".into())],
+                ),
                 2,
             ),
         ];
@@ -2015,14 +2032,8 @@ mod tests {
             Value::Jsonpath(jsonpath::jsonpath_in("$.a.b.c[*] ? (@.x > 3 && @.y < 4)")?);
         assert!(long_path.deep_size_of() > short_path.deep_size_of());
 
-        let one = Value::Array {
-            elem: PgType::Int4,
-            elems: vec![Value::Int4(1)],
-        };
-        let hundred = Value::Array {
-            elem: PgType::Int4,
-            elems: (0..100).map(Value::Int4).collect(),
-        };
+        let one = Value::array_1d(PgType::Int4, vec![Value::Int4(1)]);
+        let hundred = Value::array_1d(PgType::Int4, (0..100).map(Value::Int4).collect());
         assert!(hundred.deep_size_of() > one.deep_size_of());
         Ok(())
     }

@@ -263,13 +263,27 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
-    let (elem, exprs) = unify_value_column(bindings, "ARRAY", scope.catalog())?;
-    // Reject an element type this build has no array type for — a user enum, or
-    // an array, which is what makes a multi-dimensional constructor land here.
+    let (unified, exprs) = unify_value_column(bindings, "ARRAY", scope.catalog())?;
+    // `ARRAY[ARRAY[1,2], ARRAY[3,4]]` (and its `ARRAY[[1,2],[3,4]]` spelling)
+    // unifies on an *array* type: the operands are whole rows of the result, not
+    // elements of it. The constructor then has the same type as its operands —
+    // PG has no nested array type — and only gains a dimension, which is why the
+    // shapes are checked at run time rather than here.
+    let (elem, nested) = match unified {
+        PgType::Array(elem_oid) => {
+            let elem = PgType::from_oid(elem_oid).ok_or_else(|| {
+                BindError::feature_not_supported(format!(
+                    "could not find array type for data type {}",
+                    crate::expr::type_label(unified, scope.catalog().as_ref())
+                ))
+            })?;
+            (elem, true)
+        }
+        elem => (elem, false),
+    };
+    // Reject an element type this build has no array type for — a user enum, say.
     // `type_label`, not `PgType::name`, which renders a runtime-created type as
     // the useless "user-defined".
-    // TODO: support multi-dimensional array constructors (`ARRAY[[1,2],[3,4]]`,
-    // `ARRAY[ARRAY[…]]`).
     if crabgresql_types::array::array_oid_for_elem(elem.oid()).is_none() {
         return Err(BindError::feature_not_supported(format!(
             "could not find array type for data type {}",
@@ -283,21 +297,21 @@ fn bind_array_ctor(elems: &[ast::Expr], scope: &Scope) -> Result<Binding, BindEr
     }
     Ok(Binding::Typed(BoundExpr::ArrayCtor {
         elem,
+        nested,
         ty: PgType::Array(elem.oid()),
         elems: exprs,
     }))
 }
 
-/// Bind an `a[i]` subscript: a single integer index on an array, whose result
-/// type is the array's element type.
+/// Bind an `a[i]` subscript — one integer index per array dimension
+/// (`a[i][j]`), whose result type is the array's element type.
 ///
 /// The parser only folds a dotted path into a `CompoundIdentifier` when *every*
 /// link is an identifier, so a trailing subscript strands the whole path here as
 /// `root` plus a chain of `Dot`s. Those dots are a qualified column reference,
 /// not field access.
 ///
-/// TODO: support array slices (`a[1:3]`) and chained/multi-dimensional
-/// subscripts, both rejected here with `0A000`.
+/// TODO: support array slices (`a[1:3]`), still rejected here with `0A000`.
 fn bind_subscript(
     root: &ast::Expr,
     access_chain: &[ast::AccessExpr],
@@ -308,19 +322,27 @@ fn bind_subscript(
             "multi-dimensional or field subscripting is not supported yet",
         )
     };
-    // A second subscript would need multi-dimensional arrays, a dot *after* a
-    // subscript composite types — neither of which this build represents.
-    let Some((ast::AccessExpr::Subscript(subscript), path)) = access_chain.split_last() else {
-        return Err(unsupported());
-    };
-    let index_expr = match subscript {
-        ast::Subscript::Index { index } => index,
-        ast::Subscript::Slice { .. } => {
-            return Err(BindError::feature_not_supported(
-                "array slice access is not supported yet",
-            ));
+    // The chain is a run of subscripts, optionally preceded by the dots of a
+    // qualified column name. A dot *after* a subscript would be field access on
+    // a composite type, which this build does not represent.
+    let first_subscript = access_chain
+        .iter()
+        .position(|link| matches!(link, ast::AccessExpr::Subscript(_)))
+        .ok_or_else(unsupported)?;
+    let (path, subscripts) = access_chain.split_at(first_subscript);
+    let mut index_exprs = Vec::with_capacity(subscripts.len());
+    for link in subscripts {
+        match link {
+            ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => index_exprs.push(index),
+            ast::AccessExpr::Subscript(ast::Subscript::Slice { .. }) => {
+                return Err(BindError::feature_not_supported(
+                    "array slice access is not supported yet",
+                ));
+            }
+            // A `Dot` here follows a subscript: field access.
+            ast::AccessExpr::Dot(_) => return Err(unsupported()),
         }
-    };
+    }
     let base = if path.is_empty() {
         bind_scalar(root, scope)?
     } else {
@@ -357,10 +379,16 @@ fn bind_subscript(
             ));
         }
     };
-    let index = coerce_expr(bind_scalar(index_expr, scope)?, PgType::Int4)?;
+    // How many subscripts an array actually *has* is a property of the value, so
+    // a count that does not match is not an error here — the executor yields
+    // NULL, as PG does.
+    let indexes = index_exprs
+        .into_iter()
+        .map(|e| coerce_expr(bind_scalar(e, scope)?, PgType::Int4))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Binding::Typed(BoundExpr::Subscript {
         base: Box::new(base),
-        index: Box::new(index),
+        indexes,
         ty: elem,
     }))
 }

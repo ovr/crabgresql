@@ -1433,9 +1433,9 @@ fn resolve_expr(
             resolve_exprs(args, ctx, txn)?;
         }
         BoundExpr::ArrayCtor { elems, .. } => resolve_exprs(elems, ctx, txn)?,
-        BoundExpr::Subscript { base, index, .. } => {
+        BoundExpr::Subscript { base, indexes, .. } => {
             resolve_expr(base, ctx, txn)?;
-            resolve_expr(index, ctx, txn)?;
+            resolve_exprs(indexes, ctx, txn)?;
         }
         BoundExpr::Case { whens, else_, .. } => {
             for (cond, result) in whens.iter_mut() {
@@ -1551,10 +1551,7 @@ fn fold_subquery(
             let elem = hole_ty(&cmp).unwrap_or(PgType::Text);
             Ok(BoundExpr::QuantifiedArray {
                 array: Box::new(BoundExpr::Const {
-                    value: Value::Array {
-                        elem,
-                        elems: dedup_candidates(subquery_column(rows)),
-                    },
+                    value: Value::array_1d(elem, dedup_candidates(subquery_column(rows))),
                     ty: PgType::Array(elem.oid()),
                 }),
                 all,
@@ -1655,7 +1652,7 @@ fn array_subquery_value(
         .into_iter()
         .map(|value| coerce_value(value, elem, ctx))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Value::Array { elem, elems })
+    Ok(Value::array_1d(elem, elems))
 }
 
 /// Evaluate a *correlated* subquery marker for one outer `row`: the per-row
@@ -2004,7 +2001,15 @@ fn fold_off_hole_path(
 /// constant instead of rebuilding the array per row. `None` when any element is
 /// non-constant (a column/param reference), which must stay per-row.
 fn fold_const_array(expr: &BoundExpr) -> Option<BoundExpr> {
-    let BoundExpr::ArrayCtor { elem, ty, elems } = expr else {
+    // A nested constructor's operands are sub-arrays, not elements, so folding
+    // it would need the dimension stacking `eval` does; leave it per-row.
+    let BoundExpr::ArrayCtor {
+        elem,
+        nested: false,
+        ty,
+        elems,
+    } = expr
+    else {
         return None;
     };
     let values = elems
@@ -2015,10 +2020,7 @@ fn fold_const_array(expr: &BoundExpr) -> Option<BoundExpr> {
         })
         .collect::<Option<Vec<_>>>()?;
     Some(BoundExpr::Const {
-        value: Value::Array {
-            elem: *elem,
-            elems: values,
-        },
+        value: Value::array_1d(*elem, values),
         ty: *ty,
     })
 }
@@ -5696,10 +5698,10 @@ mod tests {
         assert_eq!(cols[0].ty, PgType::Array(crabgresql_types::oid::INT4));
         assert_eq!(
             rows,
-            vec![vec![Value::Array {
-                elem: PgType::Int4,
-                elems: vec![Value::Int4(2), Value::Null, Value::Int4(1)],
-            }]]
+            vec![vec![Value::array_1d(
+                PgType::Int4,
+                vec![Value::Int4(2), Value::Null, Value::Int4(1)]
+            )]]
         );
     }
 
@@ -5709,10 +5711,10 @@ mod tests {
     #[test]
     fn array_agg_follows_its_own_order_by() {
         let ints = |ns: [i32; 3]| {
-            vec![vec![Value::Array {
-                elem: PgType::Int4,
-                elems: ns.into_iter().map(Value::Int4).collect(),
-            }]]
+            vec![vec![Value::array_1d(
+                PgType::Int4,
+                ns.into_iter().map(Value::Int4).collect(),
+            )]]
         };
         let rows = "(VALUES (1, 3), (2, 1), (3, 2)) t(x, y)";
         assert_eq!(
@@ -5731,10 +5733,10 @@ mod tests {
     fn aggregate_order_by_places_nulls_by_the_key() {
         let rows = "(VALUES (1, 3), (2, NULL), (3, 2)) t(x, y)";
         let ints = |ns: [i32; 3]| {
-            vec![vec![Value::Array {
-                elem: PgType::Int4,
-                elems: ns.into_iter().map(Value::Int4).collect(),
-            }]]
+            vec![vec![Value::array_1d(
+                PgType::Int4,
+                ns.into_iter().map(Value::Int4).collect(),
+            )]]
         };
         assert_eq!(
             run_rows(&format!("SELECT array_agg(x ORDER BY y) FROM {rows}")).1,
@@ -5776,10 +5778,10 @@ mod tests {
         );
         assert_eq!(
             rows,
-            vec![vec![Value::Array {
-                elem: PgType::Int4,
-                elems: vec![Value::Null, Value::Int4(3), Value::Int4(2), Value::Int4(1)],
-            }]]
+            vec![vec![Value::array_1d(
+                PgType::Int4,
+                vec![Value::Null, Value::Int4(3), Value::Int4(2), Value::Int4(1)]
+            )]]
         );
     }
 
@@ -5796,10 +5798,10 @@ mod tests {
             run_rows("SELECT array_agg(DISTINCT x) FROM (VALUES (3), (1), (NULL), (2), (1)) t(x)");
         assert_eq!(
             rows,
-            vec![vec![Value::Array {
-                elem: PgType::Int4,
-                elems: vec![Value::Int4(1), Value::Int4(2), Value::Int4(3), Value::Null,],
-            }]]
+            vec![vec![Value::array_1d(
+                PgType::Int4,
+                vec![Value::Int4(1), Value::Int4(2), Value::Int4(3), Value::Null,]
+            )]]
         );
     }
 
@@ -5851,14 +5853,11 @@ mod tests {
         assert_eq!(
             rows,
             vec![vec![
-                Value::Array {
-                    elem: PgType::Int4,
-                    elems: vec![Value::Int4(2), Value::Int4(1)],
-                },
-                Value::Array {
-                    elem: PgType::Int4,
-                    elems: vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)],
-                },
+                Value::array_1d(PgType::Int4, vec![Value::Int4(2), Value::Int4(1)]),
+                Value::array_1d(
+                    PgType::Int4,
+                    vec![Value::Int4(1), Value::Int4(2), Value::Int4(3)]
+                ),
             ]]
         );
     }
@@ -5873,10 +5872,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![vec![
-                Value::Array {
-                    elem: PgType::Int4,
-                    elems: Vec::new(),
-                },
+                Value::array_1d(PgType::Int4, Vec::new()),
                 Value::Text(String::new()),
             ]]
         );
@@ -5890,10 +5886,10 @@ mod tests {
             run_rows("SELECT array(SELECT n FROM (VALUES (1), (NULL), (1), (2)) v(n))");
         assert_eq!(
             rows,
-            vec![vec![Value::Array {
-                elem: PgType::Int4,
-                elems: vec![Value::Int4(1), Value::Null, Value::Int4(1), Value::Int4(2)],
-            }]]
+            vec![vec![Value::array_1d(
+                PgType::Int4,
+                vec![Value::Int4(1), Value::Null, Value::Int4(1), Value::Int4(2)]
+            )]]
         );
     }
 
@@ -5911,18 +5907,9 @@ mod tests {
             vec![
                 vec![
                     Value::Int4(1),
-                    Value::Array {
-                        elem: PgType::Int4,
-                        elems: vec![Value::Int4(7), Value::Int4(8)],
-                    },
+                    Value::array_1d(PgType::Int4, vec![Value::Int4(7), Value::Int4(8)]),
                 ],
-                vec![
-                    Value::Int4(2),
-                    Value::Array {
-                        elem: PgType::Int4,
-                        elems: Vec::new(),
-                    },
-                ],
+                vec![Value::Int4(2), Value::array_1d(PgType::Int4, Vec::new()),],
             ]
         );
         Ok(())

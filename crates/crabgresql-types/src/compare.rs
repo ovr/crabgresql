@@ -111,12 +111,24 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
         // The text-search types carry their own total orders.
         PgType::Tsvector => tsvector::cmp(tsvector_of(l), tsvector_of(r)),
         PgType::Tsquery => tsquery::cmp(tsquery_of(l), tsquery_of(r)),
-        // Arrays: element-wise comparison, then the shorter array is less on a
-        // common prefix (PG's `array_cmp`). A NULL element sorts after any
-        // non-NULL (NULLS-LAST), matching the default btree order.
+        // Arrays: element-wise comparison over the flat, row-major elements, then
+        // the shorter array is less on a common prefix (PG's `array_cmp`). A NULL
+        // element sorts after any non-NULL (NULLS-LAST), matching the default
+        // btree order.
+        //
+        // Shape only breaks a tie. Two arrays holding the same elements in the
+        // same order but under different dimensions or bounds are *not* equal —
+        // `ARRAY[[1,2]] = ARRAY[1,2]` and `'[2:3]={1,2}'::int[] = '{1,2}'` are
+        // both false — and the one with more dimensions, or the higher bound,
+        // sorts after.
         PgType::Array(elem_oid) => {
             let elem = PgType::from_oid(elem_oid).expect("orderable array element type resolves");
+            let (dl, dr) = (array_dims(l), array_dims(r));
             compare_elementwise(elem, array_elems(l), array_elems(r))
+                // Dimension *count* before the bounds themselves, so a deeper
+                // array sorts after a flatter one holding the same elements.
+                .then_with(|| dl.len().cmp(&dr.len()))
+                .then_with(|| dl.cmp(dr))
         }
         // `oidvector` is the one type whose *sort* order is not its element-wise
         // order: PG gives it its own operator class (`btoidvectorcmp`), which
@@ -183,6 +195,13 @@ pub fn int2(v: &Value) -> i16 {
 pub fn array_elems(v: &Value) -> &[Value] {
     match v {
         Value::Array { elems, .. } => elems,
+        other => unreachable!("expected array, got {other:?}"),
+    }
+}
+
+pub fn array_dims(v: &Value) -> &[crate::ArrayDim] {
+    match v {
+        Value::Array { dims, .. } => dims,
         other => unreachable!("expected array, got {other:?}"),
     }
 }

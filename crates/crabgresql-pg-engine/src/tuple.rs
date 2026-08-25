@@ -587,10 +587,10 @@ mod tests {
             Value::Text("a longer string".into()),
             Value::Null,
             Value::Bool(true),
-            Value::Array {
-                elem: crabgresql_types::PgType::Int4,
-                elems: vec![Value::Int4(1), Value::Null, Value::Int4(3)],
-            },
+            Value::array_1d(
+                crabgresql_types::PgType::Int4,
+                vec![Value::Int4(1), Value::Null, Value::Int4(3)],
+            ),
             Value::Bytea(vec![7; 9]),
         ];
         let buf = encode_inline(&vals, &hdr, ctid);
