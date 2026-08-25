@@ -137,7 +137,13 @@ CREATE TABLE chk_cast (x int, arr int[], i int,
                        y text DEFAULT (1)::text,
                        z text DEFAULT 'x'::text,
                        CHECK (x::text > 'a'),
-                       CHECK (arr[i + 1] > 0));
+                       CHECK (arr[i + 1] > 0),
+                       -- The dots of a qualified column survive a trailing
+                       -- subscript as a chain of field accesses; read that way
+                       -- this would be a field of a column named chk_cast, so
+                       -- the qualifier has to be recognised before it is
+                       -- dropped, as it is for a column with no subscript.
+                       CHECK (chk_cast.arr[chk_cast.i] > 0));
 SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
   WHERE conrelid = 'chk_cast'::regclass AND contype = 'c' ORDER BY conname;
 SELECT attname, pg_get_expr(adbin, adrelid) FROM pg_attrdef

@@ -679,14 +679,7 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
         // [`Cx::unqualify`]. Guarded on the qualifier actually naming this
         // relation — a mismatched one is not ours to rewrite, and binding has
         // already rejected it with 42P01 by the time we deparse.
-        ast::Expr::CompoundIdentifier(parts) => match (cx.unqualify, parts.as_slice()) {
-            (Some(relation), [qualifier, column])
-                if crate::expr::normalize_ident(qualifier) == relation =>
-            {
-                ident(column)
-            }
-            _ => parts.iter().map(ident).collect::<Vec<_>>().join("."),
-        },
+        ast::Expr::CompoundIdentifier(parts) => qualified_column(parts, cx),
         ast::Expr::AtTimeZone {
             timestamp,
             time_zone,
@@ -717,17 +710,23 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
         // for a field access even off a column. Later links in the chain never
         // add parentheses: `(a)[1][2]`, `(p).x[1]`.
         ast::Expr::CompoundFieldAccess { root, access_chain } => {
-            let field_first = matches!(access_chain.first(), Some(ast::AccessExpr::Dot(_)));
-            let column_root = matches!(
-                root.as_ref(),
-                ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)
-            );
-            let root = match cx.param_refs || field_first || !column_root {
-                true => format!("({})", expr(root, cx, 0)),
-                false => expr(root, cx, u8::MAX),
+            let (base, chain) = match column_path(root, access_chain) {
+                Some((parts, rest)) => (qualified_column(&parts, cx), rest),
+                None => {
+                    let field_first = matches!(access_chain.first(), Some(ast::AccessExpr::Dot(_)));
+                    let column_root = matches!(
+                        root.as_ref(),
+                        ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)
+                    );
+                    let base = match cx.param_refs || field_first || !column_root {
+                        true => format!("({})", expr(root, cx, 0)),
+                        false => expr(root, cx, u8::MAX),
+                    };
+                    (base, access_chain.as_slice())
+                }
             };
-            let chain: String = access_chain.iter().map(|a| access(a, cx)).collect();
-            format!("{root}{chain}")
+            let chain: String = chain.iter().map(|a| access(a, cx)).collect();
+            format!("{base}{chain}")
         }
         ast::Expr::Cast {
             expr: inner,
@@ -818,6 +817,53 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
         prec != u8::MAX
     };
     if wrap { format!("({body})") } else { body }
+}
+
+/// The leading links of a chain that are really a *qualified column* —
+/// `t.arr[1]` — with the accesses that remain. `None` when the chain is what it
+/// looks like, a field access or a subscript off an expression.
+///
+/// The parser folds a dotted path into a `CompoundIdentifier` only when every
+/// link is an identifier, so a trailing subscript strands the whole path here
+/// as a root plus `Dot`s. Printing those as written would say something else
+/// entirely: `(t).arr[1]` reads a field `arr` off a *column* named `t`. Same
+/// rule the binder applies in `bind_subscript`.
+fn column_path<'a>(
+    root: &ast::Expr,
+    chain: &'a [ast::AccessExpr],
+) -> Option<(Vec<ast::Ident>, &'a [ast::AccessExpr])> {
+    let ast::Expr::Identifier(root) = root else {
+        return None;
+    };
+    let dots = chain
+        .iter()
+        .take_while(|link| matches!(link, ast::AccessExpr::Dot(ast::Expr::Identifier(_))))
+        .count();
+    if dots == 0 {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(dots + 1);
+    parts.push(root.clone());
+    parts.extend(chain[..dots].iter().filter_map(|link| match link {
+        ast::AccessExpr::Dot(ast::Expr::Identifier(field)) => Some(field.clone()),
+        _ => None,
+    }));
+    Some((parts, &chain[dots..]))
+}
+
+/// A dotted column reference. Inside a CHECK it loses its qualifier — see
+/// [`Cx::unqualify`] — guarded on the qualifier actually naming this relation,
+/// since a mismatched one is not ours to rewrite and binding has already
+/// rejected it with 42P01 by the time we deparse.
+fn qualified_column(parts: &[ast::Ident], cx: Cx) -> String {
+    match (cx.unqualify, parts) {
+        (Some(relation), [qualifier, column])
+            if crate::expr::normalize_ident(qualifier) == relation =>
+        {
+            ident(column)
+        }
+        _ => parts.iter().map(ident).collect::<Vec<_>>().join("."),
+    }
 }
 
 /// One link of a subscript/field chain. The index is an expression like any
@@ -1198,6 +1244,10 @@ mod tests {
         assert_eq!(plain("arr[i + 1]"), "arr[(i + 1)]");
         assert_eq!(plain("arr[1]"), "arr[1]");
         assert_eq!(plain("ARRAY[arr[1], 2]"), "ARRAY[arr[1], 2]");
+        // The dots of `t.arr[1]` qualify a column; printing them as the field
+        // access they parse into would read `arr` off a column named `t`.
+        assert_eq!(plain("t.arr[i + 1]"), "t.arr[(i + 1)]");
+        assert_eq!(plain("(p).x[1]"), "(p).x[1]");
     }
 
     /// A `CASE` is deparsed branch by branch, so the operators inside one are
