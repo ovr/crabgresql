@@ -245,7 +245,7 @@ pub trait CatalogOps: Send + Sync {
     fn rule_relation(&self, oid: u32) -> Option<u32>;
 
     /// The argument and result shape of the function `oid`, or `None` if there
-    /// is no such function. Backs the `pg_get_function_*` trio, which renders
+    /// is no such function. Backs the `pg_get_function_*` family, which renders
     /// what [`CatalogOps::proc_signature`] only identifies by.
     fn proc_info(&self, oid: u32) -> Option<ProcInfo>;
 

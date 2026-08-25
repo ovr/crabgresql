@@ -2205,8 +2205,8 @@ pub struct RoutineSig {
     pub imp: RoutineImpl,
 }
 
-/// One function's argument and result shape, as the `pg_get_function_*` trio
-/// renders it: a `pg_proc` row seen through *type OIDs*, where [`RoutineSig`]
+/// One function's argument, result and body shape, as the `pg_get_function_*`
+/// family renders it: a `pg_proc` row seen through *type OIDs*, where [`RoutineSig`]
 /// sees resolved [`PgType`]s. The two do not merge — this one describes
 /// built-in rows as well, whose types are OIDs the binder never resolves, and
 /// it must survive an OID no type answers to (which prints as `-`).
@@ -2230,6 +2230,30 @@ pub struct ProcInfo {
     /// procedure is not a function with a return type, so the renderers need
     /// this as well as the types.
     pub kind: char,
+    /// The SQL-standard body, for a routine written with one. `None` — a quoted
+    /// body, another language, or a built-in — is what makes
+    /// `pg_get_function_sqlbody` answer NULL.
+    pub sql_body: Option<SqlBody>,
+}
+
+/// A `LANGUAGE SQL` routine's body in its *standard* form — the one PostgreSQL
+/// parses at definition time and stores in `pg_proc.prosqlbody`, as against a
+/// quoted string it re-parses on first call. The two forms print differently
+/// (`RETURN …` against a `BEGIN ATOMIC` block), so which one was written is
+/// carried rather than re-derived.
+///
+/// Both variants hold SQL *text*, canonicalized when the routine is created and
+/// re-rendered for the reading session — the same split
+/// [`crate::Column::default_expr`]'s deparse makes, and for the same reason: the
+/// session's time zone belongs to whoever reads the body, not to whoever wrote
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SqlBody {
+    /// `RETURN <expr>` — the text is the expression alone.
+    Return(String),
+    /// `BEGIN ATOMIC <stmt>; END` — the text is the single statement, without
+    /// its terminator.
+    Atomic(String),
 }
 
 /// The `pg_proc` columns a [`ProcInfo`] is built from, spelled as PostgreSQL
@@ -2246,6 +2270,10 @@ pub struct StoredProc {
     pub prorettype: u32,
     pub proretset: bool,
     pub prokind: char,
+    /// The standard-form body, already parsed out of its `RETURN`/`BEGIN
+    /// ATOMIC` frame. PostgreSQL keeps a `pg_node_tree` here; crabgresql keeps
+    /// the SQL text that deparses to, exactly as it does for a column default.
+    pub prosqlbody: Option<SqlBody>,
 }
 
 impl From<StoredProc> for ProcInfo {
@@ -2267,6 +2295,7 @@ impl From<StoredProc> for ProcInfo {
             ret_type: stored.prorettype,
             retset: stored.proretset,
             kind: stored.prokind,
+            sql_body: stored.prosqlbody,
         }
     }
 }

@@ -99,6 +99,62 @@ pub fn is_copy_from_stdin(sql: &str) -> bool {
     }
 }
 
+/// Tracks psql's `BEGIN ATOMIC ... END` rule: inside such a routine body a
+/// semicolon separates the body's statements instead of ending the `CREATE`,
+/// so the lexer has to know where the block closes.
+///
+/// psql decides this on keywords, and so does this: the block opens on `ATOMIC`
+/// directly after `BEGIN` in a statement that began with `CREATE FUNCTION` or
+/// `CREATE PROCEDURE`, and closes on the matching `END` — with `CASE` counted
+/// as well, since a `CASE … END` inside the body would otherwise close it
+/// early.
+#[derive(Default)]
+struct AtomicBlock {
+    /// 0 outside a block; how many `END`s are still owed inside one.
+    depth: u32,
+    /// The previous word scanned, so `BEGIN ATOMIC` can be recognized as a pair.
+    previous: String,
+}
+
+impl AtomicBlock {
+    /// Feed one keyword-shaped word, `stmt` being the statement buffer scanned
+    /// so far (used only to check that this is a routine definition).
+    fn word(&mut self, word: &str, stmt: &str) {
+        let upper = word.to_ascii_uppercase();
+        if self.depth == 0 {
+            if upper == "ATOMIC" && self.previous == "BEGIN" && defines_routine(stmt) {
+                self.depth = 1;
+            }
+        } else {
+            match upper.as_str() {
+                "CASE" => self.depth += 1,
+                "END" => self.depth -= 1,
+                _ => {}
+            }
+        }
+        self.previous = upper;
+    }
+
+    /// Whether a `;` here separates body statements rather than ending one.
+    fn inside(&self) -> bool {
+        self.depth > 0
+    }
+
+    fn reset(&mut self) {
+        self.depth = 0;
+        self.previous.clear();
+    }
+}
+
+/// Whether the statement scanned so far is a `CREATE FUNCTION`/`PROCEDURE`,
+/// which is the only place `BEGIN ATOMIC` opens a routine body.
+fn defines_routine(stmt: &str) -> bool {
+    let upper = stmt.to_ascii_uppercase();
+    let mut words = upper.split_whitespace();
+    words.next() == Some("CREATE")
+        && words.any(|word| word.starts_with("FUNCTION") || word.starts_with("PROCEDURE"))
+}
+
 /// Quoting/comment state that survives across lines. The dollar-quote tag is
 /// tracked separately so the state stays `Copy`.
 #[derive(Clone, Copy, PartialEq)]
@@ -122,6 +178,8 @@ pub fn lex(input: &str) -> Vec<ScriptItem> {
     let mut has_content = false;
     let mut state = State::Normal;
     let mut dollar_tag = String::new();
+    let mut atomic = AtomicBlock::default();
+    let mut word = String::new();
     // `Some` while collecting the inline data of a `COPY … FROM STDIN`: each
     // line is accumulated until a lone `\.` closes the payload.
     let mut copy_data: Option<String> = None;
@@ -164,7 +222,21 @@ pub fn lex(input: &str) -> Vec<ScriptItem> {
             }
             match state {
                 State::Normal => {
-                    if c == ';' {
+                    // A word ends at the first character that cannot continue
+                    // it, so the keyword rule is applied *before* this
+                    // character is handled — that is what lets the `;` after
+                    // `END` see a closed block.
+                    if !is_ident_char(c) && !word.is_empty() {
+                        atomic.word(&word, &stmt);
+                        word.clear();
+                    }
+                    if is_ident_char(c) {
+                        word.push(c);
+                    }
+                    if c == ';' && atomic.inside() {
+                        stmt.push(';');
+                        has_content = true;
+                    } else if c == ';' {
                         stmt.push(';');
                         flush_sql(&mut items, &stmt, &mut emitted);
                         let is_copy = is_copy_from_stdin(&stmt);
@@ -174,6 +246,7 @@ pub fn lex(input: &str) -> Vec<ScriptItem> {
                             end: QueryEnd::Semicolon,
                         });
                         has_content = false;
+                        atomic.reset();
                         // A COPY … FROM STDIN switches subsequent lines to data
                         // collection; anything after the `;` on this line is not
                         // part of the payload (psql reads data from the next line).
@@ -226,6 +299,7 @@ pub fn lex(input: &str) -> Vec<ScriptItem> {
                             items.push(ScriptItem::Statement {
                                 end: QueryEnd::Backslash { name, args },
                             });
+                            atomic.reset();
                             if is_copy {
                                 copy_data = Some(String::new());
                                 break;
@@ -328,6 +402,11 @@ pub fn lex(input: &str) -> Vec<ScriptItem> {
             }
             i += 1;
         }
+        // A word cannot span lines, so the last one on this line ends here.
+        if !word.is_empty() {
+            atomic.word(&word, &stmt);
+            word.clear();
+        }
         if has_content {
             stmt.push('\n');
         }
@@ -397,6 +476,45 @@ mod tests {
 
     fn sql(text: &str) -> ScriptItem {
         ScriptItem::Sql(text.to_string())
+    }
+
+    /// A `BEGIN ATOMIC` body's semicolons separate its statements; only the one
+    /// after `END` sends the `CREATE`. Same rule psql applies, which is why the
+    /// upstream `create_function_sql` script is readable at all.
+    #[test]
+    fn an_atomic_body_holds_its_semicolons() {
+        assert_eq!(
+            statements(
+                "CREATE FUNCTION f(a int) RETURNS int LANGUAGE SQL\nBEGIN ATOMIC\n  SELECT a;\nEND;\nSELECT 1;\n"
+            ),
+            vec![
+                "CREATE FUNCTION f(a int) RETURNS int LANGUAGE SQL\nBEGIN ATOMIC\n  SELECT a;\nEND;",
+                "SELECT 1;",
+            ]
+        );
+        // Several statements, and a CASE whose END must not close the block.
+        assert_eq!(
+            statements(
+                "CREATE FUNCTION f(a int) RETURNS int LANGUAGE SQL BEGIN ATOMIC \
+                 SELECT CASE WHEN a > 0 THEN a ELSE 0 END; SELECT a; END; SELECT 2;"
+            )
+            .len(),
+            2
+        );
+    }
+
+    /// `BEGIN` outside a routine definition is still a transaction command, and
+    /// the word `atomic` elsewhere is just an identifier.
+    #[test]
+    fn begin_outside_a_routine_definition_is_unaffected() {
+        assert_eq!(
+            statements("BEGIN; SELECT 1; COMMIT;"),
+            vec!["BEGIN;", "SELECT 1;", "COMMIT;"]
+        );
+        assert_eq!(
+            statements("SELECT atomic FROM t; SELECT 1;"),
+            vec!["SELECT atomic FROM t;", "SELECT 1;"]
+        );
     }
 
     fn semicolon() -> ScriptItem {

@@ -9027,6 +9027,22 @@ pub enum CreateFunctionBody {
     ///
     /// [MsSql]: https://learn.microsoft.com/en-us/sql/t-sql/statements/create-function-transact-sql?view=sql-server-ver16#select_stmt
     AsReturnSelect(Select),
+
+    /// The SQL-standard body of a `LANGUAGE SQL` routine, as [PostgreSQL] takes
+    /// it: a block of statements bound to the routine at definition time rather
+    /// than a quoted string parsed on first call.
+    ///
+    /// Example:
+    /// ```sql
+    /// CREATE FUNCTION add(a INTEGER, b INTEGER) RETURNS INTEGER
+    /// LANGUAGE SQL
+    /// BEGIN ATOMIC
+    ///   SELECT a + b;
+    /// END;
+    /// ```
+    ///
+    /// [PostgreSQL]: https://www.postgresql.org/docs/current/sql-createfunction.html
+    BeginAtomic(Vec<Statement>),
 }
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]

@@ -72,9 +72,13 @@ pub(crate) fn pg_proc_schema() -> TableSchema {
 ///   exactly that the two agree ("pronargdefaults should be 0 iff
 ///   proargdefaults is null").
 /// * `protrftypes` — there are no transforms to name.
-/// * `prosqlbody` — PostgreSQL fills this only for a function written in the
-///   standard `BEGIN ATOMIC` form; every SQL routine here carries its body in
-///   `prosrc`, which is the same thing PostgreSQL does for a quoted body.
+/// * `prosqlbody` — a routine written in the standard `RETURN`/`BEGIN ATOMIC`
+///   form does have one, and `pg_get_function_sqlbody` renders it (which is
+///   what `pg_dump` reads), but the *column* stays NULL: PostgreSQL stores a
+///   `pg_node_tree` here, and nothing in this build renders a node tree. The
+///   NULL is therefore a gap, not a statement that no body exists — the one
+///   place in this list where the two differ. `prosrc` is empty for such a
+///   routine, exactly as in PostgreSQL.
 /// * `proconfig` — `CREATE FUNCTION` parses no `SET` clause, so no routine has
 ///   a per-call GUC setting.
 pub(crate) fn pg_proc_builtin_rows() -> Vec<Vec<Value>> {

@@ -27,8 +27,8 @@ use crabgresql_storage_api::{
     CheckConstraint, Column, GeneratedColumn, Generation, IndexConstraint, IndexKey, IndexMetadata,
     IndexMethod, InheritParent, PartitionBound, PartitionBoundDatum, PartitionOf, PartitionScheme,
     PartitionStrategy, RelPersistence, RelationMetadata, RoutineKind as ApiRoutineKind, RoutineSig,
-    SequenceDefinition, StorageError, TableAccessMethod, TableAm, TableEngine, TableSchema,
-    TypeCatalog, ViewDefinition,
+    SequenceDefinition, SqlBody, StorageError, TableAccessMethod, TableAm, TableEngine,
+    TableSchema, TypeCatalog, ViewDefinition,
 };
 use crabgresql_txn::{CommandId, IsolationLevel, TransactionManager, TxnContext, Xid};
 use crabgresql_types::text::{quote_ident, quote_sql_literal};
@@ -467,6 +467,7 @@ pub(crate) fn catalog_routine(
         strict: info.strict,
         secdef: info.secdef,
         src: info.src.clone(),
+        sql_body: info.sql_body.clone(),
     }
 }
 
@@ -7355,22 +7356,55 @@ fn function_internal_name(create: &ast::CreateFunction) -> Result<String, PgErro
     }
 }
 
-/// The normalized `SELECT <expr>` body text of a `LANGUAGE SQL` function. A
-/// `RETURN expr` / `AS RETURN expr` form becomes `SELECT expr`; an `AS '<body>'`
-/// string is taken verbatim (it is already a `SELECT`); an `AS RETURN (select)`
-/// is rendered from its query. The binder re-parses this text to validate and
-/// inline the body.
+/// The body of a `LANGUAGE SQL` function, in the two forms the catalog keeps it
+/// in: the normalized `SELECT <expr>` text the binder re-parses to inline the
+/// call, and — when the declaration used a SQL-standard body — the body
+/// `pg_get_function_sqlbody` renders back.
 ///
-/// TODO: accept a multi-statement `BEGIN ATOMIC ... END` body.
-fn sql_function_body_text(create: &ast::CreateFunction) -> Result<String, PgError> {
+/// Only the quoted `AS '<body>'` form has no standard body, which is exactly
+/// when PostgreSQL leaves `prosqlbody` NULL.
+///
+/// The `RETURN` expression is canonicalized on the way in, like a column
+/// default — `ruleutils::deparse_stored_expr` resolves the function calls
+/// inside so a literal argument carries the type its signature gives it —
+/// falling back to the text as written when it does not re-parse.
+///
+/// TODO: accept a multi-statement `BEGIN ATOMIC ... END` body. It needs
+/// per-statement execution, which the inlining call path has no room for.
+fn sql_function_body_text(
+    create: &ast::CreateFunction,
+    type_catalog: &Arc<dyn TypeCatalog>,
+) -> Result<(String, Option<SqlBody>), PgError> {
+    let canonical = |expr: &ast::Expr| {
+        let source = expr.to_string();
+        SqlBody::Return(
+            crabgresql_binder::ruleutils::deparse_stored_expr(&source, type_catalog)
+                .unwrap_or(source),
+        )
+    };
     match &create.function_body {
         Some(ast::CreateFunctionBody::Return(expr))
-        | Some(ast::CreateFunctionBody::AsReturnExpr(expr)) => Ok(format!("SELECT {expr}")),
-        Some(ast::CreateFunctionBody::AsReturnSelect(select)) => Ok(select.to_string()),
+        | Some(ast::CreateFunctionBody::AsReturnExpr(expr)) => {
+            Ok((format!("SELECT {expr}"), Some(canonical(expr))))
+        }
+        Some(ast::CreateFunctionBody::AsReturnSelect(select)) => {
+            let text = select.to_string();
+            Ok((text.clone(), Some(SqlBody::Atomic(text))))
+        }
+        Some(ast::CreateFunctionBody::BeginAtomic(statements)) => {
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                return Err(PgError::feature_not_supported(
+                    "a BEGIN ATOMIC body must hold exactly one SELECT statement",
+                ));
+            };
+            let text = query.to_string();
+            Ok((text.clone(), Some(SqlBody::Atomic(text))))
+        }
         Some(ast::CreateFunctionBody::AsBeforeOptions { body, .. })
-        | Some(ast::CreateFunctionBody::AsAfterOptions(body)) => string_literal(body),
+        | Some(ast::CreateFunctionBody::AsAfterOptions(body)) => Ok((string_literal(body)?, None)),
         _ => Err(PgError::feature_not_supported(
-            "CREATE FUNCTION LANGUAGE SQL requires a RETURN expression or AS '<body>'",
+            "CREATE FUNCTION LANGUAGE SQL requires a RETURN expression, a BEGIN ATOMIC body or \
+             AS '<body>'",
         )),
     }
 }
@@ -7480,7 +7514,7 @@ fn execute_create_function(
     let body = match lang.as_deref() {
         Some("internal") => FuncBody::Internal(function_internal_name(create)?),
         Some("sql") => {
-            let body_sql = sql_function_body_text(create)?;
+            let (body_sql, sql_body) = sql_function_body_text(create, type_catalog)?;
             // PG binds a `LANGUAGE SQL` body at CREATE time, reporting parse/type
             // errors then rather than on first call. Binding here also fixes the
             // register-after-validate ordering that makes a self-referential body
@@ -7500,7 +7534,10 @@ fn execute_create_function(
                 &body_sql,
             )
             .map_err(PgError::from)?;
-            FuncBody::Sql(body_sql)
+            FuncBody::Sql {
+                src: body_sql,
+                sql_body,
+            }
         }
         Some("plpgsql") => {
             let body_sql = routine_body_text(create)?;

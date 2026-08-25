@@ -3866,6 +3866,13 @@ impl fmt::Display for CreateFunction {
         if let Some(CreateFunctionBody::AsReturnSelect(function_body)) = &self.function_body {
             write!(f, " AS RETURN {function_body}")?;
         }
+        if let Some(CreateFunctionBody::BeginAtomic(statements)) = &self.function_body {
+            write!(f, " BEGIN ATOMIC ")?;
+            for statement in statements {
+                write!(f, "{statement}; ")?;
+            }
+            write!(f, "END")?;
+        }
         if let Some(using) = &self.using {
             write!(f, " {using}")?;
         }
@@ -3963,6 +3970,13 @@ impl fmt::Display for CreateProcedure {
             if let Some(link_symbol) = link_symbol {
                 write!(f, ", {link_symbol}")?;
             }
+        }
+        if let Some(CreateFunctionBody::BeginAtomic(statements)) = &self.function_body {
+            write!(f, " BEGIN ATOMIC ")?;
+            for statement in statements {
+                write!(f, "{statement}; ")?;
+            }
+            write!(f, "END")?;
         }
         Ok(())
     }

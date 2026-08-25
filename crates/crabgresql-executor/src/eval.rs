@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 
 use crabgresql_binder::{BinOp, BoundDomain, BoundExpr, MinMaxKind, ScalarFn, UnaryOp};
 use crabgresql_pg_wire::sqlstate;
-use crabgresql_storage_api::ProcInfo;
+use crabgresql_storage_api::{ProcInfo, SqlBody};
 use crabgresql_txn::{TxnContext, XactStatus};
 use crabgresql_types::text::quote_ident;
 use crabgresql_types::{Interval, PgType, Value, arith, cast};
@@ -1265,6 +1265,7 @@ fn eval_deparse_fn(
             Some(eval_pg_get_function_arguments(args, ctx))
         }
         ScalarFn::PgGetFunctionResult => Some(eval_pg_get_function_result(args, ctx)),
+        ScalarFn::PgGetFunctionSqlbody => Some(eval_pg_get_function_sqlbody(args, ctx)),
         _ => None,
     }
 }
@@ -1272,7 +1273,7 @@ fn eval_deparse_fn(
 /// Whether a call must answer NULL without running. PostgreSQL declares every
 /// `pg_get_*` deparse function STRICT (`proisstrict`, checked on 18.4 for all of
 /// `expr`, `viewdef`, `ruledef`, `triggerdef`, `constraintdef`, `indexdef`,
-/// `serial_sequence` and the `function_*` trio), so each of them calls this.
+/// `serial_sequence` and the four `function_*`), so each of them calls this.
 ///
 /// Spelled out rather than inherited because the family is dispatched from
 /// [`eval_deparse_fn`] ahead of the STRICT short-circuit in `eval_scalar`. That
@@ -1768,7 +1769,57 @@ fn eval_pg_get_function_result(args: &[Value], ctx: &ExecContext) -> Result<Valu
     }))
 }
 
-/// The catalog lookup the `pg_get_function_*` trio shares. A NULL argument and
+/// `pg_get_function_sqlbody(oid)`: the body of a routine written with a
+/// SQL-standard body, and NULL for every other routine — a quoted `AS '<body>'`,
+/// a PL/pgSQL or `internal` one, and any OID no function answers to. That NULL
+/// is what `pg_dump` tests to decide which spelling of `CREATE FUNCTION` to
+/// emit, so it is the whole point of the function.
+///
+/// Two shapes, as PostgreSQL 18.4 prints them:
+///
+/// ```text
+/// RETURN (a + 1)
+/// BEGIN ATOMIC
+///  SELECT a AS a;
+/// END
+/// ```
+///
+/// The expression is re-rendered for *this* session rather than echoed: the
+/// parenthesisation is `pg_get_expr`'s non-pretty one (every operator node
+/// wrapped, a bare constant left alone — `RETURN 1`), and a `timestamptz`
+/// constant follows the reader's zone, exactly as in a column default. The one
+/// rule this shape adds is the parameter under a subscript or a field access,
+/// which is wrapped where a view's column would not be (`RETURN (a)[1]` against
+/// `arr[1]`) — see [`crabgresql_binder::ruleutils::sqlbody_expr`].
+///
+/// **Where this diverges from PostgreSQL:** PG deparses an analysed node tree
+/// and crabgresql re-renders stored SQL text, so whatever PG knows only from
+/// types prints here as written — a parameter keeps a qualifier PG drops
+/// (`f.a`), `IN (…)` is not rewritten to `= ANY (ARRAY[…])`, a `CASE` target
+/// stays on one line without the `ELSE NULL::<type>` the analyser inserts, and
+/// a cast PG folded away because the literal was already of that type survives
+/// (`1::int::text`). Everything else matches byte for byte, checked on 18.4.
+fn eval_pg_get_function_sqlbody(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
+    let Some((info, _)) = proc_info_of(args, ctx, "pg_get_function_sqlbody")? else {
+        return Ok(Value::Null);
+    };
+    let rendered = match &info.sql_body {
+        None => return Ok(Value::Null),
+        Some(SqlBody::Return(expr)) => format!(
+            "RETURN {}",
+            crabgresql_binder::ruleutils::sqlbody_expr(expr, &ctx.fmt)
+                .unwrap_or_else(|| expr.clone())
+        ),
+        Some(SqlBody::Atomic(stmt)) => format!(
+            "BEGIN ATOMIC\n {};\nEND",
+            crabgresql_binder::ruleutils::sqlbody_statement(stmt, &ctx.fmt)
+                .unwrap_or_else(|| stmt.clone())
+        ),
+    };
+    Ok(Value::Text(rendered))
+}
+
+/// The catalog lookup the `pg_get_function_*` family shares. A NULL argument and
 /// an OID no function answers to collapse into the same miss, since both print
 /// as NULL.
 fn proc_info_of<'a>(

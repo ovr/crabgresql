@@ -57,6 +57,18 @@ DROP VIEW v_tm;
 DROP TABLE tm_copy;
 DROP TABLE tm;
 
+-- A view names an unaliased target the way PostgreSQL's FigureColname does: the
+-- operand names a cast over it, so a::text is "a" and only an expression that
+-- names nothing takes the target type. The operand of a cast node is
+-- parenthesised, and a subscript's index is deparsed rather than echoed.
+CREATE TABLE tn (a int, arr int[], i int);
+CREATE VIEW v_names AS
+  SELECT a::text, upper(a::text), (a + 1)::text, arr[i + 1], ARRAY[arr[1], 2] FROM tn;
+SELECT pg_get_viewdef('v_names'::regclass);
+SELECT pg_get_viewdef('v_names'::regclass, true);
+DROP VIEW v_names;
+DROP TABLE tn;
+
 -- Clean up (this suite shares one database across tests).
 DROP VIEW v_over;
 DROP VIEW v_alias;

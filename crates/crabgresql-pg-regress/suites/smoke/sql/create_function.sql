@@ -34,5 +34,31 @@ SELECT named(2, 40), qualified(2, 40), mixed(2, 40), quoted(21);
 CREATE TABLE t (a int, b int);
 INSERT INTO t VALUES (1, 2), (3, 4), (10, 20);
 SELECT a, b, add(a, b) FROM t ORDER BY a;
+-- The SQL-standard body forms, and how pg_get_function_sqlbody renders them
+-- back: a RETURN expression, and a single-statement BEGIN ATOMIC block. Such a
+-- body leaves prosrc empty — the body lives in prosqlbody alone — while a
+-- quoted body keeps prosrc and has no standard body at all.
+CREATE FUNCTION body_ret(a int) RETURNS int LANGUAGE SQL RETURN a + 1;
+CREATE FUNCTION body_atomic(a int, b int) RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT a + b; END;
+CREATE FUNCTION body_atomic_col(a int) RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT a; END;
+CREATE FUNCTION body_quoted(a int) RETURNS int LANGUAGE SQL AS $$ SELECT a + 1 $$;
+-- A subscripted argument is parenthesised, which a subscripted column in a view
+-- is not: the rule wraps the container of a subscript unless it is a plain
+-- column, and an argument is not one.
+CREATE FUNCTION body_sub(a int[]) RETURNS int LANGUAGE SQL RETURN a[1];
+CREATE FUNCTION body_atomic_sub(a int[]) RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT a[1] + 1; END;
+-- A subscript's index is deparsed like any other expression, so the operator in
+-- it is wrapped; a cast parenthesises its operand, and the alias follows the
+-- operand's own name rather than the target type -- the type names only a
+-- target that names nothing.
+CREATE FUNCTION body_index(a int[], i int) RETURNS int LANGUAGE SQL RETURN a[i + 1];
+CREATE FUNCTION body_cast(a int) RETURNS text LANGUAGE SQL BEGIN ATOMIC SELECT a::text; END;
+CREATE FUNCTION body_cast_expr(a int) RETURNS text LANGUAGE SQL BEGIN ATOMIC SELECT (a + 1)::text; END;
+CREATE FUNCTION body_array(a int[]) RETURNS int[] LANGUAGE SQL BEGIN ATOMIC SELECT ARRAY[a[1], 2]; END;
+SELECT body_ret(1), body_atomic(1, 2), body_atomic_col(41), body_quoted(1);
+SELECT body_sub(ARRAY[7, 8]), body_atomic_sub(ARRAY[7, 8]);
+SELECT body_index(ARRAY[7, 8], 1), body_cast(3), body_cast_expr(3), body_array(ARRAY[7, 8]);
+SELECT proname, prosrc, pg_get_function_sqlbody(oid) AS sqlbody
+  FROM pg_proc WHERE proname LIKE 'body\_%' ORDER BY proname;
 -- Clean up (this suite shares one database across tests).
 DROP TABLE t;

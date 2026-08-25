@@ -807,6 +807,11 @@ pub enum ScalarFn {
     /// `pg_get_function_result(oid) -> text`: a function's `RETURNS` clause,
     /// `SETOF`/`TABLE(...)` included.
     PgGetFunctionResult,
+    /// `pg_get_function_sqlbody(oid) -> text`: the body of a `LANGUAGE SQL`
+    /// routine written in the SQL-standard form (`RETURN <expr>` or
+    /// `BEGIN ATOMIC ... END`), and NULL for one whose body is a quoted string
+    /// — which is the distinction `pg_dump` reads it for.
+    PgGetFunctionSqlbody,
     /// `pg_get_indexdef(oid[, int4, bool]) -> text`: an index's `CREATE INDEX`
     /// DDL, rendered by [`crabgresql_storage_api::index_definition`]. The
     /// three-argument form is PostgreSQL's per-column one: a non-zero column
@@ -3362,6 +3367,11 @@ fn lookup(name: &str) -> &'static [Signature] {
         }],
         "pg_get_function_result" => &[Signature {
             func: ScalarFn::PgGetFunctionResult,
+            args: &[OID],
+            ret: TEXT,
+        }],
+        "pg_get_function_sqlbody" => &[Signature {
+            func: ScalarFn::PgGetFunctionSqlbody,
             args: &[OID],
             ret: TEXT,
         }],
