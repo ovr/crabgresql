@@ -18061,10 +18061,9 @@ async fn pg_get_function_sqlbody_renders_a_standard_body() -> anyhow::Result<()>
         Some("BEGIN ATOMIC\n SELECT upper(a) AS upper;\nEND")
     );
 
-    // A subscripted parameter is parenthesised, where a view's subscripted
-    // *column* is not (`arr[1]`): PostgreSQL wraps the container of a subscript
-    // unless it is a plain `Var`, and a routine's argument is a `Param`. The
-    // alias is the name of what is indexed, not of the subscript.
+    // PostgreSQL wraps the container of a subscript unless it is a plain `Var`,
+    // and a routine's argument is a `Param` — so a parameter is parenthesised
+    // where a view's subscripted column (`arr[1]`) is not.
     assert_eq!(body("s_sub").await?.0.as_deref(), Some("RETURN (a)[1]"));
     assert_eq!(
         body("s_atomic_sub").await?.0.as_deref(),
@@ -18074,16 +18073,13 @@ async fn pg_get_function_sqlbody_renders_a_standard_body() -> anyhow::Result<()>
         body("s_atomic_sub_expr").await?.0.as_deref(),
         Some("BEGIN ATOMIC\n SELECT ((a)[1] + 1);\nEND")
     );
-    // A subscript's index is deparsed, not echoed, so the operator inside it is
-    // wrapped like any other.
     assert_eq!(
         body("s_sub_index").await?.0.as_deref(),
         Some("RETURN (a)[(i + 1)]")
     );
 
-    // A cast node parenthesises its operand, and an operator inside one doubles
-    // up because it already wraps itself. The alias follows the operand's name,
-    // not the target type — the type only names a target that names nothing.
+    // A cast node parenthesises its operand too, and an operator inside one
+    // doubles up because it already wraps itself.
     assert_eq!(body("s_cast").await?.0.as_deref(), Some("RETURN (a)::text"));
     assert_eq!(
         body("s_atomic_cast").await?.0.as_deref(),
@@ -18097,7 +18093,6 @@ async fn pg_get_function_sqlbody_renders_a_standard_body() -> anyhow::Result<()>
         body("s_atomic_array").await?.0.as_deref(),
         Some("BEGIN ATOMIC\n SELECT ARRAY[(a)[1], 2] AS \"array\";\nEND")
     );
-    // The body still runs, whichever form declared it.
     let row = client
         .query_one("SELECT s_atomic(41), s_atomic_expr(1, 2), s_ret(1)", &[])
         .await?;
@@ -18110,8 +18105,6 @@ async fn pg_get_function_sqlbody_renders_a_standard_body() -> anyhow::Result<()>
         (41, 3, 2)
     );
 
-    // A quoted body has no standard body at all — and keeps its `prosrc`, which
-    // a standard one leaves empty.
     assert_eq!(
         body("s_quoted").await?,
         (None, " SELECT a + 1 ".to_string())
@@ -18119,7 +18112,6 @@ async fn pg_get_function_sqlbody_renders_a_standard_body() -> anyhow::Result<()>
     assert_eq!(body("s_plpgsql").await?.0, None);
     assert_eq!(body("s_proc").await?.0, None);
 
-    // STRICT, and an OID no function answers to is NULL rather than an error.
     let row = client
         .query_one(
             "SELECT pg_get_function_sqlbody(999999) IS NULL, \

@@ -178,7 +178,6 @@ pub fn lex(input: &str) -> Vec<ScriptItem> {
     let mut has_content = false;
     let mut state = State::Normal;
     let mut dollar_tag = String::new();
-    // psql's `BEGIN ATOMIC` tracking, plus the word being scanned that feeds it.
     let mut atomic = AtomicBlock::default();
     let mut word = String::new();
     // `Some` while collecting the inline data of a `COPY … FROM STDIN`: each

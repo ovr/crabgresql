@@ -126,10 +126,8 @@ DROP TABLE tm_copy;
 DROP TABLE tm;
 -- A view names an unaliased target the way PostgreSQL's FigureColname does: the
 -- operand names a cast over it, so a::text is "a" and only an expression that
--- names nothing takes the target type. A CASE offers "case" and an array
--- constructor "array", both of which a cast would override. The operand of a
--- cast node is parenthesised, and a subscript's index is deparsed rather than
--- echoed.
+-- names nothing takes the target type. The operand of a cast node is
+-- parenthesised, and a subscript's index is deparsed rather than echoed.
 CREATE TABLE tn (a int, arr int[], i int);
 CREATE VIEW v_names AS
   SELECT a::text, upper(a::text), (a + 1)::text, arr[i + 1], ARRAY[arr[1], 2] FROM tn;

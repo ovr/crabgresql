@@ -7361,11 +7361,8 @@ fn function_internal_name(create: &ast::CreateFunction) -> Result<String, PgErro
 /// call, and — when the declaration used a SQL-standard body — the body
 /// `pg_get_function_sqlbody` renders back.
 ///
-/// A `RETURN expr` / `AS RETURN expr` form becomes `SELECT expr`; an
-/// `AS '<body>'` string is taken verbatim (it is already a `SELECT`); an
-/// `AS RETURN (select)` is rendered from its query; a `BEGIN ATOMIC` block
-/// contributes its single statement. Only the quoted form has no standard body,
-/// which is exactly when PostgreSQL leaves `prosqlbody` NULL.
+/// Only the quoted `AS '<body>'` form has no standard body, which is exactly
+/// when PostgreSQL leaves `prosqlbody` NULL.
 ///
 /// The `RETURN` expression is canonicalized on the way in, like a column
 /// default — `ruleutils::deparse_stored_expr` resolves the function calls

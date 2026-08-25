@@ -1793,11 +1793,12 @@ fn eval_pg_get_function_result(args: &[Value], ctx: &ExecContext) -> Result<Valu
 /// `arr[1]`) — see [`crabgresql_binder::ruleutils::sqlbody_expr`].
 ///
 /// **Where this diverges from PostgreSQL:** PG deparses an analysed node tree
-/// and crabgresql re-renders stored SQL text, so a body PG would print with
-/// added casts (`upper(a) || 'x'::text`), a qualified parameter (`f.a`) or a
-/// rewritten construct (`IN (…)` as `= ANY (ARRAY[…])`) prints here as written.
-/// Bodies this build can actually execute — one FROM-less expression — match
-/// byte for byte.
+/// and crabgresql re-renders stored SQL text, so whatever PG knows only from
+/// types prints here as written — a parameter keeps a qualifier PG drops
+/// (`f.a`), `IN (…)` is not rewritten to `= ANY (ARRAY[…])`, a `CASE` target
+/// stays on one line without the `ELSE NULL::<type>` the analyser inserts, and
+/// a cast PG folded away because the literal was already of that type survives
+/// (`1::int::text`). Everything else matches byte for byte, checked on 18.4.
 fn eval_pg_get_function_sqlbody(args: &[Value], ctx: &ExecContext) -> Result<Value, ExecError> {
     let Some((info, _)) = proc_info_of(args, ctx, "pg_get_function_sqlbody")? else {
         return Ok(Value::Null);

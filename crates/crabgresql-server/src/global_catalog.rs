@@ -332,7 +332,6 @@ impl FuncBody {
         }
     }
 
-    /// The standard-form body, for the reader that renders it back.
     pub fn sql_body(&self) -> Option<&SqlBody> {
         match self {
             FuncBody::Sql { sql_body, .. } => sql_body.as_ref(),

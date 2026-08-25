@@ -482,8 +482,6 @@ fn colname_of(e: &ast::Expr) -> (Option<String>, NameStrength) {
                 .and_then(|p| p.as_ident())
                 .map(|i| i.value.to_ascii_lowercase()),
         ),
-        // The operand names the cast unless it has nothing better to offer than
-        // another type name.
         ast::Expr::Cast {
             expr: inner,
             data_type,
@@ -492,14 +490,11 @@ fn colname_of(e: &ast::Expr) -> (Option<String>, NameStrength) {
             (name, NameStrength::Owned) => (name, NameStrength::Owned),
             _ => (Some(type_name(data_type)), NameStrength::Offered),
         },
-        // A `CASE` is named by its `ELSE` arm — `CASE WHEN … ELSE a END` is
-        // `a` — and falls back on `case`, which an enclosing cast overrides.
         ast::Expr::Case { else_result, .. } => match else_result.as_deref().map(colname_of) {
             Some((name, NameStrength::Owned)) => (name, NameStrength::Owned),
             _ => (Some("case".to_string()), NameStrength::Offered),
         },
-        // A constructor is named after what it constructs, strongly enough that
-        // a cast keeps it: `ARRAY[1, 2]::int[]` is still `array`.
+        // A constructor's name survives a cast: `ARRAY[1, 2]::int[]` is `array`.
         ast::Expr::Array(_) => owned(Some("array".to_string())),
         ast::Expr::Tuple(_) => owned(Some("row".to_string())),
         ast::Expr::Nested(inner) => colname_of(inner),
@@ -536,22 +531,16 @@ fn name_of(i: &ast::Ident) -> String {
 /// PostgreSQL prints `AS <resname>` on every target that names itself —
 /// including a bare column, which a view leaves alone (`SELECT a AS a`) — and
 /// no alias at all where a view would write `AS "?column?"` (`SELECT (a + b)`).
-/// Verified on 18.4 across `select a`, `select a+b`, `select 1`,
-/// `select upper(a)` and `select coalesce(a, 1)`, the last of which also pins
-/// the keyword quoting: `AS "coalesce"`.
 ///
-/// `None` for anything a `LANGUAGE SQL` body in this build cannot be — several
-/// statements, a `FROM` clause, a set operation — leaving the caller to echo
-/// the text as stored rather than print a body that means something else. The
-/// shape is decided by [`simple_body_select`], the same check `CREATE FUNCTION`
-/// validates against, so a clause this renderer does not know cannot reach it.
+/// `None` where [`simple_body_select`] refuses the shape, which is the same
+/// check `CREATE FUNCTION` validates against: a clause this renderer does not
+/// know cannot reach it, and the caller echoes the text as stored rather than
+/// print a body that means something else.
 ///
 /// **Where a `CASE` target diverges from PostgreSQL:** PG breaks one across
-/// lines here and in a view (`SELECT\n         CASE\n             WHEN …`) and
-/// materialises the `ELSE NULL::<type>` the analyser inserted. Both come of
-/// deparsing a typed tree rather than text — the alias it carries (`AS "case"`)
-/// does match. The same gap shows in [`view_definition`]; a `RETURN CASE …` is
-/// on one line in PG too and differs only by that `ELSE`.
+/// lines and materialises the `ELSE NULL::<type>` its analyser inserted, both
+/// of which need the typed tree this walk does not have. The alias (`AS "case"`)
+/// does match, and [`view_definition`] has the same gap.
 pub fn sqlbody_statement(sql: &str, fmt: &FmtCtx) -> Option<String> {
     let query = parse_query(sql)?;
     let select = simple_body_select(&query).ok()?;
@@ -560,12 +549,9 @@ pub fn sqlbody_statement(sql: &str, fmt: &FmtCtx) -> Option<String> {
         calls: None,
         zone: Some(fmt),
         unqualify: None,
-        // A routine body has no domain `VALUE` in scope; that placeholder only
-        // means anything inside a domain's own CHECK.
         domain_value: false,
-        // The `FROM`-less shape checked just above is what makes this
-        // unconditional: with no relation in scope, every identifier in the
-        // body is a parameter.
+        // Unconditional because `simple_body_select` has already refused a
+        // `FROM`: with no relation in scope, every identifier is a parameter.
         param_refs: true,
     };
     let projection: Vec<String> = select
@@ -754,6 +740,12 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
                 // through `value` would add the `text` it assumes for a bare string
                 // and produce `'x'::text::text`, which also makes re-rendering an
                 // already-deparsed expression non-idempotent.
+                //
+                // Right for the literal already *of* the labelled type, which is
+                // what PostgreSQL has left by deparse time — `'x'::text`. A
+                // literal of another type is a coercion node there and prints
+                // wrapped (`1::text` is `(1)::text`), which needs the operand
+                // typed to tell apart and so is not reproduced here.
                 match literal_of(inner) {
                     Some(v) => format!("{}::{}", value_body(v), type_name(data_type)),
                     // Everything else is a cast *node*, and PostgreSQL wraps
@@ -850,8 +842,8 @@ fn access(a: &ast::AccessExpr, cx: Cx) -> String {
             let bound =
                 |e: &Option<ast::Expr>| e.as_ref().map(|e| top_expr(e, cx)).unwrap_or_default();
             let mut out = format!("[{}:{}", bound(lower_bound), bound(upper_bound));
-            // PostgreSQL has no stride; it can only come from another dialect's
-            // text, so it is echoed rather than given a rendering of its own.
+            // PostgreSQL has no stride, so nothing it prints reaches here; the
+            // arm exists because another dialect's text can still parse into one.
             if let Some(stride) = stride {
                 out.push_str(&format!(":{}", top_expr(stride, cx)));
             }
@@ -1164,8 +1156,6 @@ mod tests {
         assert_eq!(name("1::int::text").as_deref(), Some("text"));
         assert_eq!(name("arr[i + 1]").as_deref(), Some("arr"));
         assert_eq!(name("(arr[1])::text").as_deref(), Some("arr"));
-        // A `CASE` is named by its `ELSE` arm, and falls back on `case` — which
-        // an enclosing cast is then free to override.
         assert_eq!(name("CASE WHEN a > 0 THEN a END").as_deref(), Some("case"));
         assert_eq!(
             name("CASE WHEN true THEN 1 ELSE a END").as_deref(),
@@ -1195,8 +1185,6 @@ mod tests {
         assert_eq!(plain("arr[1]::text"), "(arr[1])::text");
         assert_eq!(plain("'x'::text"), "'x'::text");
         assert_eq!(plain("NULL::text"), "NULL::text");
-        // Asking to be pretty drops the wrapping, which is the form psql's `\d`
-        // shows.
         assert_eq!(pretty("a::text"), "a::text");
         assert_eq!(pretty("(a + 1)::text"), "(a + 1)::text");
     }

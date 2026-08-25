@@ -130,18 +130,21 @@ INSERT INTO chk_dd VALUES (-1);
 
 -- A cast node parenthesises its operand wherever a stored expression is read
 -- back without pretty-printing, so a CHECK and a DEFAULT carry the same
--- (x)::text a routine body does. A literal keeps its bare label instead: it is
--- a constant carrying its own type, not a coercion. A subscript's index is an
--- expression like any other and is deparsed as one.
+-- (x)::text a routine body does. A string literal is not a cast node at all --
+-- it is a constant of the type it is labelled with -- so it stays bare. A
+-- subscript's index is an expression like any other and is deparsed as one.
 CREATE TABLE chk_cast (x int, arr int[], i int,
                        y text DEFAULT (1)::text,
+                       z text DEFAULT 'x'::text,
                        CHECK (x::text > 'a'),
                        CHECK (arr[i + 1] > 0));
 SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
   WHERE conrelid = 'chk_cast'::regclass AND contype = 'c' ORDER BY conname;
-SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'chk_cast'::regclass;
-SELECT column_default FROM information_schema.columns
-  WHERE table_name = 'chk_cast' AND column_name = 'y';
+SELECT attname, pg_get_expr(adbin, adrelid) FROM pg_attrdef
+  JOIN pg_attribute ON attrelid = adrelid AND attnum = adnum
+  WHERE adrelid = 'chk_cast'::regclass ORDER BY attname;
+SELECT column_name, column_default FROM information_schema.columns
+  WHERE table_name = 'chk_cast' AND column_default IS NOT NULL ORDER BY column_name;
 DROP TABLE chk_cast;
 
 -- The suite shares one database, and the inheritance links above are visible to
