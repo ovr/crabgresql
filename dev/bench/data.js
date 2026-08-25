@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787688724358,
+  "lastUpdate": 1787688726263,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -58864,6 +58864,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 17787.011862,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bed41dac9bfebfdba724d0c357c60edd505220b9",
+          "message": "feat: Support subscripting a qualified column (t.a[1]) (#281)",
+          "timestamp": "2026-08-25T19:20:22Z",
+          "tree_id": "35f1b407285d6f245156c787c3091dd31aabefa3",
+          "url": "https://github.com/ovr/crabgresql/commit/bed41dac9bfebfdba724d0c357c60edd505220b9"
+        },
+        "date": 1787688726152,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1217.422807,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 20026.321893,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
