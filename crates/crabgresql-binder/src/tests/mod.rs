@@ -2,6 +2,7 @@
 //! each one covers. Shared fixtures live in [`common`].
 
 mod aggregates;
+mod arrays;
 mod case_bool;
 mod coalesce;
 mod common;
