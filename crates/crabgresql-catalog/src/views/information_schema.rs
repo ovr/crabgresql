@@ -35,16 +35,17 @@ struct TypeAttributes {
 fn type_attributes(ty: PgType, typmod: i32) -> TypeAttributes {
     use crabgresql_types::info_schema as shape;
     let typmod = pg_typmod(ty, typmod);
-    // The two length answers can only overflow on a modifier no catalog row
-    // holds (they need one near `i32`'s ends); a `Value::Null` is the closest
-    // thing a view column has to the error a direct call would raise.
+    // The four answers that strip the varlena header can only overflow on a
+    // modifier no catalog row holds (they need one near `i32`'s ends); a
+    // `Value::Null` is the closest thing a view column has to the error a direct
+    // call would raise.
     let int = |v: Option<i32>| v.map_or(Value::Null, Value::Int4);
     TypeAttributes {
         character_length: int(shape::char_max_length(ty, typmod).unwrap_or(None)),
         character_octets: int(shape::char_octet_length(ty, typmod).unwrap_or(None)),
-        numeric_precision: int(shape::numeric_precision(ty, typmod)),
+        numeric_precision: int(shape::numeric_precision(ty, typmod).unwrap_or(None)),
         numeric_radix: int(shape::numeric_precision_radix(ty, typmod)),
-        numeric_scale: int(shape::numeric_scale(ty, typmod)),
+        numeric_scale: int(shape::numeric_scale(ty, typmod).unwrap_or(None)),
         datetime_precision: int(shape::datetime_precision(ty, typmod)),
         interval_type: shape::interval_type(ty, typmod).map_or(Value::Null, Value::Text),
     }

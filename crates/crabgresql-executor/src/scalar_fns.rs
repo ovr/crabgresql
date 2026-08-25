@@ -343,9 +343,13 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 Attr::CharOctetLength => shape::char_octet_length(ty, typmod)
                     .map_err(arith_error)
                     .and_then(int),
-                Attr::NumericPrecision => int(shape::numeric_precision(ty, typmod)),
+                Attr::NumericPrecision => shape::numeric_precision(ty, typmod)
+                    .map_err(arith_error)
+                    .and_then(int),
                 Attr::NumericPrecisionRadix => int(shape::numeric_precision_radix(ty, typmod)),
-                Attr::NumericScale => int(shape::numeric_scale(ty, typmod)),
+                Attr::NumericScale => shape::numeric_scale(ty, typmod)
+                    .map_err(arith_error)
+                    .and_then(int),
                 Attr::DatetimePrecision => int(shape::datetime_precision(ty, typmod)),
                 Attr::IntervalType => {
                     Ok(shape::interval_type(ty, typmod).map_or(Value::Null, Value::Text))

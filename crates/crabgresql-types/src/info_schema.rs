@@ -50,22 +50,29 @@ const UNBOUNDED_OCTET_LENGTH: i32 = 1 << 30;
 /// declared.
 const DEFAULT_DATETIME_PRECISION: i32 = 6;
 
+/// The declared modifier behind a varlena one: `typmod` with the length header
+/// taken back off. Every caller here is `int4`-shaped, and PostgreSQL does this
+/// subtraction in `integer` too — so near `i32::MIN` it overflows and raises
+/// `22003` rather than wrapping. Unreachable from a catalog row, but it is the
+/// observable answer, and every type that reserves the header goes through here
+/// so that only one of them can be wrong.
+fn strip_header(typmod: i32) -> Result<i32, ArithError> {
+    typmod
+        .checked_sub(VARHDRSZ)
+        .ok_or_else(|| out_of_range(PgType::Int4))
+}
+
 /// `_pg_char_max_length(typid, typmod)`: the declared length in characters, or
 /// in bits for the two bit-string types. NULL for a type that has no length and
 /// for an undeclared modifier.
 ///
-/// `Err` where PostgreSQL raises `22003`: the subtraction below overflows for
-/// `i32::MIN`. Unreachable from a catalog row, but it is the observable answer.
+/// `Err` where PostgreSQL raises `22003` — see [`strip_header`].
 pub fn char_max_length(ty: PgType, typmod: i32) -> Result<Option<i32>, ArithError> {
     if typmod == NO_TYPMOD {
         return Ok(None);
     }
     Ok(match ty {
-        PgType::Bpchar | PgType::Varchar => Some(
-            typmod
-                .checked_sub(VARHDRSZ)
-                .ok_or_else(|| out_of_range(PgType::Int4))?,
-        ),
+        PgType::Bpchar | PgType::Varchar => Some(strip_header(typmod)?),
         // A bit string's modifier is the bit count itself — no header is
         // reserved, so it needs no adjustment.
         PgType::Bit | PgType::Varbit => Some(typmod),
@@ -102,16 +109,19 @@ pub fn char_octet_length(ty: PgType, typmod: i32) -> Result<Option<i32>, ArithEr
 /// `_pg_numeric_precision(typid, typmod)`: how many digits the type holds — in
 /// *bits* for the binary types (an `integer` reports 32), in decimal digits for
 /// `numeric`, which is the one type whose answer comes from the modifier.
-pub fn numeric_precision(ty: PgType, typmod: i32) -> Option<i32> {
-    match ty {
+///
+/// `Err` where PostgreSQL raises `22003`, for the same reason as
+/// [`char_max_length`]: stripping the header overflows near `i32::MIN`.
+pub fn numeric_precision(ty: PgType, typmod: i32) -> Result<Option<i32>, ArithError> {
+    Ok(match ty {
         PgType::Int2 => Some(16),
         PgType::Int4 => Some(32),
         PgType::Int8 => Some(64),
         PgType::Float4 => Some(24),
         PgType::Float8 => Some(53),
-        PgType::Numeric if typmod != NO_TYPMOD => Some((typmod - VARHDRSZ) >> 16 & 0xffff),
+        PgType::Numeric if typmod != NO_TYPMOD => Some(strip_header(typmod)? >> 16 & 0xffff),
         _ => None,
-    }
+    })
 }
 
 /// `_pg_numeric_precision_radix(typid, typmod)`: the base the precision above is
@@ -128,14 +138,16 @@ pub fn numeric_precision_radix(ty: PgType, _typmod: i32) -> Option<i32> {
 /// `_pg_numeric_scale(typid, typmod)`: the digits after the point. Zero for the
 /// integer types, which hold none; the modifier's low half for `numeric`. The
 /// float types are NULL — a binary float has no decimal scale.
-pub fn numeric_scale(ty: PgType, typmod: i32) -> Option<i32> {
-    match ty {
+///
+/// `Err` on `22003` as [`numeric_precision`] does, and for the same input.
+pub fn numeric_scale(ty: PgType, typmod: i32) -> Result<Option<i32>, ArithError> {
+    Ok(match ty {
         PgType::Int2 | PgType::Int4 | PgType::Int8 => Some(0),
         // Raw and unsigned, deliberately: see the module comment on
         // `numeric(4,-2)`.
-        PgType::Numeric if typmod != NO_TYPMOD => Some((typmod - VARHDRSZ) & 0xffff),
+        PgType::Numeric if typmod != NO_TYPMOD => Some(strip_header(typmod)? & 0xffff),
         _ => None,
-    }
+    })
 }
 
 /// `_pg_datetime_precision(typid, typmod)`: the declared fractional-second
@@ -154,15 +166,10 @@ pub fn datetime_precision(ty: PgType, typmod: i32) -> Option<i32> {
             })
         }
         // An interval's modifier packs the field range above its precision, and
-        // the all-ones precision half is how "none was declared" is spelled
-        // inside a modifier that still names a range.
+        // the all-ones low half is how "none was declared" is spelled inside a
+        // modifier that still names a range.
         PgType::Interval => {
-            let precision = typmod & 0xffff;
-            Some(if typmod < 0 || precision == 0xffff {
-                DEFAULT_DATETIME_PRECISION
-            } else {
-                precision
-            })
+            Some(crate::interval::declared_precision(typmod).unwrap_or(DEFAULT_DATETIME_PRECISION))
         }
         _ => None,
     }
@@ -174,19 +181,24 @@ pub fn datetime_precision(ty: PgType, typmod: i32) -> Option<i32> {
 /// `interval` and an `interval(2)` name no fields, and carry their precision
 /// through [`datetime_precision`] alone.
 ///
-/// One divergence, on an input no catalog holds: PostgreSQL renders this through
-/// `format_type`, which raises `XX000 invalid INTERVAL typmod` for a range mask
-/// it cannot name (`_pg_interval_type(1186, 24)`). This build's `format_type`
-/// prints a bare `interval` for such a mask rather than raising, and this
-/// follows it by answering NULL.
+/// PostgreSQL renders this through `format_type`; here the modifier is read
+/// directly, by the same two rules `format_type` applies — the range through
+/// [`crate::interval::range_name`], the precision through
+/// [`crate::interval::declared_precision`], which is *not* the clamped one
+/// [`crate::interval::unpack_typmod`] returns.
+///
+/// One divergence, on an input no catalog holds: PostgreSQL's `format_type`
+/// raises `XX000 invalid INTERVAL typmod` for a range mask it cannot name
+/// (`_pg_interval_type(1186, 24)`). This build's prints a bare `interval` for
+/// such a mask rather than raising, and this follows it by answering NULL.
 pub fn interval_type(ty: PgType, typmod: i32) -> Option<String> {
     if ty != PgType::Interval {
         return None;
     }
-    let (range, precision) = crate::interval::unpack_typmod(typmod);
+    let (range, _) = crate::interval::unpack_typmod(typmod);
     let fields = crate::interval::range_name(range)?;
     let mut spelling = fields.to_ascii_uppercase();
-    if let Some(p) = precision {
+    if let Some(p) = crate::interval::declared_precision(typmod) {
         spelling.push_str(&format!("({p})"));
     }
     Some(spelling)
@@ -205,6 +217,14 @@ mod tests {
 
     fn octets(ty: PgType, typmod: i32) -> Option<i32> {
         char_octet_length(ty, typmod).expect("no overflow for a modifier a catalog can hold")
+    }
+
+    fn precision(ty: PgType, typmod: i32) -> Option<i32> {
+        numeric_precision(ty, typmod).expect("no overflow for a modifier a catalog can hold")
+    }
+
+    fn scale(ty: PgType, typmod: i32) -> Option<i32> {
+        numeric_scale(ty, typmod).expect("no overflow for a modifier a catalog can hold")
     }
 
     #[test]
@@ -255,51 +275,64 @@ mod tests {
         assert_eq!(max_len(PgType::Bit, -5), Some(-5));
         assert_eq!(max_len(PgType::Bpchar, 0), Some(-4));
         assert_eq!(octets(PgType::Bpchar, 0), Some(-16));
-        assert_eq!(numeric_precision(PgType::Numeric, -2), Some(65535));
-        assert_eq!(numeric_scale(PgType::Numeric, -2), Some(65530));
-        assert_eq!(numeric_precision(PgType::Numeric, -100_000), Some(65534));
-        assert_eq!(numeric_scale(PgType::Numeric, -100_000), Some(31068));
+        assert_eq!(precision(PgType::Numeric, -2), Some(65535));
+        assert_eq!(scale(PgType::Numeric, -2), Some(65530));
+        assert_eq!(precision(PgType::Numeric, -100_000), Some(65534));
+        assert_eq!(scale(PgType::Numeric, -100_000), Some(31068));
     }
 
+    /// Every answer that strips the varlena header raises rather than wrapping,
+    /// which is what PostgreSQL does. A panic here would take the connection
+    /// down, so this is the arm that must not regress.
     #[test]
-    fn overflowing_lengths_raise_the_integer_range_error() {
+    fn overflowing_modifiers_raise_the_integer_range_error() {
         let e = char_max_length(PgType::Varchar, i32::MIN).expect_err("i32::MIN - 4 overflows");
         assert_eq!(e.message, "integer out of range");
         let e = char_octet_length(PgType::Varchar, i32::MAX).expect_err("i32::MAX * 4 overflows");
         assert_eq!(e.message, "integer out of range");
+        let e = numeric_precision(PgType::Numeric, i32::MIN).expect_err("i32::MIN - 4 overflows");
+        assert_eq!(e.message, "integer out of range");
+        let e = numeric_scale(PgType::Numeric, i32::MIN).expect_err("i32::MIN - 4 overflows");
+        assert_eq!(e.message, "integer out of range");
+        // The last modifier that still overflows, and the first that does not.
+        assert!(numeric_precision(PgType::Numeric, i32::MIN + 3).is_err());
+        assert_eq!(precision(PgType::Numeric, i32::MIN + 4), Some(32768));
+        // A type that reserves no header never reaches the subtraction.
+        assert_eq!(max_len(PgType::Bit, i32::MIN), Some(i32::MIN));
+        assert_eq!(precision(PgType::Int4, i32::MIN), Some(32));
     }
 
     #[test]
     fn binary_types_report_precision_in_bits() {
-        for (ty, precision) in [
+        for (ty, bits) in [
             (PgType::Int2, 16),
             (PgType::Int4, 32),
             (PgType::Int8, 64),
             (PgType::Float4, 24),
             (PgType::Float8, 53),
         ] {
-            assert_eq!(numeric_precision(ty, -1), Some(precision), "{ty:?}");
+            assert_eq!(precision(ty, -1), Some(bits), "{ty:?}");
             // The modifier is irrelevant to a type that takes none.
-            assert_eq!(numeric_precision(ty, 24), Some(precision), "{ty:?}");
+            assert_eq!(precision(ty, 24), Some(bits), "{ty:?}");
             assert_eq!(numeric_precision_radix(ty, -1), Some(2), "{ty:?}");
         }
         for ty in [PgType::Int2, PgType::Int4, PgType::Int8] {
-            assert_eq!(numeric_scale(ty, -1), Some(0), "{ty:?}");
+            assert_eq!(scale(ty, -1), Some(0), "{ty:?}");
         }
         // A binary float has a precision but no decimal scale.
-        assert_eq!(numeric_scale(PgType::Float4, -1), None);
-        assert_eq!(numeric_scale(PgType::Float8, -1), None);
+        assert_eq!(scale(PgType::Float4, -1), None);
+        assert_eq!(scale(PgType::Float8, -1), None);
     }
 
     #[test]
     fn numeric_reads_precision_and_scale_out_of_the_modifier() {
         // `numeric(5,2)`, `numeric(3)` and `numeric` as 18.4 stores them.
-        assert_eq!(numeric_precision(PgType::Numeric, 327_686), Some(5));
-        assert_eq!(numeric_scale(PgType::Numeric, 327_686), Some(2));
-        assert_eq!(numeric_precision(PgType::Numeric, 196_612), Some(3));
-        assert_eq!(numeric_scale(PgType::Numeric, 196_612), Some(0));
-        assert_eq!(numeric_precision(PgType::Numeric, -1), None);
-        assert_eq!(numeric_scale(PgType::Numeric, -1), None);
+        assert_eq!(precision(PgType::Numeric, 327_686), Some(5));
+        assert_eq!(scale(PgType::Numeric, 327_686), Some(2));
+        assert_eq!(precision(PgType::Numeric, 196_612), Some(3));
+        assert_eq!(scale(PgType::Numeric, 196_612), Some(0));
+        assert_eq!(precision(PgType::Numeric, -1), None);
+        assert_eq!(scale(PgType::Numeric, -1), None);
         // The radix is known even when the precision is not.
         assert_eq!(numeric_precision_radix(PgType::Numeric, -1), Some(10));
     }
@@ -309,8 +342,8 @@ mod tests {
     /// `Numeric::unpack_typmod`.
     #[test]
     fn negative_numeric_scale_reads_back_unsigned() {
-        assert_eq!(numeric_precision(PgType::Numeric, 264_194), Some(4));
-        assert_eq!(numeric_scale(PgType::Numeric, 264_194), Some(2046));
+        assert_eq!(precision(PgType::Numeric, 264_194), Some(4));
+        assert_eq!(scale(PgType::Numeric, 264_194), Some(2046));
     }
 
     #[test]
@@ -356,6 +389,11 @@ mod tests {
             (402_718_719, Some("MINUTE TO SECOND"), 6),
             (268_435_459, Some("SECOND(3)"), 3),
             (470_286_340, Some("DAY TO SECOND(4)"), 4),
+            // Past the six digits an interval value can hold. PostgreSQL does
+            // not clamp what it *prints* — `SECOND(6)` here would contradict the
+            // 9 `datetime_precision` reports for the same modifier.
+            (268_435_465, Some("SECOND(9)"), 9),
+            (268_435_527, Some("SECOND(71)"), 71),
             // `interval(2)`: a precision over the full range, which names no
             // fields.
             (2_147_418_114, None, 2),

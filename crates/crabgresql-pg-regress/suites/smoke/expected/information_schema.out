@@ -136,6 +136,17 @@ SELECT information_schema._pg_interval_type(1186, -1) AS interval_any,
               | YEAR | YEAR TO MONTH | DAY TO SECOND | DAY TO SECOND(4) | SECOND(3) | 
 (1 row)
 
+-- The precision is printed as declared, past the six digits a value can hold,
+-- and agrees with what _pg_datetime_precision and format_type report.
+SELECT information_schema._pg_interval_type(1186, 268435465) AS second9,
+       information_schema._pg_datetime_precision(1186, 268435465) AS second9_precision,
+       format_type(1186, 268435465) AS second9_format,
+       information_schema._pg_interval_type(1186, 268435527) AS second71;
+  second9  | second9_precision |   second9_format   |  second71  
+-----------+-------------------+--------------------+------------
+ SECOND(9) |                 9 | interval second(9) | SECOND(71)
+(1 row)
+
 -- NULL in either argument is NULL out; an OID no built-in answers to is NULL.
 SELECT information_schema._pg_char_max_length(NULL, 14) AS null_typid,
        information_schema._pg_char_max_length(1043, NULL) AS null_typmod,

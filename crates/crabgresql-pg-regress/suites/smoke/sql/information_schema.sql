@@ -71,6 +71,12 @@ SELECT information_schema._pg_interval_type(1186, -1) AS interval_any,
        information_schema._pg_interval_type(1186, 470286340) AS day_to_second4,
        information_schema._pg_interval_type(1186, 268435459) AS second3,
        information_schema._pg_interval_type(1114, 3) AS timestamp3;
+-- The precision is printed as declared, past the six digits a value can hold,
+-- and agrees with what _pg_datetime_precision and format_type report.
+SELECT information_schema._pg_interval_type(1186, 268435465) AS second9,
+       information_schema._pg_datetime_precision(1186, 268435465) AS second9_precision,
+       format_type(1186, 268435465) AS second9_format,
+       information_schema._pg_interval_type(1186, 268435527) AS second71;
 -- NULL in either argument is NULL out; an OID no built-in answers to is NULL.
 SELECT information_schema._pg_char_max_length(NULL, 14) AS null_typid,
        information_schema._pg_char_max_length(1043, NULL) AS null_typmod,
