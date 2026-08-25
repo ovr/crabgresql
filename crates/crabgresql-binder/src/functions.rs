@@ -722,6 +722,11 @@ pub enum ScalarFn {
     /// `pg_table_is_visible(oid) -> bool`: whether the relation is reachable by
     /// an unqualified name. NULL for an OID no relation has.
     PgTableIsVisible,
+    /// One call of `pg_has_role` or of a `has_*_privilege` family — the whole
+    /// group is one variant because they differ only in which object class is
+    /// asked about and how each argument was spelled, which is exactly what
+    /// [`PrivCall`] carries. The executor evaluates them in `acl`.
+    HasPrivilege(PrivCall),
     /// `pg_relation_size(regclass[, text]) -> int8`: the relation's own storage
     /// in bytes. The second argument names a fork (`main`, `fsm`, `vm`, `init`)
     /// and defaults to `main`; anything else is `22023`. NULL for an OID no
@@ -1332,6 +1337,64 @@ pub enum GeoFn {
     /// `polygon <-> circle` distance (`-> float8`); args are
     /// `[polygon, circle]`.
     DistPolyCircle,
+}
+
+/// The object class a privilege question is asked about. Each names one
+/// `has_*_privilege` family, plus [`AclClass::Role`] for `pg_has_role` — which
+/// belongs here because it shares every part of the shape: the same optional
+/// leading role argument, the same trailing privilege string, the same errors.
+///
+/// The class decides three things the executor cannot read off the arguments:
+/// how an object *name* is resolved (see `acl::resolve_object`), which
+/// privilege keywords the string may spell, and what PostgreSQL's default ACL
+/// grants to PUBLIC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AclClass {
+    /// `has_table_privilege`. Any relation kind, not just a table: PostgreSQL
+    /// answers for a view, an index and a sequence alike.
+    Relation,
+    /// `has_column_privilege` — a relation *and* one of its columns.
+    Column,
+    /// `has_any_column_privilege`: the privilege on the relation as a whole or
+    /// on any one of its columns.
+    AnyColumn,
+    /// `has_sequence_privilege`. Unlike [`AclClass::Relation`] this one checks
+    /// the relation kind and raises `42809` for anything else.
+    Sequence,
+    Schema,
+    Type,
+    Function,
+    Server,
+    ForeignDataWrapper,
+    /// `pg_has_role`.
+    Role,
+}
+
+/// How one argument of a privilege call was spelled. PostgreSQL declares every
+/// family under both spellings of the role and of the object, which is what
+/// makes `has_table_privilege('t','SELECT')` and
+/// `has_table_privilege(c.oid,'SELECT')` both legal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgForm {
+    /// A name to resolve — `name` for a role, `text` for most objects, `name`
+    /// for `pg_has_role`'s role argument.
+    Name,
+    Oid,
+    /// A column number (`int2`), for [`AclClass::Column`] only.
+    Attnum,
+}
+
+/// One resolved call shape: which class is asked about and how the arguments
+/// were spelled, in the order they arrive — the optional role, the object, the
+/// optional column, and always a privilege string last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivCall {
+    pub class: AclClass,
+    /// `None` for the short forms, which ask about `current_user`.
+    pub user: Option<ArgForm>,
+    pub object: ArgForm,
+    /// `Some` only for [`AclClass::Column`].
+    pub column: Option<ArgForm>,
 }
 
 struct Signature {
@@ -2008,6 +2071,74 @@ fn lookup(name: &str) -> &'static [Signature] {
     macro_rules! arity_sigs {
         ($f:expr, $ret:expr, $($args:expr),+ $(,)?) => {
             &[$(Signature { func: $f, args: $args, ret: $ret }),+]
+        };
+    }
+    // The six overloads every privilege family but `has_column_privilege` is
+    // declared under: the role spelled either way or left out, times the object
+    // spelled either way. `$obj` is the SQL type the *name* spelling uses —
+    // `text` for the `has_*_privilege` families and `name` for `pg_has_role`,
+    // which is the one difference between them at this level.
+    //
+    // Written out rather than resolved in order (the way `resolve_relation_size`
+    // resolves its `regclass`-or-`oid` argument) because nothing here is
+    // ambiguous: at an unknown position `narrow_by_unknown_category` keeps the
+    // string-category candidates, which is exactly how PostgreSQL sends
+    // `has_table_privilege('t','SELECT')` to the `(text, text)` overload.
+    macro_rules! priv_sigs {
+        ($class:expr, $obj:expr) => {
+            &[
+                priv_sig!(
+                    $class,
+                    Some(ArgForm::Name),
+                    ArgForm::Name,
+                    &[NAME, $obj, TEXT]
+                ),
+                priv_sig!(
+                    $class,
+                    Some(ArgForm::Name),
+                    ArgForm::Oid,
+                    &[NAME, OID, TEXT]
+                ),
+                priv_sig!(
+                    $class,
+                    Some(ArgForm::Oid),
+                    ArgForm::Name,
+                    &[OID, $obj, TEXT]
+                ),
+                priv_sig!($class, Some(ArgForm::Oid), ArgForm::Oid, &[OID, OID, TEXT]),
+                priv_sig!($class, None, ArgForm::Name, &[$obj, TEXT]),
+                priv_sig!($class, None, ArgForm::Oid, &[OID, TEXT]),
+            ]
+        };
+    }
+    macro_rules! priv_sig {
+        ($class:expr, $user:expr, $object:expr, $args:expr) => {
+            Signature {
+                func: ScalarFn::HasPrivilege(PrivCall {
+                    class: $class,
+                    user: $user,
+                    object: $object,
+                    column: None,
+                }),
+                args: $args,
+                ret: BOOL,
+            }
+        };
+    }
+    // `has_column_privilege`'s twelve: the six above times the column spelled
+    // as a name or as an `int2` attribute number.
+    macro_rules! priv_col_sig {
+        ($user:expr, $object:expr, $column:expr, $args:expr) => {
+            Signature {
+                func: ScalarFn::HasPrivilege(PrivCall {
+                    class: AclClass::Column,
+                    user: $user,
+                    object: $object,
+                    column: Some($column),
+                }),
+                args: $args,
+                ret: BOOL,
+            }
         };
     }
     match name {
@@ -3007,6 +3138,77 @@ fn lookup(name: &str) -> &'static [Signature] {
             args: &[OID],
             ret: BOOL,
         }],
+        // The privilege questions. Every object here is owned by the bootstrap
+        // superuser and carries no ACL (there is no object-level `GRANT`), so
+        // what these report is PostgreSQL's *default* ACL — see the executor's
+        // `acl` module, which owns that model.
+        "has_table_privilege" => priv_sigs!(AclClass::Relation, TEXT),
+        "has_any_column_privilege" => priv_sigs!(AclClass::AnyColumn, TEXT),
+        "has_sequence_privilege" => priv_sigs!(AclClass::Sequence, TEXT),
+        "has_schema_privilege" => priv_sigs!(AclClass::Schema, TEXT),
+        "has_type_privilege" => priv_sigs!(AclClass::Type, TEXT),
+        "has_function_privilege" => priv_sigs!(AclClass::Function, TEXT),
+        "has_server_privilege" => priv_sigs!(AclClass::Server, TEXT),
+        "has_foreign_data_wrapper_privilege" => {
+            priv_sigs!(AclClass::ForeignDataWrapper, TEXT)
+        }
+        // The object of `pg_has_role` is a role, which PostgreSQL spells `name`
+        // rather than `text` — the one place the shape differs.
+        "pg_has_role" => priv_sigs!(AclClass::Role, NAME),
+        "has_column_privilege" => &[
+            priv_col_sig!(
+                Some(ArgForm::Name),
+                ArgForm::Name,
+                ArgForm::Name,
+                &[NAME, TEXT, TEXT, TEXT]
+            ),
+            priv_col_sig!(
+                Some(ArgForm::Name),
+                ArgForm::Name,
+                ArgForm::Attnum,
+                &[NAME, TEXT, I2, TEXT]
+            ),
+            priv_col_sig!(
+                Some(ArgForm::Name),
+                ArgForm::Oid,
+                ArgForm::Name,
+                &[NAME, OID, TEXT, TEXT]
+            ),
+            priv_col_sig!(
+                Some(ArgForm::Name),
+                ArgForm::Oid,
+                ArgForm::Attnum,
+                &[NAME, OID, I2, TEXT]
+            ),
+            priv_col_sig!(
+                Some(ArgForm::Oid),
+                ArgForm::Name,
+                ArgForm::Name,
+                &[OID, TEXT, TEXT, TEXT]
+            ),
+            priv_col_sig!(
+                Some(ArgForm::Oid),
+                ArgForm::Name,
+                ArgForm::Attnum,
+                &[OID, TEXT, I2, TEXT]
+            ),
+            priv_col_sig!(
+                Some(ArgForm::Oid),
+                ArgForm::Oid,
+                ArgForm::Name,
+                &[OID, OID, TEXT, TEXT]
+            ),
+            priv_col_sig!(
+                Some(ArgForm::Oid),
+                ArgForm::Oid,
+                ArgForm::Attnum,
+                &[OID, OID, I2, TEXT]
+            ),
+            priv_col_sig!(None, ArgForm::Name, ArgForm::Name, &[TEXT, TEXT, TEXT]),
+            priv_col_sig!(None, ArgForm::Name, ArgForm::Attnum, &[TEXT, I2, TEXT]),
+            priv_col_sig!(None, ArgForm::Oid, ArgForm::Name, &[OID, TEXT, TEXT]),
+            priv_col_sig!(None, ArgForm::Oid, ArgForm::Attnum, &[OID, I2, TEXT]),
+        ],
         "obj_description" => &[
             Signature {
                 func: ScalarFn::ObjDescription,

@@ -3900,3 +3900,128 @@ fn pg_depend_records_the_graph_postgres_records() -> anyhow::Result<()> {
     assert_eq!(edges, expected);
     Ok(())
 }
+
+fn plain_role(oid: u32, name: &str) -> CatalogRole {
+    CatalogRole {
+        oid,
+        superuser: false,
+        canlogin: false,
+        createrole: false,
+        createdb: false,
+        replication: false,
+        bypassrls: false,
+        ..CatalogRole::bootstrap(name)
+    }
+}
+
+fn membership(role: u32, member: u32, inherit: bool, set: bool, admin: bool) -> CatalogRoleMember {
+    CatalogRoleMember {
+        oid: 20000 + role * 100 + member,
+        role,
+        member,
+        grantor: oids::BOOTSTRAP_ROLE_OID,
+        admin_option: admin,
+        inherit_option: inherit,
+        set_option: set,
+    }
+}
+
+/// `pg_has_role`'s three answers come apart along the chain, not just at its
+/// last edge: reaching a role through one whose grant does not inherit confers
+/// membership without privileges. Probed against PostgreSQL 18.4.
+#[test]
+fn membership_privileges_follow_the_options_along_the_whole_chain() {
+    let cat = SystemCatalog::from_source(Arc::new(
+        StaticSource::new(Vec::new())
+            .roles(vec![
+                CatalogRole::bootstrap("postgres"),
+                plain_role(16400, "grp"),
+                plain_role(16401, "mid"),
+                plain_role(16402, "leaf"),
+            ])
+            .role_members(vec![
+                // grp <- mid inherits; mid <- leaf does not.
+                membership(16400, 16401, true, true, false),
+                membership(16401, 16402, false, true, false),
+            ]),
+    ));
+
+    let direct = cat.role_membership(16401, 16400);
+    assert!(direct.member && direct.inherits && direct.set);
+
+    // Two steps, the second of which does not inherit: a member of `grp`, and
+    // allowed to become it, but holding none of its privileges outright.
+    let indirect = cat.role_membership(16402, 16400);
+    assert!(indirect.member, "membership is transitive");
+    assert!(!indirect.inherits, "a non-inheriting edge breaks the chain");
+    assert!(indirect.set, "every edge on the chain is settable");
+
+    assert!(!cat.role_membership(16400, 16402).member);
+}
+
+/// The admin option is the one answer whose chain and whose last edge are asked
+/// different questions: PostgreSQL's `is_admin_of_role` walks plain membership
+/// and then looks for an `ADMIN OPTION` grant of the role to anything reached.
+/// So `GRANT grp TO mid WITH ADMIN OPTION; GRANT mid TO leaf` leaves `leaf`
+/// holding the option over `grp` without holding it directly — probed as
+/// `pg_has_role('leaf','grp','USAGE WITH ADMIN OPTION')` on 18.4.
+#[test]
+fn the_admin_option_is_transitive_over_plain_membership() {
+    let cat = SystemCatalog::from_source(Arc::new(
+        StaticSource::new(Vec::new())
+            .roles(vec![
+                CatalogRole::bootstrap("postgres"),
+                plain_role(16400, "grp"),
+                plain_role(16401, "mid"),
+                plain_role(16402, "leaf"),
+                plain_role(16403, "outsider"),
+            ])
+            .role_members(vec![
+                membership(16400, 16401, true, true, true),
+                // The step to `mid` carries no admin option of its own, and does
+                // not inherit — neither stops the option over `grp` arriving.
+                membership(16401, 16402, false, true, false),
+            ]),
+    ));
+
+    assert!(cat.role_membership(16401, 16400).admin, "the direct grant");
+    assert!(
+        cat.role_membership(16402, 16400).admin,
+        "and the same option through it"
+    );
+    assert!(
+        !cat.role_membership(16402, 16401).admin,
+        "the step itself was granted without the option"
+    );
+    assert!(!cat.role_membership(16403, 16400).admin);
+    // A role holds no admin option over itself, but a superuser holds one over
+    // everything.
+    assert!(!cat.role_membership(16400, 16400).admin);
+    assert!(cat.role_membership(oids::BOOTSTRAP_ROLE_OID, 16400).admin);
+}
+
+/// `initdb` closes a handful of system catalogs to PUBLIC and leaves the rest
+/// world-readable. The list is only as good as its spelling, so every name in it
+/// must be one this build actually serves.
+#[test]
+fn restricted_catalogs_are_sorted_and_served() {
+    let mut sorted = registry::RESTRICTED_CATALOGS.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        registry::RESTRICTED_CATALOGS,
+        sorted.as_slice(),
+        "RESTRICTED_CATALOGS must be sorted and unique — `public_reads` binary-searches it"
+    );
+    for name in registry::RESTRICTED_CATALOGS {
+        assert!(
+            registry::lookup(CatalogNamespace::PgCatalog, name).is_some(),
+            "{name} is named as restricted but is not served"
+        );
+        assert!(!registry::public_reads(name));
+    }
+    assert!(registry::public_reads("pg_class"));
+    // A name nothing serves is not "restricted" — it is simply not a relation,
+    // which `relation_acl` answers by finding no OID at all.
+    assert!(registry::public_reads("no_such_catalog"));
+}

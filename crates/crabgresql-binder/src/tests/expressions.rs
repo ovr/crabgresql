@@ -665,6 +665,120 @@ fn size_functions_take_regclass_or_oid() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The privilege families are declared under every spelling of their role and
+/// object arguments, and nothing resolves them in order: an untyped literal
+/// lands on the string-category candidate, exactly as PostgreSQL's
+/// unknown-argument rule sends it there. What that buys is that
+/// `has_table_privilege('t','SELECT')` reads `t` as a relation *name* while
+/// `has_table_privilege(c.oid,'SELECT')` reads an OID, with no cast written.
+#[test]
+fn privilege_functions_resolve_by_argument_spelling() -> anyhow::Result<()> {
+    use crate::{AclClass, ArgForm, PrivCall};
+    for (sql, want) in [
+        (
+            "SELECT has_table_privilege('t', 'SELECT')",
+            PrivCall {
+                class: AclClass::Relation,
+                user: None,
+                object: ArgForm::Name,
+                column: None,
+            },
+        ),
+        (
+            "SELECT has_table_privilege(16384::oid, 'SELECT')",
+            PrivCall {
+                class: AclClass::Relation,
+                user: None,
+                object: ArgForm::Oid,
+                column: None,
+            },
+        ),
+        // Three untyped literals: the role and the relation both take the
+        // string-category candidate, which for the role is `name`.
+        (
+            "SELECT has_table_privilege('alice', 't', 'SELECT')",
+            PrivCall {
+                class: AclClass::Relation,
+                user: Some(ArgForm::Name),
+                object: ArgForm::Name,
+                column: None,
+            },
+        ),
+        (
+            "SELECT has_table_privilege(10::oid, 16384::oid, 'SELECT')",
+            PrivCall {
+                class: AclClass::Relation,
+                user: Some(ArgForm::Oid),
+                object: ArgForm::Oid,
+                column: None,
+            },
+        ),
+        // A column number is an `int2`, which no untyped literal reaches — the
+        // cast is what picks this overload out of the twelve.
+        (
+            "SELECT has_column_privilege('t', 1::smallint, 'SELECT')",
+            PrivCall {
+                class: AclClass::Column,
+                user: None,
+                object: ArgForm::Name,
+                column: Some(ArgForm::Attnum),
+            },
+        ),
+        (
+            "SELECT has_column_privilege('t', 'c', 'SELECT')",
+            PrivCall {
+                class: AclClass::Column,
+                user: None,
+                object: ArgForm::Name,
+                column: Some(ArgForm::Name),
+            },
+        ),
+        (
+            "SELECT pg_has_role('alice', 'devs', 'USAGE')",
+            PrivCall {
+                class: AclClass::Role,
+                user: Some(ArgForm::Name),
+                object: ArgForm::Name,
+                column: None,
+            },
+        ),
+        (
+            "SELECT has_schema_privilege('public', 'USAGE')",
+            PrivCall {
+                class: AclClass::Schema,
+                user: None,
+                object: ArgForm::Name,
+                column: None,
+            },
+        ),
+    ] {
+        let ValuesPlan { rows, .. } = bound_values(sql)?;
+        let BoundExpr::FuncCall { func, ret, .. } = &rows[0][0] else {
+            bail!("expected a function call for `{sql}`");
+        };
+        assert_eq!(*func, crate::ScalarFn::HasPrivilege(want), "for `{sql}`");
+        assert_eq!(*ret, PgType::Bool, "for `{sql}`");
+    }
+    // `current_user` is a `name`, so it binds the role argument with no cast.
+    let ValuesPlan { rows, .. } =
+        bound_values("SELECT has_table_privilege(current_user, 't', 'SELECT')")?;
+    let BoundExpr::FuncCall { func, args, .. } = &rows[0][0] else {
+        bail!("expected a function call");
+    };
+    assert!(matches!(
+        func,
+        crate::ScalarFn::HasPrivilege(PrivCall {
+            user: Some(ArgForm::Name),
+            ..
+        })
+    ));
+    assert_eq!(args[0].ty(), PgType::Name);
+    // A wrong arity is 42883 rather than a mis-resolved overload.
+    let e = bind_err("SELECT has_table_privilege('t')")?;
+    assert_eq!(e.code, "42883");
+    Ok(())
+}
+
 /// `pg_size_pretty` is the opposite case: two ordinary signatures over numbers,
 /// neither of which an integer or an untyped literal can choose between — which
 /// is exactly the `42725` PostgreSQL raises there.

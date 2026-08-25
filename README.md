@@ -46,7 +46,11 @@ What exists today:
   and the five relations over it. A password is stored as a SCRAM-SHA-256
   verifier, but nothing authenticates against it yet and no privilege on an
   object is checked — `GRANT … ON <object>` is refused with `0A000` rather than
-  silently accepted.
+  silently accepted. `pg_has_role` and the nine `has_*_privilege` families
+  (`crabgresql-executor::acl`) answer the questions a client's introspection
+  asks: with no object-level grants every object carries PostgreSQL's *default*
+  ACL, so the owner and the roles that inherit from it hold everything, and
+  everyone else holds only what upstream leaves to `PUBLIC`.
 - **Expressions** (`crabgresql-executor::eval`): comparisons, `AND`/`OR`/`NOT`
   with SQL three-valued NULL logic, `IS [NOT] NULL`, int4/int8 arithmetic
   with PG overflow (`22003`) and division-by-zero (`22012`) behavior.

@@ -33,8 +33,8 @@ pub use expr::{
     subquery_in_execute_param, value_shape,
 };
 pub use functions::{
-    AggFn, GeoFn, JsonFn, JsonPathFn, ScalarFn, TableFn, TsFn, WindowFn, lookup_table_fn,
-    routine_params,
+    AclClass, AggFn, ArgForm, GeoFn, JsonFn, JsonPathFn, PrivCall, ScalarFn, TableFn, TsFn,
+    WindowFn, lookup_table_fn, routine_params,
 };
 pub use logical_plan::{
     AggInput, AggregatePlan, AppendPlan, DeletePlan, DistinctKey, ExprVisitor, InsertPlan,

@@ -109,3 +109,4 @@ test: column_introspection
 test: quantified_vector
 test: lateral
 test: roles
+test: privileges

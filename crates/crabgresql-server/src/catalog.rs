@@ -13,8 +13,8 @@ use crabgresql_catalog::{
     CatalogViewDependency, SerialSequenceLookup, SystemCatalog, ViewDepRelation,
 };
 use crabgresql_executor::{
-    CatalogOperator, CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, PartitionKeyDef,
-    RelationSize, SerialSequence,
+    AclClass, CatalogOperator, CatalogOps, ConstraintDef, ExtensionVersion, IndexDef, ObjectAcl,
+    PartitionKeyDef, RelationSize, RoleMembership, SerialSequence,
 };
 use crabgresql_storage_api::pgstat::{
     DbStatSnapshot, IndexStatSnapshot, PgStatCounters, RelStatSnapshot,
@@ -699,6 +699,57 @@ impl SessionCatalogOps {
 impl CatalogOps for SessionCatalogOps {
     fn role_name(&self, oid: u32) -> Option<String> {
         self.system.role_name(oid).map(str::to_string)
+    }
+
+    fn role_oid(&self, name: &str) -> Option<u32> {
+        self.system.role_oid(name)
+    }
+
+    fn current_user_oid(&self) -> u32 {
+        self.system.current_user_oid()
+    }
+
+    fn role_membership(&self, member: u32, role: u32) -> RoleMembership {
+        let m = self.system.role_membership(member, role);
+        RoleMembership {
+            superuser: m.superuser,
+            inherits: m.inherits,
+            member: m.member,
+            set: m.set,
+            admin: m.admin,
+        }
+    }
+
+    /// Each class is a different catalog lookup, which is why the executor asks
+    /// with a class rather than by OID alone: the same number identifies a
+    /// relation, a schema and a type all at once.
+    fn object_acl(&self, class: AclClass, oid: u32) -> Option<ObjectAcl> {
+        let acl = match class {
+            AclClass::Relation | AclClass::Column | AclClass::AnyColumn | AclClass::Sequence => {
+                self.system.relation_acl(oid)
+            }
+            AclClass::Schema => self.system.namespace_acl(oid),
+            AclClass::Type => self.system.type_acl(oid),
+            AclClass::Function => self.system.proc_acl(oid),
+            // Neither catalog has a row in this build; see `acl::resolve_object`
+            // for the matching name-side behavior.
+            AclClass::Server | AclClass::ForeignDataWrapper => None,
+            // A role has no owner to report: `pg_has_role` never asks this.
+            AclClass::Role => None,
+        }?;
+        Some(ObjectAcl {
+            owner: acl.owner,
+            is_sequence: acl.is_sequence,
+            granted_to_public: acl.granted_to_public,
+        })
+    }
+
+    fn attribute_number(&self, oid: u32, column: &str) -> Option<i16> {
+        self.system.attribute_number(oid, column)
+    }
+
+    fn has_attribute(&self, oid: u32, attnum: i16) -> bool {
+        self.system.has_attribute(oid, attnum)
     }
 
     /// A relation is visible when *its own unqualified name reaches it* — PG's

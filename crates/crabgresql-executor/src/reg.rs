@@ -201,6 +201,38 @@ pub fn from_text(kind: RegKind, s: &str, ops: &dyn CatalogOps) -> Result<Reg, Ex
     Ok(from_oid(kind, oid, ops))
 }
 
+/// The relation a *name* denotes, for the privilege functions — PG's
+/// `RangeVarGetRelid` over `textToQualifiedNameList`, which is **not**
+/// `regclassin`.
+///
+/// The difference is the two shortcuts [`from_text`] takes first: there, all
+/// digits are an OID written directly and `-` is `InvalidOid`. Here they are
+/// ordinary names, so `has_table_privilege('1259','SELECT')` reports
+/// `relation "1259" does not exist` where `'1259'::regclass` is `pg_class`.
+/// Everything past the shortcuts — case folding, quoting, qualification — is
+/// the same grammar, so it is shared rather than restated.
+pub fn relation_oid_from_name(s: &str, ops: &dyn CatalogOps) -> Result<u32, ExecError> {
+    let parts = split_qualified_name(s.trim()).ok_or_else(invalid_name_syntax)?;
+    let (namespace, name) = qualify(RegKind::Class, &parts, || ops.current_database())?;
+    // `RangeVarGetRelid` resolves the namespace first, so `'nosuch.t'` is a
+    // missing *schema* rather than a missing relation — one more place it and
+    // `regclassin` part company. `information_schema` lands here as well: this
+    // build serves three of its views but publishes no `pg_namespace` row for
+    // the schema, so every privilege question about it reports that one fact.
+    if let Some(namespace) = &namespace
+        && ops.namespace_oid(namespace).is_none()
+    {
+        return Err(ExecError::new(
+            sqlstate::INVALID_SCHEMA_NAME,
+            format!("schema \"{namespace}\" does not exist"),
+        ));
+    }
+    ops.rel_oid(namespace.as_deref(), &name)
+        // Belt and braces: 0 is `InvalidOid`, never an object to ask about.
+        .filter(|oid| *oid != 0)
+        .ok_or_else(|| not_found(RegKind::Class, s, &parts))
+}
+
 /// The OID a type *name* denotes, which is PG's `parseTypeString` — what
 /// `regtypein` resolves its whole argument with, and what `regoperatorin`
 /// resolves each operand with.

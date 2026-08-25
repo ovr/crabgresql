@@ -315,7 +315,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         | ScalarFn::SessionUser
         | ScalarFn::PgMyTempSchema
         | ScalarFn::PgIsOtherTempSchema
-        | ScalarFn::PgBackendPid => {
+        | ScalarFn::PgBackendPid
+        | ScalarFn::HasPrivilege(_) => {
             return Err(ExecError::new(
                 sqlstate::INTERNAL_ERROR,
                 "catalog function reached the pure scalar evaluator",

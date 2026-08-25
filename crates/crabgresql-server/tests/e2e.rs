@@ -18460,6 +18460,130 @@ async fn dropping_a_role_removes_its_memberships() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The privilege functions answer for the role the session is *acting as*, so a
+/// `SET ROLE` moves every answer that depends on ownership — and moves it back.
+/// The smoke suite pins the values; what only a live session can show is that
+/// they follow the identity rather than the connection.
+#[tokio::test]
+async fn privilege_functions_follow_set_role() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE owned (i int); CREATE ROLE alice")
+        .await?;
+    let ask = "SELECT has_table_privilege('owned', 'SELECT') AS own, \
+                      has_table_privilege('pg_class', 'SELECT') AS cat, \
+                      has_schema_privilege('public', 'CREATE') AS pub";
+    let before = client.simple_query(ask).await?;
+    let before = rows(&before);
+    assert_eq!(
+        (before[0].get(0), before[0].get(1), before[0].get(2)),
+        (Some("t"), Some("t"), Some("t")),
+        "the owning superuser holds everything"
+    );
+
+    client.batch_execute("SET ROLE alice").await?;
+    let during = client.simple_query(ask).await?;
+    let during = rows(&during);
+    assert_eq!(
+        (during[0].get(0), during[0].get(1), during[0].get(2)),
+        // A system catalog stays readable — that is the one grant `initdb`
+        // leaves to PUBLIC here — while the owner's table and schema do not.
+        (Some("f"), Some("t"), Some("f")),
+        "a plain role holds only what PUBLIC holds"
+    );
+
+    client.batch_execute("RESET ROLE").await?;
+    let after = client.simple_query(ask).await?;
+    assert_eq!(rows(&after)[0].get(0), Some("t"));
+    Ok(())
+}
+
+/// A membership granted mid-session is visible to `pg_has_role` at once, and so
+/// is the ownership it carries: a member of the owner holds what the owner
+/// holds, which is what makes `information_schema`'s filters work under a
+/// `SET ROLE`.
+#[tokio::test]
+async fn granting_membership_moves_the_privilege_answers() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute("CREATE TABLE owned (i int); CREATE ROLE alice; CREATE ROLE devs")
+        .await?;
+    let ask = "SELECT pg_has_role('alice', 'devs', 'MEMBER') AS member, \
+                      pg_has_role('alice', 'devs', 'USAGE') AS usage";
+    let before = client.simple_query(ask).await?;
+    assert_eq!(
+        (rows(&before)[0].get(0), rows(&before)[0].get(1)),
+        (Some("f"), Some("f"))
+    );
+
+    client.batch_execute("GRANT devs TO alice").await?;
+    let after = client.simple_query(ask).await?;
+    assert_eq!(
+        (rows(&after)[0].get(0), rows(&after)[0].get(1)),
+        (Some("t"), Some("t"))
+    );
+
+    // A member of the *bootstrap* role owns what it owns. `alice` is not one,
+    // so she still holds nothing on the table — until she is.
+    client.batch_execute("SET ROLE alice").await?;
+    let unowned = client
+        .simple_query("SELECT has_table_privilege('owned', 'SELECT')")
+        .await?;
+    assert_eq!(rows(&unowned)[0].get(0), Some("f"));
+    client.batch_execute("RESET ROLE").await?;
+    client.batch_execute("GRANT postgres TO alice").await?;
+    client.batch_execute("SET ROLE alice").await?;
+    let owned = client
+        .simple_query("SELECT has_table_privilege('owned', 'SELECT')")
+        .await?;
+    assert_eq!(
+        rows(&owned)[0].get(0),
+        Some("t"),
+        "a role that inherits the owner's privileges holds them"
+    );
+    Ok(())
+}
+
+/// A `NOINHERIT` member is a member and may `SET ROLE`, but the owner's
+/// privileges do not reach it until it does — the distinction `pg_has_role`
+/// draws between `MEMBER`/`SET` and `USAGE`, and the one an object check makes.
+#[tokio::test]
+async fn noinherit_membership_confers_nothing_until_set_role() -> anyhow::Result<()> {
+    let client = connect(spawn_server().await).await;
+    client
+        .batch_execute(
+            "CREATE TABLE owned (i int); CREATE ROLE alice NOINHERIT; \
+             GRANT postgres TO alice",
+        )
+        .await?;
+    client.batch_execute("SET ROLE alice").await?;
+    let asked = client
+        .simple_query(
+            "SELECT pg_has_role('postgres', 'MEMBER') AS member, \
+                    pg_has_role('postgres', 'SET') AS set, \
+                    pg_has_role('postgres', 'USAGE') AS usage, \
+                    has_table_privilege('owned', 'SELECT') AS tab",
+        )
+        .await?;
+    let asked = rows(&asked);
+    assert_eq!(
+        (
+            asked[0].get(0),
+            asked[0].get(1),
+            asked[0].get(2),
+            asked[0].get(3)
+        ),
+        (Some("t"), Some("t"), Some("f"), Some("f"))
+    );
+    // `SET ROLE` to the owner is how those privileges arrive.
+    client.batch_execute("SET ROLE postgres").await?;
+    let after = client
+        .simple_query("SELECT has_table_privilege('owned', 'SELECT')")
+        .await?;
+    assert_eq!(rows(&after)[0].get(0), Some("t"));
+    Ok(())
+}
+
 /// `pg_get_userbyid` resolves the owner OID every catalog row carries, which is
 /// the bootstrap superuser rather than whoever is connected.
 #[tokio::test]
