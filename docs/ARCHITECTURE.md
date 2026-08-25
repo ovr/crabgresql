@@ -865,6 +865,41 @@ The most underestimated part of compatibility. Bit-for-bit behavior required:
 - PL/pgSQL — our own parser and interpreter (`crabgresql-plpgsql`) on top of
   our executor — a prerequisite for passing real-world migrations.
 
+### 3.4 The data directory
+
+A cluster is one directory, laid out as PostgreSQL lays one out wherever the
+contents serve the same purpose:
+
+```
+<PGDATA>/
+  PG_VERSION           # major version that wrote this directory
+  base/                # one file per heap/index relfilenode
+  global/
+    pg_control         # redo point, XID floor, clean-shutdown flag
+    relcatalog         # the engine's relation catalog (name -> filenode+schema)
+  pg_wal/              # 32 MiB segments, named by segment number
+  pg_xact/             # commit log
+  stats/               # one file of ANALYZE results per relation
+  parquet/             # one directory per Parquet relation
+```
+
+Creation is a single operation (`crabgresql_server::initdb`), reached either
+from `crabgresql initdb -D <dir>` or from the server itself when it is started
+on an absent or empty directory. The two differ in one answer: `initdb` refuses
+a directory that already holds a cluster, and the server expects one.
+
+`PG_VERSION` is written **last** and fsynced, which is what makes it a marker
+rather than a field: everything it vouches for is on disk before it is. It
+states the major version whose behavior the writing server reported, not the
+layout of any one file — those carry their own version fields (`pg_control`'s
+header, the relation catalog's per-section magics), which is where a format
+change *within* a major version is caught.
+
+A directory holding a control file or `base/` but no `PG_VERSION` is a cluster
+written before the stamp existed. It is adopted — stamped in place, data
+untouched — because the on-disk format is a compatibility boundary. A directory
+holding anything else is refused: it was almost certainly named by mistake.
+
 ## 4. Workspace layout (crates)
 
 ```

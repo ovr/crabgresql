@@ -9,9 +9,12 @@ use std::time::Duration;
 use crabgresql_server_process::{ServerProcess, listening_line, locate_server_binary};
 use tokio_postgres::NoTls;
 
+/// `dir` is the run's root: the cluster goes under it and the log beside it,
+/// because the server refuses to initialize a data directory that already holds
+/// files — and the log is written before the child starts.
 async fn start(dir: &Path) -> anyhow::Result<ServerProcess> {
     let binary = locate_server_binary(None)?;
-    Ok(ServerProcess::start(&binary, dir, &[], &dir.join("server.log")).await?)
+    Ok(ServerProcess::start(&binary, &dir.join("pgdata"), &[], &dir.join("server.log")).await?)
 }
 
 #[tokio::test]

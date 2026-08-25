@@ -34,7 +34,11 @@ use crabgresql_txn::Xid;
 
 use crate::record::{Lsn, WalError};
 
-const CONTROL_SUBDIR: &str = "global";
+/// Cluster-wide directory holding `pg_control` (and the engine's relation
+/// catalog). Public because creating the data directory's skeleton is now one
+/// operation elsewhere (`crabgresql_server::initdb`), and a second copy of this
+/// string there would drift from this one in silence.
+pub const CONTROL_SUBDIR: &str = "global";
 const CONTROL_FILE: &str = "pg_control";
 const MAGIC: u32 = 0xCA6D_0001;
 const VERSION: u32 = 2;
@@ -95,6 +99,29 @@ pub fn read_control(dir: &Path) -> Result<Option<ControlFile>, WalError> {
         Err(e) => return Err(e.into()),
     };
     Ok(decode(&bytes))
+}
+
+/// Whether `dir` holds a `pg_control` **somebody else** wrote.
+///
+/// [`read_control`] deliberately cannot answer this: it folds "corrupt" into
+/// "absent" so a lost control file costs a whole-stream replay rather than a
+/// refusal. That is right for our own file and wrong for a foreign one — a
+/// PostgreSQL data directory carries the same `PG_VERSION` we do (the parity
+/// target is PG 19), so without this the two are indistinguishable and we would
+/// open one and overwrite its control file at the first checkpoint.
+///
+/// Only a positively-read, positively-different magic counts. Absent is `false`
+/// (a fresh cluster), and so is a file too short to carry one: our own is
+/// published by rename and is never short, but "cannot tell" must not condemn a
+/// directory whose data may be real. A file with *our* magic and a broken CRC
+/// stays ours, and keeps reading as absent above.
+pub fn control_is_foreign(dir: &Path) -> Result<bool, WalError> {
+    let bytes = match std::fs::read(control_path(dir)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(read_u32(&bytes, 0).is_some_and(|magic| magic != MAGIC))
 }
 
 /// Parse a control-file image. `None` for anything we cannot vouch for.
@@ -195,6 +222,45 @@ mod tests {
         let crc = crc32c::crc32c(&bytes);
         bytes.extend_from_slice(&crc.to_le_bytes());
         bytes
+    }
+
+    /// The one question `read_control` cannot answer, because it folds corrupt
+    /// into absent: is this file *somebody else's*? A PostgreSQL data directory
+    /// carries the same `PG_VERSION` we do, so this magic is what keeps us from
+    /// opening one and overwriting it.
+    #[test]
+    fn a_foreign_control_file_is_told_apart_from_ours() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert!(!control_is_foreign(dir.path())?, "absent: a fresh cluster");
+
+        write_control(
+            dir.path(),
+            &ControlFile {
+                next_xid: Xid(7),
+                redo_lsn: Lsn(0),
+                clean_shutdown: true,
+            },
+        )?;
+        assert!(!control_is_foreign(dir.path())?);
+
+        // Ours with a broken CRC still reads as absent — and must still be ours,
+        // or losing a checkpoint's worth of bytes would cost the whole cluster.
+        let mut ours = std::fs::read(control_path(dir.path()))?;
+        let last = ours.len() - 1;
+        ours[last] ^= 0xFF;
+        write_raw(dir.path(), &ours)?;
+        assert_eq!(read_control(dir.path())?, None);
+        assert!(!control_is_foreign(dir.path())?);
+
+        // PostgreSQL's: eight bytes of system identifier where our magic sits.
+        write_raw(dir.path(), &[0x11; 8192])?;
+        assert!(control_is_foreign(dir.path())?);
+
+        // Too short to carry a magic: we cannot tell, so we do not condemn it.
+        write_raw(dir.path(), &[0x11, 0x22])?;
+        assert!(!control_is_foreign(dir.path())?);
+
+        Ok(())
     }
 
     #[test]

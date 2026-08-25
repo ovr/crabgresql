@@ -74,6 +74,35 @@ What exists today:
 Tests: `cargo test` — unit tests per crate plus end-to-end tests that drive a
 real driver (tokio-postgres) and raw-socket handshake checks.
 
+## The data directory
+
+A cluster lives in one directory (`--data-dir`/`-D`, or `PGDATA`; `./pgdata` by
+default). Create one deliberately:
+
+```console
+$ crabgresql initdb -D ./pgdata
+$ crabgresql -D ./pgdata
+```
+
+`initdb` writes the directory's skeleton (`base/`, `global/`, `pg_wal/`,
+`pg_xact/`, `stats/`, `parquet/`), its first `global/pg_control`, and a
+`PG_VERSION` stamp naming the major version that wrote it — all owner-only
+(`0700`), because everything under the directory is readable as plain bytes.
+`--no-sync` skips the fsyncs, which is fine for a throwaway cluster and unsafe
+for one you intend to keep.
+
+Running it is optional: the server initializes an **absent or empty** directory
+itself, so `crabgresql -D ./pgdata` on a fresh host still works, and the image
+needs no entrypoint script. What running it buys is doing that under the account
+the server will run as, before the first start, and getting an error rather than
+a new cluster when the directory turns out to hold something already.
+
+A directory that holds files but is not a cluster is refused, rather than filled
+in around them — a typo in `-D` should not scatter a database through your source
+tree. So is a cluster whose `PG_VERSION` names another major version. A directory
+written by a build from before `PG_VERSION` existed is stamped and opened, data
+intact.
+
 ## Configuration
 
 Every environment variable the server reads is declared in one place,
@@ -84,7 +113,7 @@ not parse falls back to its default rather than failing startup.
 | --- | --- | --- | --- |
 | `CRABGRESQL_PORT` | `5433` | | TCP port to listen on (also `--port`) |
 | `CRABGRESQL_LISTEN_ADDRESS` | `127.0.0.1` | | address to accept connections on (also `--listen-address`). Loopback by default: authentication is trust and there is no TLS, so anything reachable on this port is a superuser |
-| `PGDATA` | `./pgdata` | | data directory the durable heap engine is opened in (also `--data-dir`) |
+| `PGDATA` | `./pgdata` | | data directory the durable heap engine is opened in (also `--data-dir`, and read by `crabgresql initdb`) |
 | `CRABGRESQL_SUPERUSER` | `postgres` | | name of the bootstrap superuser created when the data directory has no role catalog yet, as `initdb --username` names PostgreSQL's (also `--superuser`). Ignored afterwards: the stored roles are authoritative. Connections are still trusted whoever they claim to be — nothing authenticates yet |
 | `CRABGRESQL_COPY_ALLOW_PATHS` | *(empty)* | | extra directories a server-side `COPY … FROM '<file>'` may read, colon-separated (also repeatable `--copy-allow-path`). The data directory is always readable and is where a relative path resolves; nothing else is, because the read runs with the server's privileges |
 | `RUST_LOG` | `info` | | tracing filter directives |

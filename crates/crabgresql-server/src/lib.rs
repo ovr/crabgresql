@@ -12,6 +12,7 @@ mod explain;
 mod func_deps;
 mod global_catalog;
 mod guc;
+pub mod initdb;
 mod prepare;
 mod query;
 mod role_stmt;

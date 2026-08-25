@@ -95,8 +95,8 @@ of any one file.
 - `cargo test --workspace` leaves `crabgresql-server`'s `e2e` binary aborting on
   `recursive_view_definition_errors_on_use_not_creation` (stack overflow). Pre-existing
   and unrelated; `-- --skip recursive_view_definition` to get a clean run.
-- Startup errors print as a raw `Debug` of `std::io::Error` (`Custom { kind: Other,
-  error: Redo("...") }`) because `main` returns `io::Result`. The message inside is
-  the real one.
+- Startup errors print as one line on stderr — `crabgresql: <message>` — and the
+  process exits 1. (They used to be a raw `Debug` of `std::io::Error`, `Custom { kind:
+  Other, error: Redo("...") }`; `main` now prints the `Display` itself.)
 - Do not run `cargo fmt --all` — the tree is not clean under rustfmt 1.8.0; format by
   hand.

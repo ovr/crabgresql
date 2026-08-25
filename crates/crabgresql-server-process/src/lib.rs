@@ -116,6 +116,11 @@ impl ServerProcess {
     /// may read: the regression suites keep their fixtures in the source tree
     /// rather than in the data directory. A load that goes through
     /// `COPY … FROM STDIN` needs none.
+    ///
+    /// `log_path` must be **outside** `data_dir`. The log is created before the
+    /// child is, and a server asked to initialize a directory that already holds
+    /// files refuses it — so a log inside a fresh data directory stops the very
+    /// server it was meant to record.
     pub async fn start(
         binary: &Path,
         data_dir: &Path,
@@ -397,7 +402,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let error = ServerProcess::start(
             Path::new("/nonexistent/crabgresql"),
-            dir.path(),
+            &dir.path().join("pgdata"),
             &[],
             &dir.path().join("server.log"),
         )
@@ -424,7 +429,7 @@ mod tests {
         let thief = StdTcpListener::bind(("127.0.0.1", 0)).expect("a port");
         let port = thief.local_addr().expect("an address").port();
         let mut server = ServerProcess {
-            child: spawn(&binary, dir.path(), &[], &log_path, port).expect("spawn"),
+            child: spawn(&binary, &dir.path().join("pgdata"), &[], &log_path, port).expect("spawn"),
             port,
             log_path,
         };

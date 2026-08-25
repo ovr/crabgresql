@@ -477,7 +477,9 @@ fn no_data_hint(suite: &Suite) -> String {
 ///
 /// A child process is what a benchmark should measure: the same binary a user
 /// runs, and a load that OOMs or panics it no longer takes the harness holding
-/// the results down with it. Its log goes to `<data-dir>/server.log`.
+/// the results down with it. Its log goes to `<dir>/server.log`, beside the
+/// cluster rather than inside it — the server refuses to initialize a directory
+/// that already holds files, and the log would be one.
 async fn start_target(config: &RunConfig) -> Result<Target> {
     if let Some(url) = &config.url {
         return Ok(Target {
@@ -500,12 +502,22 @@ async fn start_target(config: &RunConfig) -> Result<Target> {
             (Some(dir), path)
         }
     };
+    // `path` is the run's root: the cluster sits under it, because a data
+    // directory has to be free of anything the server did not put there and the
+    // log lives at the root. A `--data-dir` from before this split *is* the
+    // cluster, so it keeps being used as one — reusing a loaded dataset across
+    // runs is the whole reason that flag exists.
+    let data_dir = if path.join("base").is_dir() {
+        path.clone()
+    } else {
+        path.join("pgdata")
+    };
     let binary = locate_server_binary(config.server_bin.clone())?;
     // The dataset is streamed in through `COPY … FROM STDIN`, so the server
     // needs no read access outside its own data directory.
-    let server = ServerProcess::start(&binary, &path, &[], &path.join("server.log"))
+    let server = ServerProcess::start(&binary, &data_dir, &[], &path.join("server.log"))
         .await
-        .with_context(|| format!("starting {} over {}", binary.display(), path.display()))?;
+        .with_context(|| format!("starting {} over {}", binary.display(), data_dir.display()))?;
 
     Ok(Target {
         conninfo: format!(
