@@ -727,6 +727,12 @@ pub enum ScalarFn {
     /// asked about and how each argument was spelled, which is exactly what
     /// [`PrivCall`] carries. The executor evaluates them in `acl`.
     HasPrivilege(PrivCall),
+    /// One of the seven `information_schema._pg_*` type-shape helpers, all of
+    /// which take `(typid oid, typmod int4)` and differ only in which question
+    /// they ask — which is what [`InfoSchemaTypeAttr`] carries. The executor
+    /// answers them out of `crabgresql_types::info_schema`, the same module the
+    /// `information_schema.columns` row builder reads.
+    InfoSchemaTypeAttr(InfoSchemaTypeAttr),
     /// `pg_relation_size(regclass[, text]) -> int8`: the relation's own storage
     /// in bytes. The second argument names a fork (`main`, `fsm`, `vm`, `init`)
     /// and defaults to `main`; anything else is `22023`. NULL for an OID no
@@ -1395,6 +1401,30 @@ pub struct PrivCall {
     pub object: ArgForm,
     /// `Some` only for [`AclClass::Column`].
     pub column: Option<ArgForm>,
+}
+
+/// Which shape question one `information_schema._pg_*` call asks. The seven
+/// share a signature — `(typid oid, typmod int4)` — and are STRICT and
+/// IMMUTABLE alike, so the question itself is the only thing that distinguishes
+/// them.
+///
+/// PostgreSQL declares these in the `information_schema` namespace rather than
+/// `pg_catalog`, so a bare `_pg_char_max_length(...)` does not resolve there
+/// unless the schema is on the search path. It does resolve here: `bare_name`
+/// drops the qualifier for every function, and these are no more ambiguous than
+/// the `pg_catalog` names it already admits that way. Nothing in this build
+/// publishes a `pg_proc` row for them either, so `\df` will not list them and
+/// `::regprocedure` will not resolve one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InfoSchemaTypeAttr {
+    CharMaxLength,
+    CharOctetLength,
+    NumericPrecision,
+    NumericPrecisionRadix,
+    NumericScale,
+    DatetimePrecision,
+    /// The only one of the seven returning `text` rather than `int4`.
+    IntervalType,
 }
 
 struct Signature {
@@ -2139,6 +2169,18 @@ fn lookup(name: &str) -> &'static [Signature] {
                 args: $args,
                 ret: BOOL,
             }
+        };
+    }
+    // The seven `information_schema._pg_*` helpers: one overload each, over the
+    // `(typid, typmod)` pair every catalog row carries. Only the return type
+    // varies.
+    macro_rules! info_attr_sig {
+        ($attr:expr, $ret:expr) => {
+            &[Signature {
+                func: ScalarFn::InfoSchemaTypeAttr($attr),
+                args: &[OID, I4],
+                ret: $ret,
+            }]
         };
     }
     match name {
@@ -3209,6 +3251,20 @@ fn lookup(name: &str) -> &'static [Signature] {
             priv_col_sig!(None, ArgForm::Oid, ArgForm::Name, &[OID, TEXT, TEXT]),
             priv_col_sig!(None, ArgForm::Oid, ArgForm::Attnum, &[OID, I2, TEXT]),
         ],
+        // The `information_schema` type-shape helpers. PostgreSQL's own
+        // `information_schema.columns` and `.domains` are defined over these
+        // seven, and so are this build's row builders for the two views — see
+        // `crabgresql_types::info_schema`, which holds the single answer both
+        // paths read.
+        "_pg_char_max_length" => info_attr_sig!(InfoSchemaTypeAttr::CharMaxLength, I4),
+        "_pg_char_octet_length" => info_attr_sig!(InfoSchemaTypeAttr::CharOctetLength, I4),
+        "_pg_numeric_precision" => info_attr_sig!(InfoSchemaTypeAttr::NumericPrecision, I4),
+        "_pg_numeric_precision_radix" => {
+            info_attr_sig!(InfoSchemaTypeAttr::NumericPrecisionRadix, I4)
+        }
+        "_pg_numeric_scale" => info_attr_sig!(InfoSchemaTypeAttr::NumericScale, I4),
+        "_pg_datetime_precision" => info_attr_sig!(InfoSchemaTypeAttr::DatetimePrecision, I4),
+        "_pg_interval_type" => info_attr_sig!(InfoSchemaTypeAttr::IntervalType, TEXT),
         "obj_description" => &[
             Signature {
                 func: ScalarFn::ObjDescription,

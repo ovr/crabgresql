@@ -21,6 +21,7 @@ pub mod formatting;
 pub mod formatting_num;
 pub mod geo;
 pub mod hex;
+pub mod info_schema;
 pub mod interval;
 pub mod intlit;
 pub mod json;

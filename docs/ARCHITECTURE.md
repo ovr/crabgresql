@@ -827,7 +827,14 @@ one whose columns are all fixed-width — raises `54000 program_limit_exceeded`,
   `pg_attribute` carries neither system columns nor `attislocal`/`attinhcount`
   (per-column inheritance provenance is not recorded — the parent↔child
   correspondence is recomputed by name).
-- `information_schema` — views over pg_catalog, as in PG.
+- `information_schema` — views over pg_catalog, as in PG. Its seven `_pg_*`
+  type-shape helpers (`_pg_char_max_length`, `_pg_char_octet_length`, the three
+  `_pg_numeric_*`, `_pg_datetime_precision`, `_pg_interval_type`) are callable
+  functions, and the `columns`/`domains` row builders answer through the same
+  `crabgresql_types::info_schema` module rather than a second copy of the rules
+  — PostgreSQL *defines* those views in terms of those functions, so a view
+  column and a direct call cannot drift apart. No `pg_proc` row is published for
+  them, so `\df` does not list them and `::regprocedure` will not resolve one.
 - Which relations are served is one table: `registry::CATALOG_RELATIONS` in
   `crabgresql-catalog`, pairing each name and OID with the two `fn` pointers
   that build it (`fn() -> TableSchema` and `fn(&SystemCatalog) -> rows`). The
