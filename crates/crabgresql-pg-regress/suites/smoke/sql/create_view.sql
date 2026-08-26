@@ -69,6 +69,32 @@ SELECT pg_get_viewdef('v_names'::regclass, true);
 DROP VIEW v_names;
 DROP TABLE tn;
 
+-- A function FROM item deparses as the call it is, with the alias and column
+-- list PostgreSQL synthesises for a function range table entry: a bare call is
+-- named after the function, a bare alias renames the scalar column, an alias
+-- list wins over it, and WITH ORDINALITY sits between the call and the alias.
+CREATE VIEW v_fn AS SELECT * FROM abs(1);
+CREATE VIEW v_fn_alias AS SELECT * FROM abs(1) t;
+CREATE VIEW v_fn_cols AS SELECT * FROM abs(1) t(v);
+CREATE VIEW v_fn_ord AS SELECT * FROM abs(1) WITH ORDINALITY;
+CREATE VIEW v_fn_srf AS SELECT * FROM generate_series(1, 3);
+CREATE VIEW v_fn_text AS SELECT * FROM upper('cd');
+SELECT pg_get_viewdef('v_fn'::regclass);
+SELECT pg_get_viewdef('v_fn_alias'::regclass);
+SELECT pg_get_viewdef('v_fn_cols'::regclass);
+SELECT pg_get_viewdef('v_fn_ord'::regclass);
+SELECT pg_get_viewdef('v_fn_srf'::regclass);
+SELECT pg_get_viewdef('v_fn_text'::regclass);
+-- and the rendered definition reads back as the same view.
+SELECT * FROM v_fn;
+SELECT * FROM v_fn_ord;
+DROP VIEW v_fn_text;
+DROP VIEW v_fn_srf;
+DROP VIEW v_fn_ord;
+DROP VIEW v_fn_cols;
+DROP VIEW v_fn_alias;
+DROP VIEW v_fn;
+
 -- Clean up (this suite shares one database across tests).
 DROP VIEW v_over;
 DROP VIEW v_alias;

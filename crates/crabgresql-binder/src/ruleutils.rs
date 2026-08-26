@@ -572,9 +572,9 @@ pub fn sqlbody_statement(sql: &str, fmt: &FmtCtx) -> Option<String> {
     Some(format!("SELECT {}", projection.join(", ")))
 }
 
-fn from_item(from: &ast::TableWithJoins, _cx: Cx) -> String {
+fn from_item(from: &ast::TableWithJoins, cx: Cx) -> String {
     if from.joins.is_empty() {
-        table_factor(&from.relation)
+        table_factor(&from.relation, cx)
     } else {
         // TODO: render a join in PG's parenthesised, indented shape; it keeps
         // the parser's rendering instead. Note it is emitted *verbatim* —
@@ -585,8 +585,24 @@ fn from_item(from: &ast::TableWithJoins, _cx: Cx) -> String {
     }
 }
 
-fn table_factor(factor: &ast::TableFactor) -> String {
+fn table_factor(factor: &ast::TableFactor, cx: Cx) -> String {
     match factor {
+        // A call, not a relation: the parser gives a function FROM item a
+        // `Table` factor carrying arguments, and `LATERAL f(…)` its own.
+        ast::TableFactor::Table {
+            name,
+            alias,
+            args: Some(args),
+            with_ordinality,
+            ..
+        } => function_from_item(name, &args.args, alias, *with_ordinality, false, cx),
+        ast::TableFactor::Function {
+            lateral,
+            name,
+            args,
+            with_ordinality,
+            alias,
+        } => function_from_item(name, args, alias, *with_ordinality, *lateral, cx),
         ast::TableFactor::Table { name, alias, .. } => {
             let mut s = object_name(name);
             if let Some(a) = alias {
@@ -596,6 +612,85 @@ fn table_factor(factor: &ast::TableFactor) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// A function FROM item — `f(args) [WITH ORDINALITY] alias(col, …)`.
+///
+/// PostgreSQL deparses one from its range table entry, so it always writes the
+/// alias *and* the full column list out, synthesising both from the function
+/// when the query named neither: `SELECT * FROM abs(1)` comes back as
+/// `FROM abs(1) abs(abs)`, and a composite-returning one lists its record's
+/// columns (`pg_input_error_info(message, detail, hint, sql_error_code)`).
+/// An alias column list may rename only the leading columns, so it is padded
+/// with the names it does not cover — `abs(1) WITH ORDINALITY t(v)` is
+/// `t(v, ordinality)`.
+///
+/// **Where this parts company with PostgreSQL**, both because the walk reads a
+/// parse tree and never binds it:
+///
+/// * `LATERAL` is written only where the query wrote it. PG adds the keyword to
+///   any function item whose arguments read another FROM item, which is a fact
+///   about the range table. Nothing is lost by omitting it — a function FROM
+///   item is implicitly lateral — but the text differs from PG's.
+/// * An unqualified column argument stays unqualified (`abs(id)` against PG's
+///   `abs(tt.id)`), the same gap every other clause of this deparser has.
+fn function_from_item(
+    name: &ast::ObjectName,
+    args: &[ast::FunctionArg],
+    alias: &Option<ast::TableAlias>,
+    with_ordinality: bool,
+    lateral: bool,
+    cx: Cx,
+) -> String {
+    let call = crate::functions::plain_call(name, args);
+    let mut s = String::new();
+    if lateral {
+        s.push_str("LATERAL ");
+    }
+    s.push_str(&function(&call, cx));
+    if with_ordinality {
+        s.push_str(" WITH ORDINALITY");
+    }
+    // Addressed by its alias, else by the function's own name with any schema
+    // dropped — the rule the binder's FROM items follow too.
+    let fname = name
+        .0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|id| id.value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let (qualifier, renames) = match alias {
+        Some(a) => (ident(&a.name), a.columns.as_slice()),
+        None => (quote_name(&fname), [].as_slice()),
+    };
+    let mut columns = function_item_columns(&fname, &qualifier, with_ordinality);
+    for (col, rename) in columns.iter_mut().zip(renames) {
+        *col = ident(&rename.name);
+    }
+    s.push_str(&format!(" {qualifier}({})", columns.join(", ")));
+    s
+}
+
+/// The column names a function FROM item exposes before an alias *column list*
+/// renames them.
+///
+/// A set-returning function this build knows carries its own names, which a bare
+/// alias leaves alone: the record of `pg_input_error_info`, and the `relid`
+/// PostgreSQL declares as `pg_partition_ancestors`'s OUT parameter rather than
+/// naming that column after the function. Everything else — a plain scalar call,
+/// and the polymorphic SRFs whose element type is not known here — has one
+/// column named after the FROM item, so `abs(1) t` exposes `t` and a bare
+/// `abs(1)` exposes `abs`. That is the rule the binder applies to the rowset
+/// itself (`bound_table_fn_item`), read off the parse tree instead.
+fn function_item_columns(fname: &str, qualifier: &str, with_ordinality: bool) -> Vec<String> {
+    let mut columns: Vec<String> = match crate::functions::lookup_table_fn(fname) {
+        Some(func) => func.columns().iter().map(|c| quote_name(&c.name)).collect(),
+        None => vec![qualifier.to_string()],
+    };
+    if with_ordinality {
+        columns.push(quote_name("ordinality"));
+    }
+    columns
 }
 
 /// One `ORDER BY` key. PG omits everything that is already the default, so only
@@ -1386,5 +1481,95 @@ mod tests {
     #[test]
     fn unparseable_sql_has_no_definition() {
         assert_eq!(view_definition("not a query at all", true, &[]), None);
+    }
+
+    /// A function FROM item deparses as the *call* it is, with the alias and
+    /// column list PostgreSQL synthesises for a function range table entry.
+    /// Every expected string pinned against PostgreSQL 18.4's `pg_get_viewdef`.
+    #[test]
+    fn renders_a_function_from_item_as_a_call() {
+        let def = |sql: &str, columns: &[&str]| {
+            let columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+            view_definition(sql, true, &columns).expect("rendered")
+        };
+        assert_eq!(
+            def("SELECT * FROM abs(1)", &["abs"]),
+            " SELECT abs\n   FROM abs(1) abs(abs);"
+        );
+        // A bare alias names the column too; an alias list wins over it.
+        assert_eq!(
+            def("SELECT * FROM abs(1) t", &["t"]),
+            " SELECT t\n   FROM abs(1) t(t);"
+        );
+        assert_eq!(
+            def("SELECT * FROM abs(1) t(v)", &["v"]),
+            " SELECT v\n   FROM abs(1) t(v);"
+        );
+        // The ordinal joins the rowset, and a short alias list is padded with
+        // the names it does not cover.
+        assert_eq!(
+            def(
+                "SELECT * FROM abs(1) WITH ORDINALITY",
+                &["abs", "ordinality"]
+            ),
+            " SELECT abs,\n    ordinality\n   FROM abs(1) WITH ORDINALITY abs(abs, ordinality);"
+        );
+        assert_eq!(
+            def(
+                "SELECT * FROM abs(1) WITH ORDINALITY t(v)",
+                &["v", "ordinality"]
+            ),
+            " SELECT v,\n    ordinality\n   FROM abs(1) WITH ORDINALITY t(v, ordinality);"
+        );
+        // A set-returning function keeps its own column names: the record of
+        // `pg_input_error_info`, and the OUT parameter of
+        // `pg_partition_ancestors` — which is `relid`, not the function's name.
+        assert_eq!(
+            def(
+                "SELECT * FROM pg_input_error_info('1e400', 'float4')",
+                &["message", "detail", "hint", "sql_error_code"]
+            ),
+            concat!(
+                " SELECT message,\n    detail,\n    hint,\n    sql_error_code\n",
+                "   FROM pg_input_error_info('1e400'::text, 'float4'::text)",
+                " pg_input_error_info(message, detail, hint, sql_error_code);"
+            )
+        );
+        // The argument's `::text` is this walk's type-blind rendering, where PG
+        // writes the `::regclass` its signature gives it — see [`Cx::calls`].
+        // The column list is the point here, and it is PG's.
+        assert_eq!(
+            def("SELECT * FROM pg_partition_ancestors('pt')", &["relid"]),
+            " SELECT relid\n   FROM pg_partition_ancestors('pt'::text) pg_partition_ancestors(relid);"
+        );
+        // A polymorphic one has no record to read names off, and its single
+        // column is named after the function.
+        assert_eq!(
+            def("SELECT * FROM generate_series(1, 3)", &["generate_series"]),
+            " SELECT generate_series\n   FROM generate_series(1, 3) generate_series(generate_series);"
+        );
+        // A qualified callee keeps its qualifier in the call — the type-blind
+        // rendering every other call gets — while the item is still addressed
+        // by the bare name, as PostgreSQL addresses it.
+        assert_eq!(
+            def("SELECT * FROM pg_catalog.abs(1)", &["abs"]),
+            " SELECT abs\n   FROM pg_catalog.abs(1) abs(abs);"
+        );
+    }
+
+    /// `LATERAL f(…)` is a factor of its own, and the keyword is kept where the
+    /// query wrote it. PostgreSQL writes it wherever the arguments read another
+    /// FROM item, which this walk cannot know — see [`function_from_item`]. A
+    /// join renders verbatim (the standing TODO in [`from_item`]), so the item
+    /// this reaches is the comma-separated one.
+    #[test]
+    fn keeps_a_written_lateral_on_a_function_item() {
+        let out = view_definition(
+            "SELECT a FROM t, LATERAL abs(t.id) a",
+            true,
+            &["a".to_string()],
+        )
+        .unwrap_or_default();
+        assert!(out.contains("LATERAL abs(t.id) a(a)"), "got {out}");
     }
 }

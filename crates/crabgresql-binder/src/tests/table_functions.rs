@@ -598,3 +598,124 @@ fn available_extension_versions_binds_eight_columns() -> anyhow::Result<()> {
     assert_eq!(e.code, "42883");
     Ok(())
 }
+
+// --- A plain (non-set-returning) function in FROM position ---------------
+//
+// PostgreSQL puts no set-returning requirement on a function FROM item: any
+// function may be written there, and one returning a plain value is a one-row,
+// one-column rowset. Every expectation below was probed against 18.4.
+
+#[test]
+fn scalar_function_in_from_is_a_one_column_rowset() -> anyhow::Result<()> {
+    // A qualifier does not change the name: `pg_catalog.abs(-1)` exposes `abs`.
+    for sql in ["SELECT * FROM abs(-1)", "SELECT * FROM pg_catalog.abs(-1)"] {
+        let (func, columns) = table_fn(sql).with_context(|| format!("binding `{sql}`"))?;
+        assert_eq!(func, crate::TableFn::Scalar(PgType::Int4), "for `{sql}`");
+        assert_eq!(columns.len(), 1, "for `{sql}`");
+        assert_eq!(columns[0].name, "abs", "for `{sql}`");
+        assert_eq!(columns[0].ty, PgType::Int4, "for `{sql}`");
+    }
+    Ok(())
+}
+
+#[test]
+fn scalar_function_from_item_takes_its_alias() -> anyhow::Result<()> {
+    for (sql, name) in [
+        ("SELECT * FROM abs(-1) t", "t"),
+        ("SELECT * FROM abs(-1) AS t", "t"),
+        ("SELECT * FROM abs(-1) t(v)", "v"),
+    ] {
+        let (_func, columns) = table_fn(sql).with_context(|| format!("binding `{sql}`"))?;
+        assert_eq!(columns.len(), 1, "for `{sql}`");
+        assert_eq!(columns[0].name, name, "for `{sql}`");
+    }
+    Ok(())
+}
+
+#[test]
+fn scalar_function_from_item_takes_with_ordinality() -> anyhow::Result<()> {
+    let (_func, columns) = table_fn("SELECT * FROM abs(-1) WITH ORDINALITY")?;
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["abs", "ordinality"]);
+    assert_eq!(columns[1].ty, PgType::Int8);
+    Ok(())
+}
+
+#[test]
+fn scalar_function_from_item_resolves_unknown_literals() -> anyhow::Result<()> {
+    // The four-layer psql/DataGrip shape this was opened for: the untyped
+    // literal is steered by the overload, exactly as it is in a target list.
+    let (func, columns) = table_fn("SELECT * FROM pg_indexam_has_property(403, 'can_order')")?;
+    assert_eq!(func, crate::TableFn::Scalar(PgType::Bool));
+    assert_eq!(columns[0].name, "pg_indexam_has_property");
+    Ok(())
+}
+
+#[test]
+fn a_scalar_from_item_is_implicitly_lateral() -> anyhow::Result<()> {
+    // Same rule the SRF FROM items follow: the argument sees the preceding
+    // items, and the leaf that reads one is marked so it is rebuilt per row.
+    for sql in [
+        "SELECT * FROM t, abs(t.id) a",
+        "SELECT * FROM t CROSS JOIN abs(t.id) a",
+        "SELECT * FROM t CROSS JOIN LATERAL abs(t.id) a",
+    ] {
+        let plan = bound(sql).with_context(|| format!("binding `{sql}`"))?;
+        assert!(
+            !plan_has_outer_refs(&plan),
+            "the argument names a sibling, not the enclosing statement — for `{sql}`"
+        );
+        let LogicalPlan::Join(JoinPlan { source, .. }) = &plan else {
+            bail!("expected a Join plan for `{sql}`");
+        };
+        let JoinExpr::Join { right, .. } = source else {
+            bail!("expected a binary join at the root of `{sql}`");
+        };
+        let JoinExpr::Input {
+            input: JoinInput::TableFunction { func, args, .. },
+            lateral,
+            ..
+        } = right.as_ref()
+        else {
+            bail!("expected a table-function leaf on the right of `{sql}`");
+        };
+        assert_eq!(*func, crate::TableFn::Scalar(PgType::Int4), "for `{sql}`");
+        assert!(lateral, "for `{sql}`");
+        // The whole call is the leaf's one argument, and the outer reference
+        // sits inside it.
+        assert_eq!(args.len(), 1, "for `{sql}`");
+        assert!(
+            args[0].any_node(&|e| matches!(
+                e,
+                BoundExpr::OuterColumnRef {
+                    level: 1,
+                    index: 0,
+                    ..
+                }
+            )),
+            "for `{sql}`, got {:?}",
+            args[0]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_aggregate_in_from_is_rejected_where_pg_rejects_it() -> anyhow::Result<()> {
+    let e = bind_err("SELECT * FROM count(1)")?;
+    assert_eq!(e.code, "42803");
+    assert_eq!(
+        e.message,
+        "aggregate functions are not allowed in functions in FROM"
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_function_in_from_keeps_the_scalar_42883() -> anyhow::Result<()> {
+    // The scalar path reports the argument types it resolved, as PG does.
+    let e = bind_err("SELECT * FROM no_such_fn(1)")?;
+    assert_eq!(e.code, "42883");
+    assert_eq!(e.message, "function no_such_fn(integer) does not exist");
+    Ok(())
+}

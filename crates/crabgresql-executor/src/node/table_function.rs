@@ -72,6 +72,15 @@ impl TableFunctionSource {
                 TableFn::PgPartitionAncestors => {
                     TableFnState::Series(pg_partition_ancestors_series(&values, &self.ctx))
                 }
+                // The whole call is this rowset's one "argument", so evaluating
+                // the arguments has already produced the single row's value —
+                // NULL included, which is a row here and not an empty rowset.
+                TableFn::Scalar(_) => TableFnState::Single(Some(vec![
+                    values
+                        .first()
+                        .cloned()
+                        .expect("a scalar FROM function carries its call as its one argument"),
+                ])),
                 TableFn::PgAvailableExtensions => {
                     TableFnState::Rows(pg_available_extensions_rows(&self.ctx).into_iter())
                 }

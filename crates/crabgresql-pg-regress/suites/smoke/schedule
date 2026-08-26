@@ -110,3 +110,4 @@ test: quantified_vector
 test: lateral
 test: roles
 test: privileges
+test: from_function
