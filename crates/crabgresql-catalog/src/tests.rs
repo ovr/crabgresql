@@ -2482,17 +2482,30 @@ fn xmin_columns_exist_and_are_oids() {
 fn catalog_oids_are_unique_and_outside_every_synthetic_band() {
     let mut seen = std::collections::HashSet::new();
     for def in registry::all() {
-        if def.namespace != CatalogNamespace::PgCatalog {
-            // The information_schema entries have no OID to check; the TODO on
-            // `CatalogRelDef::oid` says why, and this pins the sentinel so it
-            // cannot be read as a real assignment.
-            assert_eq!(def.oid, 0, "{} must not claim an OID yet", def.name);
-            continue;
-        }
+        let namespace = match def.namespace {
+            CatalogNamespace::PgCatalog => "pg_catalog",
+            CatalogNamespace::InformationSchema => "information_schema",
+        };
         assert_ne!(def.oid, 0, "{} has no OID", def.name);
+        // One OID must not make a cast resolve to relations in both schemas.
         assert!(seen.insert(def.oid), "OID {} is claimed twice", def.oid);
-        assert_eq!(builtin_relation_oid(def.name), Some(def.oid));
-        assert_eq!(builtin_relation_name(def.oid), Some(def.name));
+        assert_eq!(builtin_relation_oid_in(namespace, def.name), Some(def.oid));
+        assert_eq!(builtin_relation_ref(def.oid), Some((namespace, def.name)));
+        // The pg_catalog-only lookup must not let an off-path
+        // information_schema view shadow an unqualified user relation.
+        let in_pg_catalog = def.namespace == CatalogNamespace::PgCatalog;
+        assert_eq!(
+            builtin_relation_name(def.oid),
+            in_pg_catalog.then_some(def.name),
+            "{namespace}.{}",
+            def.name
+        );
+        assert_eq!(
+            builtin_relation_oid(def.name),
+            in_pg_catalog.then_some(def.oid),
+            "{namespace}.{}",
+            def.name
+        );
 
         assert!(
             def.oid < FIRST_REL_OID,
@@ -2516,6 +2529,8 @@ fn catalog_oids_are_unique_and_outside_every_synthetic_band() {
     }
     assert_eq!(builtin_relation_oid("no_such_catalog"), None);
     assert_eq!(builtin_relation_name(0), None);
+    assert_eq!(builtin_relation_ref(0), None);
+    assert_eq!(builtin_relation_oid_in("no_such_schema", "tables"), None);
 }
 
 /// Each entry's `schema` really is the relation the entry names. A copy-paste
@@ -2828,6 +2843,95 @@ fn catalog_lookups_agree_with_pg_class_rows() -> anyhow::Result<()> {
     assert_eq!(cat.relation_ref(rel_oid + 1_000), None);
     assert_eq!(cat.relation_ref(1), None);
 
+    Ok(())
+}
+
+#[test]
+fn information_schema_is_a_published_namespace() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let (schema, rows) = required(
+        cat.build_pg_catalog("pg_namespace"),
+        "pg_namespace is missing",
+    )?;
+    let (oid, nspname) = (
+        required(schema.column_index("oid"), "oid column")?,
+        required(schema.column_index("nspname"), "nspname column")?,
+    );
+    let row = required(
+        rows.iter()
+            .find(|row| row[nspname] == Value::Text("information_schema".into())),
+        "information_schema has no pg_namespace row",
+    )?;
+    assert_eq!(
+        row[oid],
+        Value::Oid(oids::INFORMATION_SCHEMA_NAMESPACE_OID),
+        "the row and the constant must name the same schema"
+    );
+    assert_eq!(
+        cat.namespace_oid("information_schema"),
+        Some(oids::INFORMATION_SCHEMA_NAMESPACE_OID)
+    );
+    assert_eq!(
+        cat.namespace_name(oids::INFORMATION_SCHEMA_NAMESPACE_OID)
+            .as_deref(),
+        Some("information_schema")
+    );
+    // PostgreSQL's initdb grants PUBLIC USAGE on information_schema.
+    let acl = required(
+        cat.namespace_acl(oids::INFORMATION_SCHEMA_NAMESPACE_OID),
+        "information_schema has no ACL",
+    )?;
+    assert!(acl.granted_to_public);
+
+    // The restricted-catalog exception list applies only to pg_catalog.
+    for name in ["tables", "columns", "schemata", "domains"] {
+        let view = required(
+            builtin_relation_oid_in("information_schema", name),
+            &format!("information_schema.{name} has no OID"),
+        )?;
+        assert_eq!(
+            builtin_relation_ref(view),
+            Some(("information_schema", name))
+        );
+        let acl = required(
+            cat.relation_acl(view),
+            &format!("information_schema.{name} has no ACL"),
+        )?;
+        assert!(acl.granted_to_public, "information_schema.{name}");
+    }
+    Ok(())
+}
+
+/// Everything that reaches a relation *through* its OID reaches these views
+/// too. Each of these lookups used to stop at `pg_catalog`, so the four views
+/// answered a `regclass` cast and then behaved like a relation that does not
+/// exist — `has_column_privilege` raised, `pg_get_serial_sequence` raised, and
+/// `pg_relation_size` was NULL where PostgreSQL 18.4 answers `t`, NULL and `0`.
+#[test]
+fn information_schema_views_answer_the_by_oid_lookups() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let tables = required(
+        builtin_relation_oid_in("information_schema", "tables"),
+        "information_schema.tables has no OID",
+    )?;
+
+    assert_eq!(cat.attribute_number(tables, "table_name"), Some(3));
+    assert_eq!(cat.attribute_number(tables, "no_such_column"), None);
+
+    // A view owns no sequence, but its columns exist — the distinction
+    // `pg_get_serial_sequence` draws between NULL and 42703.
+    assert!(matches!(
+        cat.serial_sequence(tables, "table_name"),
+        SerialSequenceLookup::Unowned
+    ));
+    assert!(matches!(
+        cat.serial_sequence(tables, "no_such_column"),
+        SerialSequenceLookup::NoColumn { relation } if relation == "tables"
+    ));
+
+    // Zero pages, not "no such relation": the rows are built per statement, and
+    // PostgreSQL reports 0 for its own catalog views just the same.
+    assert_eq!(cat.relation_pages(tables), Some(RelationPages::default()));
     Ok(())
 }
 

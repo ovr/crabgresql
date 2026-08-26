@@ -216,9 +216,7 @@ pub fn relation_oid_from_name(s: &str, ops: &dyn CatalogOps) -> Result<u32, Exec
     let (namespace, name) = qualify(RegKind::Class, &parts, || ops.current_database())?;
     // `RangeVarGetRelid` resolves the namespace first, so `'nosuch.t'` is a
     // missing *schema* rather than a missing relation — one more place it and
-    // `regclassin` part company. `information_schema` lands here as well: this
-    // build serves three of its views but publishes no `pg_namespace` row for
-    // the schema, so every privilege question about it reports that one fact.
+    // `regclassin` part company.
     if let Some(namespace) = &namespace
         && ops.namespace_oid(namespace).is_none()
     {

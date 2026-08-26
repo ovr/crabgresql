@@ -772,8 +772,11 @@ impl CatalogOps for SessionCatalogOps {
         // A catalog relation is always reachable unqualified: `pg_catalog`
         // precedes the rest of the path, so nothing in a user schema shadows
         // it. (This is why `'pg_class'::regclass` renders bare, not qualified.)
-        if crabgresql_catalog::builtin_relation_name(oid).is_some() {
-            return Some(true);
+        // `information_schema` is the opposite case and answers here too: it is
+        // off the search path entirely, so nothing there is reachable
+        // unqualified.
+        if let Some((namespace, _)) = crabgresql_catalog::builtin_relation_ref(oid) {
+            return Some(namespace == "pg_catalog");
         }
         let (namespace, name) = self.system.relation_ref(oid)?;
         // 1. This session's temp namespace shadows everything.
@@ -796,11 +799,11 @@ impl CatalogOps for SessionCatalogOps {
     }
 
     fn rel_name(&self, oid: u32) -> Option<(String, String)> {
-        // A catalog relation has no `pg_class` row to look up — it answers from
+        // A served relation has no `pg_class` row to look up — it answers from
         // the fixed OID assignments instead, so `1259::regclass` renders as
         // `pg_class` the way it does in PostgreSQL.
-        if let Some(name) = crabgresql_catalog::builtin_relation_name(oid) {
-            return Some(("pg_catalog".to_string(), name.to_string()));
+        if let Some((namespace, name)) = crabgresql_catalog::builtin_relation_ref(oid) {
+            return Some((namespace.to_string(), name.to_string()));
         }
         self.system
             .relation_ref(oid)
@@ -814,7 +817,10 @@ impl CatalogOps for SessionCatalogOps {
     ///
     /// The `pg_catalog` step goes through the fixed OID table rather than the
     /// `pg_class` rows: catalog relations are not reflected into `pg_class`, so
-    /// they have no positional OID to find there.
+    /// they have no positional OID to find there. A qualified
+    /// `information_schema` name reads the same table. That schema is reserved
+    /// as a DDL target and is never reached unqualified, so it is not one of the
+    /// search-path steps.
     fn rel_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
         let in_catalog = |name: &str| {
             self.system
@@ -824,6 +830,9 @@ impl CatalogOps for SessionCatalogOps {
         };
         match namespace {
             Some("pg_catalog") => in_catalog(name),
+            Some("information_schema") => {
+                crabgresql_catalog::builtin_relation_oid_in("information_schema", name)
+            }
             Some(ns) => self.system.relation_oid_in(ns, name),
             None => self
                 .system

@@ -47,8 +47,12 @@ pub(crate) mod views;
 pub use catalogs::depend::nextval_target;
 pub use catalogs::description::{object_description, object_descriptions_any_class};
 pub use catalogs::extension::{AvailableExtension, available_extensions};
+pub use catalogs::namespace::{is_builtin_namespace, is_system_namespace};
 pub use oids::{BOOTSTRAP_ROLE_OID, PLPGSQL_LANG_OID};
-pub use registry::{builtin_relation_name, builtin_relation_oid, builtin_view_definition};
+pub use registry::{
+    builtin_relation_name, builtin_relation_oid, builtin_relation_oid_in, builtin_relation_ref,
+    builtin_view_definition,
+};
 pub use source::{
     CatalogBackend, CatalogCursor, CatalogDomain, CatalogDomainCheck, CatalogLock,
     CatalogLockTarget, CatalogPreparedStatement, CatalogRelation, CatalogRole, CatalogRoleMember,
@@ -841,6 +845,11 @@ impl SystemCatalog {
     /// user-created schema. Feeds `pg_class.relnamespace` /
     /// `pg_constraint.connamespace`.
     ///
+    /// The built-in half is read from the same list `pg_namespace` publishes its
+    /// rows from, rather than restated here: a name resolvable through this map
+    /// but missing from that relation (or the reverse) would be a schema that
+    /// exists for `regnamespace` and not for a `SELECT`.
+    ///
     /// Memoized like the accessors above, and for a sharper reason: this one
     /// backs `pg_my_temp_schema()` and `pg_is_other_temp_schema()`, which the
     /// executor evaluates once per *row*. Rebuilt per call it was `O(#schemas)`
@@ -848,9 +857,9 @@ impl SystemCatalog {
     pub(crate) fn namespace_oids(&self) -> &std::collections::HashMap<String, u32> {
         self.namespace_oids.get_or_init(|| {
             let mut map = std::collections::HashMap::new();
-            map.insert("pg_catalog".to_string(), 11);
-            map.insert(TOAST_NAMESPACE.to_string(), 99);
-            map.insert("public".to_string(), 2200);
+            for (oid, name) in catalogs::namespace::BUILTIN_NAMESPACES {
+                map.insert((*name).to_string(), *oid);
+            }
             for (name, oid) in self.user_schemas() {
                 map.insert(name.clone(), *oid);
             }
@@ -1342,19 +1351,16 @@ impl SystemCatalog {
     }
 
     /// [`SystemCatalog::serial_sequence`] for an OID that is not a live user
-    /// relation: a served `pg_catalog` relation reports whether it has the
-    /// column, anything else reports nothing at all.
+    /// relation: a served relation reports whether it has the column, anything
+    /// else reports nothing at all.
     fn catalog_relation_column(&self, oid: u32, column: &str) -> SerialSequenceLookup {
-        let Some(name) = registry::builtin_relation_name(oid) else {
-            return SerialSequenceLookup::NoRelation;
-        };
-        let Some(def) = registry::lookup(CatalogNamespace::PgCatalog, name) else {
+        let Some(def) = registry::def_by_oid(oid) else {
             return SerialSequenceLookup::NoRelation;
         };
         match (def.schema)().column_index(column) {
             Some(_) => SerialSequenceLookup::Unowned,
             None => SerialSequenceLookup::NoColumn {
-                relation: name.to_string(),
+                relation: def.name.to_string(),
             },
         }
     }
@@ -1631,15 +1637,17 @@ impl SystemCatalog {
     ///
     /// Both kinds of relation are covered, exactly as
     /// [`SystemCatalog::serial_sequence`] covers them: a live user relation
-    /// (positionally numbered) and a served `pg_catalog` one (fixed OID).
+    /// (positionally numbered) and a served one (fixed OID), in either schema.
     pub fn relation_acl(&self, oid: u32) -> Option<ObjectAcl> {
-        if let Some(name) = registry::builtin_relation_name(oid) {
-            // A system catalog. `initdb` grants SELECT on most of them to
-            // PUBLIC and closes the rest — see `registry::RESTRICTED_CATALOGS`.
+        if let Some((namespace, name)) = registry::builtin_relation_ref(oid) {
+            // `initdb` grants SELECT on most of the catalog to PUBLIC and closes
+            // the rest — see `registry::RESTRICTED_CATALOGS`. It closes nothing
+            // in `information_schema`: what a stock cluster filters there is
+            // written into the view bodies, not into an ACL.
             return Some(ObjectAcl {
                 owner: oids::BOOTSTRAP_ROLE_OID,
                 is_sequence: false,
-                granted_to_public: registry::public_reads(name),
+                granted_to_public: namespace != "pg_catalog" || registry::public_reads(name),
             });
         }
         let offset = oid.checked_sub(FIRST_REL_OID)? as usize;
@@ -1673,19 +1681,19 @@ impl SystemCatalog {
         })
     }
 
-    /// The schema `oid` identifies. Two of them carry a USAGE grant to PUBLIC
-    /// from `initdb`: `pg_catalog`, and `public` — which since PostgreSQL 15 is
-    /// owned by the database owner and opened to PUBLIC for USAGE *only*, so
-    /// CREATE there still belongs to the owner alone. `pg_toast` and every
-    /// `CREATE SCHEMA` namespace carry no grant at all.
-    ///
-    /// `information_schema` cannot turn up here: it has no `pg_namespace` row in
-    /// this build (see `catalogs::namespace`), so it has no OID to ask about.
+    /// The schema `oid` identifies. Three of them carry a USAGE grant to PUBLIC
+    /// from `initdb`: `pg_catalog`, `information_schema`, and `public` — which
+    /// since PostgreSQL 15 is owned by the database owner and opened to PUBLIC
+    /// for USAGE *only*, so CREATE there still belongs to the owner alone.
+    /// `pg_toast` and every `CREATE SCHEMA` namespace carry no grant at all.
     pub fn namespace_acl(&self, oid: u32) -> Option<ObjectAcl> {
         self.namespace_name(oid).map(|name| ObjectAcl {
             owner: oids::BOOTSTRAP_ROLE_OID,
             is_sequence: false,
-            granted_to_public: name == "pg_catalog" || name == "public",
+            granted_to_public: matches!(
+                name.as_str(),
+                "pg_catalog" | "public" | "information_schema"
+            ),
         })
     }
 
@@ -1743,13 +1751,11 @@ impl SystemCatalog {
         attnum >= 1 && (attnum as usize) <= columns
     }
 
-    /// The shape of a served `pg_catalog` relation, for the two attribute
-    /// lookups above — the same fallback [`SystemCatalog::serial_sequence`]
-    /// makes for an OID that is not a live user relation.
+    /// The shape of a served relation, for the two attribute lookups above —
+    /// the same fallback [`SystemCatalog::serial_sequence`] makes for an OID
+    /// that is not a live user relation.
     fn catalog_relation_schema(&self, oid: u32) -> Option<TableSchema> {
-        let name = registry::builtin_relation_name(oid)?;
-        let def = registry::lookup(CatalogNamespace::PgCatalog, name)?;
-        Some((def.schema)())
+        registry::def_by_oid(oid).map(|def| (def.schema)())
     }
 
     /// The name of the function `oid` identifies, or `None` if this snapshot
@@ -1946,7 +1952,7 @@ impl SystemCatalog {
     /// `None` means "no such relation", which those functions report as NULL.
     /// It is distinct from a relation with nothing to measure, which answers
     /// zeros — as PostgreSQL does for a view, a partitioned parent, and (here
-    /// only) a `pg_catalog` relation, which exists but has no file behind it.
+    /// only) a served catalog relation, which exists but has no file behind it.
     ///
     /// A **live** count where the engine can give one: the page count comes from
     /// [`RelStats::curpages`], not the `relpages` frozen at the last `ANALYZE`
@@ -1960,9 +1966,9 @@ impl SystemCatalog {
     /// Indexed positionally, exactly as [`SystemCatalog::relation_ref`] is, and
     /// for the same reason.
     pub fn relation_pages(&self, oid: u32) -> Option<RelationPages> {
-        // A `pg_catalog` relation is real but has no storage: its rows are
-        // built per statement. Zero, not `None` — the relation exists.
-        if builtin_relation_name(oid).is_some() {
+        // A served relation is real but has no storage: its rows are built per
+        // statement. Zero, not `None` — the relation exists.
+        if builtin_relation_ref(oid).is_some() {
             return Some(RelationPages::default());
         }
         let offset = oid.checked_sub(FIRST_REL_OID)? as usize;

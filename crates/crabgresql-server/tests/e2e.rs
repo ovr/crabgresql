@@ -1214,6 +1214,34 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
     );
     client.simple_query("DROP SCHEMA IF EXISTS nope").await?;
 
+    // A system schema is refused before `IF EXISTS` or CASCADE is consulted —
+    // see `execute_drop_schema` for why `information_schema` joins the two
+    // `pg_` ones here.
+    for stmt in [
+        "DROP SCHEMA pg_catalog",
+        "DROP SCHEMA IF EXISTS pg_toast",
+        "DROP SCHEMA information_schema",
+        "DROP SCHEMA information_schema CASCADE",
+    ] {
+        let err = client
+            .simple_query(stmt)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{stmt} must be refused"));
+        let err = err.as_db_error().expect("database error");
+        assert_eq!(
+            err.code(),
+            &SqlState::DEPENDENT_OBJECTS_STILL_EXIST,
+            "{stmt}"
+        );
+        assert!(
+            err.message()
+                .ends_with("is required by the database system"),
+            "{stmt}: {}",
+            err.message()
+        );
+    }
+
     Ok(())
 }
 

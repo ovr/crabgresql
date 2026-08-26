@@ -251,7 +251,12 @@ fn user_rows(
             vec![
                 Value::Oid(r.oid),
                 Value::Text(r.name.clone()),
-                Value::Oid(namespace_oids.get(&r.namespace).copied().unwrap_or(2200)),
+                Value::Oid(
+                    namespace_oids
+                        .get(&r.namespace)
+                        .copied()
+                        .unwrap_or(PUBLIC_NAMESPACE_OID),
+                ),
                 Value::Oid(BOOTSTRAP_ROLE_OID),
                 Value::Oid(r.lang),
                 // PostgreSQL's defaults: 1 for a built-in, 100 for anything

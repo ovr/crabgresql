@@ -64,6 +64,13 @@ pub(crate) const PUBLIC_NAMESPACE_OID: u32 = 2200;
 /// more than the one relation that emits the row.
 pub(crate) const PG_CATALOG_NAMESPACE_OID: u32 = 11;
 
+/// PostgreSQL's fixed `pg_namespace.oid` for `pg_toast`.
+pub(crate) const TOAST_NAMESPACE_OID: u32 = 99;
+
+/// PostgreSQL 18.4's `initdb`-assigned OID. Unlike the `.dat` assignments above,
+/// this can change between major versions.
+pub(crate) const INFORMATION_SCHEMA_NAMESPACE_OID: u32 = 13699;
+
 /// OID of the one database a crabgresql server serves. PostgreSQL assigns a
 /// fresh OID per `CREATE DATABASE`, so there is no upstream value to reuse: this
 /// one is fixed here so `pg_database.oid` joins against itself consistently and

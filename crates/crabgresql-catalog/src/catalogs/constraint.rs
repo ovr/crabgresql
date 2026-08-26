@@ -65,7 +65,12 @@ pub(crate) fn pg_constraint_schema() -> TableSchema {
 /// `pg_get_constraintdef` resolves against.
 pub(crate) fn pg_constraint_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let (constraints, namespace_oids) = (cat.constraint_oids(), cat.namespace_oids());
-    let nsp_oid = |namespace: &str| namespace_oids.get(namespace).copied().unwrap_or(2200);
+    let nsp_oid = |namespace: &str| {
+        namespace_oids
+            .get(namespace)
+            .copied()
+            .unwrap_or(crate::oids::PUBLIC_NAMESPACE_OID)
+    };
     constraints
         .iter()
         .map(|c| {
