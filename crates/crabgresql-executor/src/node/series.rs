@@ -47,9 +47,12 @@ pub(crate) fn build_series(
         TableFn::GenerateSubscripts => Ok(generate_subscripts_series(values)),
         TableFn::PgPartitionAncestors => Ok(pg_partition_ancestors_series(values, ctx)),
         // These return a record, which a target list cannot expand into.
+        // `Scalar` never reaches here at all: a plain call in a target list is
+        // an ordinary expression, not an SRF marker.
         TableFn::PgInputErrorInfo
         | TableFn::PgAvailableExtensions
-        | TableFn::PgAvailableExtensionVersions => Err(ExecError::new(
+        | TableFn::PgAvailableExtensionVersions
+        | TableFn::Scalar(_) => Err(ExecError::new(
             crabgresql_pg_wire::sqlstate::FEATURE_NOT_SUPPORTED,
             "set-returning function is not supported in this context",
         )),

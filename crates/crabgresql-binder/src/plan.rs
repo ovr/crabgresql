@@ -29,7 +29,9 @@ use crate::expr::{
     reject_agg_or_window, reject_window, text_value, to_bool_operand, unify_value_column,
     view_expansion,
 };
-use crate::functions::{ScalarFn, bind_table_fn_call, positional_arg_exprs};
+use crate::functions::{
+    ScalarFn, bind_scalar_fn_from_item, bind_table_fn_call, positional_arg_exprs,
+};
 use crate::logical_plan::{
     AggInput, AggregatePlan, AppendPlan, DeletePlan, DistinctKey, ExprVisitor, InsertPlan,
     InsertSource, JoinExpr, JoinInput, JoinKind, JoinPlan, LimitPlan, LogicalPlan, MappedRelation,
@@ -4357,10 +4359,32 @@ fn bind_function_from_item(
     // same rule a scalar call uses, not rejected as they are for a relation.
     let fname = crate::functions::function_name(name)
         .ok_or_else(|| BindError::syntax(format!("invalid function name: {name}")))?;
-    let arg_exprs = positional_arg_exprs(args)?;
-    let (func, bound_args, lateral) =
-        bind_table_fn_args(&fname, &arg_exprs, catalog, params, preceding, outer_scope)?;
+    // Only a set-returning name has a rowset of its own; every other function is
+    // an ordinary call, and its rowset is the one row it returns.
+    let (func, bound_args, lateral) = if crate::functions::is_table_fn_name(&fname) {
+        let arg_exprs = positional_arg_exprs(args)?;
+        bind_table_fn_args(&fname, &arg_exprs, catalog, params, preceding, outer_scope)?
+    } else {
+        bind_scalar_from_item(name, args, catalog, params, preceding, outer_scope)?
+    };
     bound_table_fn_item(func, bound_args, &fname, alias, with_ordinality, lateral)
+}
+
+/// Bind a non-set-returning function FROM item, in the same implicitly-LATERAL
+/// scope [`bind_table_fn_args`] binds a set-returning one's arguments in.
+fn bind_scalar_from_item(
+    name: &ast::ObjectName,
+    args: &[ast::FunctionArg],
+    catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
+    preceding: &Preceding,
+    outer_scope: &[OuterLevel],
+) -> Result<(TableFn, Vec<BoundExpr>, bool), BindError> {
+    let levels = preceding.lateral_levels(outer_scope, catalog, params);
+    let scope = Scope::empty(catalog, params).with_outer(levels.into_owned());
+    let (func, mut args) = bind_scalar_fn_from_item(name, args, &scope)?;
+    let lateral = preceding.pushes_a_level() && settle_lateral_level_exprs(&mut args);
+    Ok((func, args, lateral))
 }
 
 /// Bind a table function's arguments for a FROM item, reporting whether they
@@ -4419,7 +4443,12 @@ fn bound_table_fn_item(
     if ordinality {
         columns.push(OutputColumn::new("ordinality", PgType::Int8));
     }
-    if func.returns_scalar() && alias.is_some() {
+    // A plain scalar call is named after the function whether or not an alias
+    // renames it — `FROM abs(-1)` exposes `abs` — and the qualifier is already
+    // whichever of the two applies. The set-returning ones keep their own column
+    // name until an alias replaces it: `pg_partition_ancestors(…)` alone exposes
+    // `relid`, not its own name.
+    if func.returns_scalar() && (alias.is_some() || matches!(func, TableFn::Scalar(_))) {
         debug_assert_eq!(
             columns.len(),
             1 + usize::from(ordinality),

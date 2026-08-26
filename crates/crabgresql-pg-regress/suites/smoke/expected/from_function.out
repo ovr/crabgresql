@@ -1,0 +1,124 @@
+--
+-- FROM_FUNCTION
+-- An ordinary, non-set-returning function called in FROM position: PostgreSQL
+-- allows any function there, and one that returns a plain value is a one-row,
+-- one-column rowset named after the function. Expected output generated from
+-- PostgreSQL 18.4.
+--
+-- the column is named after the function
+SELECT * FROM abs(-1);
+ abs 
+-----
+   1
+(1 row)
+
+-- a qualifier does not change that name
+SELECT * FROM pg_catalog.abs(-1);
+ abs 
+-----
+   1
+(1 row)
+
+-- a bare alias renames the scalar column; an alias list wins over it
+SELECT * FROM abs(-1) t;
+ t 
+---
+ 1
+(1 row)
+
+SELECT * FROM abs(-1) AS t;
+ t 
+---
+ 1
+(1 row)
+
+SELECT * FROM abs(-1) t(v);
+ v 
+---
+ 1
+(1 row)
+
+-- WITH ORDINALITY joins the rowset like it does any other
+SELECT * FROM abs(-1) WITH ORDINALITY;
+ abs | ordinality 
+-----+------------
+   1 |          1
+(1 row)
+
+SELECT * FROM abs(-1) WITH ORDINALITY AS t(v, n);
+ v | n 
+---+---
+ 1 | 1
+(1 row)
+
+-- a NULL result is a row, not an empty rowset
+SELECT * FROM abs(NULL::int);
+ abs 
+-----
+    
+(1 row)
+
+-- several function items in one FROM clause
+SELECT * FROM lower('AB'), upper('cd');
+ lower | upper 
+-------+-------
+ ab    | CD
+(1 row)
+
+-- untyped literals are steered by the overload, as in the target list
+SELECT * FROM pg_indexam_has_property(403, 'can_order');
+ pg_indexam_has_property 
+-------------------------
+ t
+(1 row)
+
+-- the argument may read a preceding item: a function FROM item is implicitly
+-- LATERAL, so the keyword decides nothing
+CREATE TABLE from_function_t (id int);
+INSERT INTO from_function_t VALUES (-2), (3);
+SELECT * FROM from_function_t, abs(id) a ORDER BY id;
+ id | a 
+----+---
+ -2 | 2
+  3 | 3
+(2 rows)
+
+SELECT * FROM from_function_t CROSS JOIN abs(from_function_t.id) a ORDER BY id;
+ id | a 
+----+---
+ -2 | 2
+  3 | 3
+(2 rows)
+
+SELECT * FROM from_function_t CROSS JOIN LATERAL abs(id) a ORDER BY id;
+ id | a 
+----+---
+ -2 | 2
+  3 | 3
+(2 rows)
+
+-- a filter over the function's own column
+SELECT a FROM from_function_t, abs(id) a WHERE a > 2;
+ a 
+---
+ 3
+(1 row)
+
+-- set-returning items are unaffected by the scalar path
+SELECT * FROM from_function_t, generate_series(1, id) g ORDER BY id, g;
+ id | g 
+----+---
+  3 | 1
+  3 | 2
+  3 | 3
+(3 rows)
+
+-- an aggregate is not a function call PG admits here. Known gap: PG decorates
+-- both of the errors below with LINE/caret, and the 42883 with the "No function
+-- matches the given name and argument types" hint; the messages themselves match.
+SELECT * FROM count(1);
+ERROR:  aggregate functions are not allowed in functions in FROM
+-- and an unknown name is still 42883
+SELECT * FROM no_such_fn(1);
+ERROR:  function no_such_fn(integer) does not exist
+DROP TABLE from_function_t;

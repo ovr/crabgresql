@@ -1472,6 +1472,14 @@ pub enum TableFn {
     /// nor partitioned yields **no rows** (observed on 18.4), which is what
     /// makes psql's `\d` footers join against it unconditionally.
     PgPartitionAncestors,
+    /// Any *non*-set-returning function called in FROM position, which PG allows
+    /// for every function and not only for the ones enumerated above:
+    /// `SELECT * FROM abs(-1)` is one row holding one column named `abs`.
+    ///
+    /// Its call arguments were resolved by the ordinary scalar overload rules,
+    /// so the whole bound call travels as this rowset's single "argument" and
+    /// the type carried here is that call's result type.
+    Scalar(PgType),
 }
 
 impl TableFn {
@@ -1487,6 +1495,9 @@ impl TableFn {
             // ones above.
             TableFn::PgPartitionAncestors => &[],
             TableFn::PgAvailableExtensions | TableFn::PgAvailableExtensionVersions => &[],
+            // Resolved through the scalar overload table before it ever becomes
+            // a `TableFn`, so there is no signature left to check here.
+            TableFn::Scalar(_) => &[],
             // The polymorphic/variadic ones resolve their own arguments in
             // `bind_table_fn_call`.
             TableFn::GenerateSeries(_)
@@ -1514,6 +1525,10 @@ impl TableFn {
             TableFn::GenerateSubscripts => {
                 vec![OutputColumn::new("generate_subscripts", PgType::Int4)]
             }
+            // The name is the *called* function's, which this variant does not
+            // carry: `bound_table_fn_item` fills it in from the FROM item's
+            // qualifier, which is that name whenever no alias renames it.
+            TableFn::Scalar(ty) => vec![OutputColumn::new("?column?", ty)],
             TableFn::PgPartitionAncestors => {
                 vec![OutputColumn::new("relid", PgType::Reg(RegKind::Class))]
             }
@@ -1550,7 +1565,8 @@ impl TableFn {
             | TableFn::JsonbPathQuery
             | TableFn::Unnest(_)
             | TableFn::GenerateSubscripts
-            | TableFn::PgPartitionAncestors => true,
+            | TableFn::PgPartitionAncestors
+            | TableFn::Scalar(_) => true,
         }
     }
 }
@@ -1564,6 +1580,48 @@ pub fn lookup_table_fn(name: &str) -> Option<TableFn> {
         "pg_available_extension_versions" => Some(TableFn::PgAvailableExtensionVersions),
         _ => None,
     }
+}
+
+type TableFnResolver = fn(&[Binding]) -> Result<(TableFn, Vec<BoundExpr>), BindError>;
+
+/// The set-returning functions that resolve outside [`lookup_table_fn`]'s
+/// fixed-signature table, because they are polymorphic in their element type or
+/// take more than one signature: name → the resolver that binds a call to it.
+///
+/// One dispatch, because three paths ask about this same set — a FROM item
+/// resolves through it, a target list expands through it (each of these returns
+/// a bare scalar, which is what a target list can hold), and
+/// [`is_table_fn_name`] decides with it whether a FROM item is a rowset at all.
+/// A name that reached only some of them would bind as a one-row scalar in the
+/// others: wrong rows, no error.
+fn polymorphic_table_fn(name: &str) -> Option<TableFnResolver> {
+    Some(match name {
+        "generate_series" => {
+            |b| resolve_generate_series(b).map(|(elem, args)| (TableFn::GenerateSeries(elem), args))
+        }
+        "jsonb_path_query" => {
+            |b| resolve_jsonb_path_query(b).map(|args| (TableFn::JsonbPathQuery, args))
+        }
+        "unnest" => |b| resolve_unnest(b).map(|(elem, args)| (TableFn::Unnest(elem), args)),
+        "generate_subscripts" => {
+            |b| resolve_generate_subscripts(b).map(|args| (TableFn::GenerateSubscripts, args))
+        }
+        "pg_partition_ancestors" => {
+            |b| resolve_partition_ancestors(b).map(|args| (TableFn::PgPartitionAncestors, args))
+        }
+        _ => return None,
+    })
+}
+
+/// Whether a (lowercased) name is one of the set-returning functions, and so
+/// binds to a rowset of its own rather than to a one-row scalar call.
+///
+/// This is what a function FROM item is decided by, so it has to name every
+/// function [`bind_table_fn_call`] can resolve: a name missing here would bind
+/// as a scalar and collapse its rowset to a single row. Both halves of that set
+/// are asked, so registering a new SRF in either one is enough.
+pub(crate) fn is_table_fn_name(name: &str) -> bool {
+    lookup_table_fn(name).is_some() || polymorphic_table_fn(name).is_some()
 }
 
 /// An aggregate function the executor accumulates over the rows of a group.
@@ -1751,6 +1809,59 @@ pub(crate) fn agg_return_type(
     }
 }
 
+/// The call a FROM item spells, as the [`ast::Function`] node the rest of the
+/// binder — and [`crate::ruleutils`] — works in terms of.
+///
+/// The FROM grammar hands the callee and its argument list over separately, and
+/// every other decoration a call can carry (`OVER`, `FILTER`, `WITHIN GROUP`) is
+/// ungrammatical there, so the reassembled call has none of them.
+pub(crate) fn plain_call(name: &ast::ObjectName, args: &[ast::FunctionArg]) -> ast::Function {
+    ast::Function {
+        name: name.clone(),
+        uses_odbc_syntax: false,
+        parameters: ast::FunctionArguments::None,
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args.to_vec(),
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    }
+}
+
+/// Bind a FROM item that calls an ordinary, non-set-returning function.
+///
+/// PostgreSQL puts no set-returning requirement on a function FROM item: any
+/// function may be written there, and one that returns a plain value is a
+/// one-row, one-column rowset. So the call is bound by the *scalar* rules —
+/// through [`bind_function`], which is what resolves overloads, steers untyped
+/// literals and inlines a user's SQL function — and the whole bound call becomes
+/// the rowset's single argument, evaluated once per row of the left side.
+///
+/// The caller has already established that the name is not a set-returning one
+/// ([`is_table_fn_name`]), so a name nothing resolves gets the scalar path's
+/// `42883` rather than a second, differently-worded one.
+pub(crate) fn bind_scalar_fn_from_item(
+    name: &ast::ObjectName,
+    args: &[ast::FunctionArg],
+    scope: &Scope,
+) -> Result<(TableFn, Vec<BoundExpr>), BindError> {
+    let call = plain_call(name, args);
+    let expr = match bind_function(&call, scope)? {
+        Binding::Typed(expr) => expr,
+        // A resolved call always has a type; an unknown here would be a literal
+        // masquerading as one, which is no function at all.
+        Binding::Unknown { .. } => return Err(undefined_function(&call.name.to_string(), &[])),
+    };
+    // PG blames the aggregate, not the FROM position: `SELECT * FROM count(1)`
+    // is `aggregate functions are not allowed in functions in FROM`.
+    crate::expr::reject_agg_or_window(&expr, "functions in FROM")?;
+    Ok((TableFn::Scalar(expr.ty()), vec![expr]))
+}
+
 /// Bind a table function's call arguments to typed expressions, resolving the
 /// function and enforcing arity/coercion. `arg_exprs` are the raw call
 /// arguments (bound in the empty scope, as SRF arguments are constants here).
@@ -1763,33 +1874,8 @@ pub(crate) fn bind_table_fn_call(
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
-    // `generate_series` is polymorphic on its integer element type and has two
-    // arities, so it resolves outside the fixed-signature table below.
-    if name == "generate_series" {
-        let (elem, args) = resolve_generate_series(&bindings)?;
-        return Ok((TableFn::GenerateSeries(elem), args));
-    }
-    if name == "jsonb_path_query" {
-        return Ok((
-            TableFn::JsonbPathQuery,
-            resolve_jsonb_path_query(&bindings)?,
-        ));
-    }
-    if name == "unnest" {
-        let (elem, args) = resolve_unnest(&bindings)?;
-        return Ok((TableFn::Unnest(elem), args));
-    }
-    if name == "generate_subscripts" {
-        return Ok((
-            TableFn::GenerateSubscripts,
-            resolve_generate_subscripts(&bindings)?,
-        ));
-    }
-    if name == "pg_partition_ancestors" {
-        return Ok((
-            TableFn::PgPartitionAncestors,
-            resolve_partition_ancestors(&bindings)?,
-        ));
+    if let Some(resolve) = polymorphic_table_fn(name) {
+        return resolve(&bindings);
     }
     let Some(func) = lookup_table_fn(name) else {
         return Err(undefined_function(name, &bindings));
@@ -5626,57 +5712,23 @@ pub(crate) fn bind_srf_projection(
     let Some(name) = function_name(&func.name) else {
         return Ok(None);
     };
-    if name != "generate_series"
-        && name != "jsonb_path_query"
-        && name != "unnest"
-        && name != "generate_subscripts"
-        && name != "pg_partition_ancestors"
-    {
+    // The target-list spelling psql's `\d` uses for one of them: `SELECT
+    // pg_partition_ancestors(oid) UNION ALL VALUES (oid)`.
+    let Some(resolve) = polymorphic_table_fn(&name) else {
         return Ok(None);
-    }
+    };
     let arg_exprs = positional_args(&func.args)?;
     let bindings = arg_exprs
         .iter()
         .map(|e| bind_expr(e, scope))
         .collect::<Result<Vec<_>, _>>()?;
-    // The target-list spelling psql's `\d` uses: `SELECT
-    // pg_partition_ancestors(oid) UNION ALL VALUES (oid)`.
-    if name == "pg_partition_ancestors" {
-        return Ok(Some(BoundExpr::Srf {
-            func: TableFn::PgPartitionAncestors,
-            ret: PgType::Reg(RegKind::Class),
-            args: resolve_partition_ancestors(&bindings)?,
-        }));
-    }
-    if name == "jsonb_path_query" {
-        let args = resolve_jsonb_path_query(&bindings)?;
-        return Ok(Some(BoundExpr::Srf {
-            func: TableFn::JsonbPathQuery,
-            ret: PgType::Jsonb,
-            args,
-        }));
-    }
-    if name == "unnest" {
-        let (elem, args) = resolve_unnest(&bindings)?;
-        return Ok(Some(BoundExpr::Srf {
-            func: TableFn::Unnest(elem),
-            ret: elem,
-            args,
-        }));
-    }
-    if name == "generate_subscripts" {
-        return Ok(Some(BoundExpr::Srf {
-            func: TableFn::GenerateSubscripts,
-            ret: PgType::Int4,
-            args: resolve_generate_subscripts(&bindings)?,
-        }));
-    }
-    let (elem, args) = resolve_generate_series(&bindings)?;
-    Ok(Some(BoundExpr::Srf {
-        func: TableFn::GenerateSeries(elem),
-        ret: elem,
-        args,
-    }))
+    let (func, args) = resolve(&bindings)?;
+    // Every function reachable here returns a bare scalar, so its rowset is one
+    // column and that column's type is what the target list gets.
+    let Some(ret) = func.columns().first().map(|c| c.ty) else {
+        unreachable!("a scalar set-returning function has exactly one column");
+    };
+    Ok(Some(BoundExpr::Srf { func, ret, args }))
 }
 
 /// Resolve a `jsonb_path_query(target, path [, vars, silent])` call to its
