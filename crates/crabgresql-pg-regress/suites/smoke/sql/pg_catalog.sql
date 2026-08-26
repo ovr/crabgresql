@@ -23,8 +23,19 @@ SELECT typname
 -- pg_namespace exposes the reserved schemas and public
 SELECT oid, nspname
   FROM pg_namespace
- WHERE nspname IN ('pg_catalog', 'pg_toast', 'public')
+ WHERE nspname IN ('pg_catalog', 'pg_toast', 'public', 'information_schema')
  ORDER BY oid;
+-- information_schema is a schema like any other: it resolves both ways and
+-- carries initdb's USAGE grant to PUBLIC
+SELECT 'information_schema'::regnamespace AS by_name,
+       13699::regnamespace AS by_oid,
+       has_schema_privilege('information_schema', 'USAGE') AS usage;
+-- its views answer to their own OIDs, and print schema-qualified because the
+-- schema is off the search path
+SELECT 'information_schema.tables'::regclass AS by_name,
+       13916::regclass AS by_oid,
+       pg_table_is_visible('information_schema.tables'::regclass) AS visible,
+       has_table_privilege('information_schema.tables', 'SELECT') AS may_read;
 -- a user table and pg_catalog resolve independently on the same statement stream
 CREATE TABLE pgcat_demo (a int, b text);
 INSERT INTO pgcat_demo VALUES (1, 'x');

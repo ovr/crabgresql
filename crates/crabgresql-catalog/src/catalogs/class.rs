@@ -269,9 +269,14 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let (indexes, toasts, namespace_oids) =
         (cat.index_oids(), cat.toast_oids(), cat.namespace_oids());
     let parents = parent_names(relations);
-    // Resolve a relation's namespace OID, defaulting to `public` (2200) for any
+    // Resolve a relation's namespace OID, defaulting to `public` for any
     // namespace not in the map (should not happen for a live relation).
-    let nsp_oid = |namespace: &str| namespace_oids.get(namespace).copied().unwrap_or(2200);
+    let nsp_oid = |namespace: &str| {
+        namespace_oids
+            .get(namespace)
+            .copied()
+            .unwrap_or(PUBLIC_NAMESPACE_OID)
+    };
     let mut rows: Vec<Vec<Value>> = relations
         .iter()
         .zip(kinds)
@@ -433,7 +438,12 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
         vec![
             Value::Oid(toast.oid),
             Value::Text(toast.name.clone()),
-            Value::Oid(namespace_oids.get(TOAST_NAMESPACE).copied().unwrap_or(99)),
+            Value::Oid(
+                namespace_oids
+                    .get(TOAST_NAMESPACE)
+                    .copied()
+                    .unwrap_or(TOAST_NAMESPACE_OID),
+            ),
             Value::Oid(0),
             Value::Oid(0),
             Value::Oid(BOOTSTRAP_ROLE_OID),

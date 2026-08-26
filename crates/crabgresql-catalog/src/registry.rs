@@ -52,10 +52,10 @@ pub(crate) struct CatalogRelDef {
     pub(crate) name: &'static str,
     /// PostgreSQL's own OID for the relation, probed from 18.4.
     ///
-    /// TODO: `0` for the three `information_schema` entries. They are built as
-    /// Rust rows rather than reflected into `pg_class`, so a client has nothing
-    /// to cast `'information_schema.tables'::regclass` to; publishing them as
-    /// relations is what would give them an OID worth recording here.
+    /// TODO: none of these relations is reflected into `pg_class`, so the OID
+    /// answers a cast and nothing more — no row joins to it. That is equally
+    /// true of `pg_catalog`'s own relations, and closing it is one change for
+    /// both.
     pub(crate) oid: u32,
     pub(crate) namespace: CatalogNamespace,
     pub(crate) schema: fn() -> TableSchema,
@@ -637,13 +637,18 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
 ];
 
 /// Every relation this build serves that PostgreSQL defines as a *view*, in the
-/// same `(namespace, name)` order — 63 of `pg_catalog`'s 80, plus the three
+/// same `(namespace, name)` order — 63 of `pg_catalog`'s 80, plus the four
 /// `information_schema` entries.
 ///
 /// The `pg_catalog` OIDs sit in the 12000 band because `initdb` creates these
 /// relations rather than bootstrapping them; they are deterministic for a given
 /// major version, and all were probed from the same 18.4 — `pg_cursors` reading
 /// back 12077 there is what confirms the whole band came from one `initdb`.
+/// The `information_schema` views are the same kind of assignment one band
+/// higher, `initdb` running `information_schema.sql` after the catalog views.
+/// Probed from a freshly created database rather than a developer's
+/// `template1`, where a `CREATE OR REPLACE VIEW` had renumbered `tables` into
+/// the user band.
 ///
 /// Every one is still a Rust row builder: the `definition` is not what produces
 /// the rows, it is what a later change re-parses to produce them. Until then it
@@ -652,7 +657,7 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
 pub(crate) static CATALOG_VIEWS: &[CatalogViewDef] = &[
     view(
         "columns",
-        0,
+        13787,
         InformationSchema,
         information_schema::columns_schema,
         information_schema::columns_rows,
@@ -660,7 +665,7 @@ pub(crate) static CATALOG_VIEWS: &[CatalogViewDef] = &[
     ),
     view(
         "domains",
-        0,
+        13811,
         InformationSchema,
         information_schema::domains_schema,
         information_schema::domains_rows,
@@ -668,7 +673,7 @@ pub(crate) static CATALOG_VIEWS: &[CatalogViewDef] = &[
     ),
     view(
         "schemata",
-        0,
+        13873,
         InformationSchema,
         information_schema::schemata_schema,
         information_schema::schemata_rows,
@@ -676,7 +681,7 @@ pub(crate) static CATALOG_VIEWS: &[CatalogViewDef] = &[
     ),
     view(
         "tables",
-        0,
+        13916,
         InformationSchema,
         information_schema::tables_schema,
         information_schema::tables_rows,
@@ -1237,11 +1242,48 @@ pub fn builtin_relation_oid(name: &str) -> Option<u32> {
 /// The inverse of [`builtin_relation_oid`]: the `pg_catalog` relation `oid`
 /// names, if it is one of the fixed assignments.
 pub fn builtin_relation_name(oid: u32) -> Option<&'static str> {
+    builtin_relation_ref(oid)
+        .filter(|(namespace, _)| *namespace == "pg_catalog")
+        .map(|(_, name)| name)
+}
+
+/// The [`CatalogNamespace`] the SQL schema name `namespace` spells, or `None`
+/// for a schema this build serves nothing in.
+fn catalog_namespace(namespace: &str) -> Option<CatalogNamespace> {
+    match namespace {
+        "pg_catalog" => Some(CatalogNamespace::PgCatalog),
+        "information_schema" => Some(CatalogNamespace::InformationSchema),
+        _ => None,
+    }
+}
+
+/// [`builtin_relation_oid`] for a caller that knows which schema it is asking
+/// about — the two are *not* interchangeable.
+///
+/// `builtin_relation_oid` answers for `pg_catalog` alone because its callers ask
+/// a second question with it: whether an unqualified name reaches a catalog
+/// relation rather than a user one. `information_schema` is off the search path,
+/// so a user table named `tables` is reached unqualified and would be wrongly
+/// reported as shadowed if that lookup spanned both schemas. Here the schema is
+/// given, so there is nothing to shadow.
+pub fn builtin_relation_oid_in(namespace: &str, name: &str) -> Option<u32> {
+    lookup(catalog_namespace(namespace)?, name).map(|def| def.oid)
+}
+
+/// The `(namespace, name)` of the served relation `oid` identifies, across both
+/// schemas. What renders `13916` back as `information_schema.tables`.
+///
+/// `InvalidOid` is never an object to ask about, so 0 answers nothing even
+/// though no entry claims it.
+pub fn builtin_relation_ref(oid: u32) -> Option<(&'static str, &'static str)> {
     // Linear, unlike the by-name direction: both tables are sorted by name, and
     // a second sorted-by-OID copy would be one more thing to keep in step.
     all()
-        .find(|def| def.namespace == CatalogNamespace::PgCatalog && def.oid == oid)
-        .map(|def| def.name)
+        .find(|def| def.oid == oid && oid != 0)
+        .map(|def| match def.namespace {
+            CatalogNamespace::PgCatalog => ("pg_catalog", def.name),
+            CatalogNamespace::InformationSchema => ("information_schema", def.name),
+        })
 }
 
 /// The `pg_catalog` relations `initdb` keeps *closed* to PUBLIC — everything a
