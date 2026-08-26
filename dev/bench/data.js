@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787739024987,
+  "lastUpdate": 1787739026737,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -60772,6 +60772,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 25351.337692,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8d8b0ad88a1c404542d4c83ab5251f5775751839",
+          "message": "feat: Support calling a scalar function in FROM position (#284)",
+          "timestamp": "2026-08-26T11:20:04+02:00",
+          "tree_id": "2fed91f236e1b4b2ce982d2bac05b0cfe8f9416d",
+          "url": "https://github.com/ovr/crabgresql/commit/8d8b0ad88a1c404542d4c83ab5251f5775751839"
+        },
+        "date": 1787739026616,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 909.04853,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 34791.811668,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
