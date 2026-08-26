@@ -210,7 +210,6 @@ fn split_gs2_header(message: &str) -> Result<(&str, &str), AuthError> {
         }
         _ => return Err(AuthError::protocol("malformed SASL gs2 header")),
     }
-    // The header is `<flag>,<authzid>,`, so its second comma is where it ends.
     let mut commas = message.match_indices(',');
     commas.next();
     let (second, _) = commas
@@ -323,7 +322,6 @@ mod tests {
         let (exchange, server_first) =
             Exchange::start(verifier_for("pa\u{ad}ss"), format!("n,,{bare}").as_bytes())
                 .expect("client-first");
-        // Answered by a client that typed it either way: both prep to "pass".
         for typed in ["pa\u{ad}ss", "pass"] {
             let final_message = client_final(typed, bare, &server_first);
             exchange

@@ -810,8 +810,6 @@ fn add_membership(
         .iter()
         .any(|m| m.role == role && m.member == member)
     {
-        // Re-granting is not an error: PostgreSQL says so in a NOTICE and folds
-        // the new options into the existing row.
         let notice = CatalogNotice::new(format!(
             "role \"{}\" has already been granted membership in role \"{}\" by role \"{}\"",
             store.name_of(member),

@@ -11,13 +11,13 @@
 //! `PG_VERSION`, written **last** and fsynced. Everything above it — the
 //! subdirectories, `global/pg_control` and the role catalog — is created first,
 //! which makes the marker mean "this directory was initialized all the way to
-//! the end". A crash
-//! partway through leaves a directory that still looks like a cluster to
-//! [`inspect`] (a control file, or `base/`), and that is deliberate: the same
-//! shape is what every data directory written before this module looks like, and
-//! those hold real data. They are adopted — stamped with a `PG_VERSION` — rather
-//! than refused, because the on-disk format is a compatibility boundary
-//! (`AGENTS.md`) and refusing would mean losing a cluster on upgrade.
+//! the end". A crash partway through leaves a directory that still looks like a
+//! cluster to [`inspect`] (a control file, or `base/`), and that is deliberate:
+//! the same shape is what every data directory written before this module looks
+//! like, and those hold real data. They are adopted — stamped with a
+//! `PG_VERSION` — rather than refused, because the on-disk format is a
+//! compatibility boundary (`AGENTS.md`) and refusing would mean losing a
+//! cluster on upgrade.
 //!
 //! Two entry points, differing in one answer only: [`init_data_dir`] is the
 //! `initdb` subcommand, and refuses a directory that already holds a cluster;

@@ -109,7 +109,6 @@ async fn connect_as(port: u16, user: &str, database: &str) -> tokio_postgres::Cl
     client
 }
 
-/// Connect with a password, the way a driver does when the role has one.
 async fn connect_with_password(port: u16, user: &str, password: &str) -> tokio_postgres::Client {
     let (client, conn) = password_config(port, user, Some(password))
         .connect(NoTls)
@@ -19317,8 +19316,6 @@ async fn an_expired_password_does_not_authenticate() -> anyhow::Result<()> {
 async fn a_scram_shaped_password_is_hashed_not_stored() -> anyhow::Result<()> {
     let port = spawn_server().await;
     let setup = connect(port).await;
-    // Right prefix, nothing else: not a verifier, so it is the plaintext it
-    // looks like.
     setup
         .batch_execute("CREATE ROLE impostor LOGIN PASSWORD 'SCRAM-SHA-256$nonsense'")
         .await?;
