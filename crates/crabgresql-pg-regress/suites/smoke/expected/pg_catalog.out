@@ -74,6 +74,18 @@ SELECT 'information_schema.tables'::regclass AS by_name,
  information_schema.tables | information_schema.tables | f       | t
 (1 row)
 
+-- a served view is a relation for every by-OID lookup too: its columns exist,
+-- it owns no sequence, and it measures zero rather than nothing at all
+SELECT has_column_privilege('information_schema.tables', 'table_name', 'SELECT') AS may_read,
+       pg_get_serial_sequence('information_schema.tables', 'table_name') AS owns_seq,
+       pg_relation_size('information_schema.tables'::regclass) AS size;
+ may_read | owns_seq | size 
+----------+----------+------
+ t        |          |    0
+(1 row)
+
+SELECT pg_get_serial_sequence('information_schema.tables', 'no_such_column');
+ERROR:  column "no_such_column" of relation "tables" does not exist
 -- a user table and pg_catalog resolve independently on the same statement stream
 CREATE TABLE pgcat_demo (a int, b text);
 INSERT INTO pgcat_demo VALUES (1, 'x');

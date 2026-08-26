@@ -47,6 +47,7 @@ pub(crate) mod views;
 pub use catalogs::depend::nextval_target;
 pub use catalogs::description::{object_description, object_descriptions_any_class};
 pub use catalogs::extension::{AvailableExtension, available_extensions};
+pub use catalogs::namespace::{is_builtin_namespace, is_system_namespace};
 pub use oids::{BOOTSTRAP_ROLE_OID, PLPGSQL_LANG_OID};
 pub use registry::{
     builtin_relation_name, builtin_relation_oid, builtin_relation_oid_in, builtin_relation_ref,
@@ -1350,19 +1351,16 @@ impl SystemCatalog {
     }
 
     /// [`SystemCatalog::serial_sequence`] for an OID that is not a live user
-    /// relation: a served `pg_catalog` relation reports whether it has the
-    /// column, anything else reports nothing at all.
+    /// relation: a served relation reports whether it has the column, anything
+    /// else reports nothing at all.
     fn catalog_relation_column(&self, oid: u32, column: &str) -> SerialSequenceLookup {
-        let Some(name) = registry::builtin_relation_name(oid) else {
-            return SerialSequenceLookup::NoRelation;
-        };
-        let Some(def) = registry::lookup(CatalogNamespace::PgCatalog, name) else {
+        let Some(def) = registry::def_by_oid(oid) else {
             return SerialSequenceLookup::NoRelation;
         };
         match (def.schema)().column_index(column) {
             Some(_) => SerialSequenceLookup::Unowned,
             None => SerialSequenceLookup::NoColumn {
-                relation: name.to_string(),
+                relation: def.name.to_string(),
             },
         }
     }
@@ -1753,13 +1751,11 @@ impl SystemCatalog {
         attnum >= 1 && (attnum as usize) <= columns
     }
 
-    /// The shape of a served `pg_catalog` relation, for the two attribute
-    /// lookups above — the same fallback [`SystemCatalog::serial_sequence`]
-    /// makes for an OID that is not a live user relation.
+    /// The shape of a served relation, for the two attribute lookups above —
+    /// the same fallback [`SystemCatalog::serial_sequence`] makes for an OID
+    /// that is not a live user relation.
     fn catalog_relation_schema(&self, oid: u32) -> Option<TableSchema> {
-        let name = registry::builtin_relation_name(oid)?;
-        let def = registry::lookup(CatalogNamespace::PgCatalog, name)?;
-        Some((def.schema)())
+        registry::def_by_oid(oid).map(|def| (def.schema)())
     }
 
     /// The name of the function `oid` identifies, or `None` if this snapshot
@@ -1956,7 +1952,7 @@ impl SystemCatalog {
     /// `None` means "no such relation", which those functions report as NULL.
     /// It is distinct from a relation with nothing to measure, which answers
     /// zeros — as PostgreSQL does for a view, a partitioned parent, and (here
-    /// only) a `pg_catalog` relation, which exists but has no file behind it.
+    /// only) a served catalog relation, which exists but has no file behind it.
     ///
     /// A **live** count where the engine can give one: the page count comes from
     /// [`RelStats::curpages`], not the `relpages` frozen at the last `ANALYZE`
@@ -1970,9 +1966,9 @@ impl SystemCatalog {
     /// Indexed positionally, exactly as [`SystemCatalog::relation_ref`] is, and
     /// for the same reason.
     pub fn relation_pages(&self, oid: u32) -> Option<RelationPages> {
-        // A `pg_catalog` relation is real but has no storage: its rows are
-        // built per statement. Zero, not `None` — the relation exists.
-        if builtin_relation_name(oid).is_some() {
+        // A served relation is real but has no storage: its rows are built per
+        // statement. Zero, not `None` — the relation exists.
+        if builtin_relation_ref(oid).is_some() {
             return Some(RelationPages::default());
         }
         let offset = oid.checked_sub(FIRST_REL_OID)? as usize;

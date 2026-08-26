@@ -2902,6 +2902,39 @@ fn information_schema_is_a_published_namespace() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Everything that reaches a relation *through* its OID reaches these views
+/// too. Each of these lookups used to stop at `pg_catalog`, so the four views
+/// answered a `regclass` cast and then behaved like a relation that does not
+/// exist — `has_column_privilege` raised, `pg_get_serial_sequence` raised, and
+/// `pg_relation_size` was NULL where PostgreSQL 18.4 answers `t`, NULL and `0`.
+#[test]
+fn information_schema_views_answer_the_by_oid_lookups() -> anyhow::Result<()> {
+    let cat = SystemCatalog::new();
+    let tables = required(
+        builtin_relation_oid_in("information_schema", "tables"),
+        "information_schema.tables has no OID",
+    )?;
+
+    assert_eq!(cat.attribute_number(tables, "table_name"), Some(3));
+    assert_eq!(cat.attribute_number(tables, "no_such_column"), None);
+
+    // A view owns no sequence, but its columns exist — the distinction
+    // `pg_get_serial_sequence` draws between NULL and 42703.
+    assert!(matches!(
+        cat.serial_sequence(tables, "table_name"),
+        SerialSequenceLookup::Unowned
+    ));
+    assert!(matches!(
+        cat.serial_sequence(tables, "no_such_column"),
+        SerialSequenceLookup::NoColumn { relation } if relation == "tables"
+    ));
+
+    // Zero pages, not "no such relation": the rows are built per statement, and
+    // PostgreSQL reports 0 for its own catalog views just the same.
+    assert_eq!(cat.relation_pages(tables), Some(RelationPages::default()));
+    Ok(())
+}
+
 #[test]
 fn unknown_relation_is_not_found() {
     let cat = SystemCatalog::new();

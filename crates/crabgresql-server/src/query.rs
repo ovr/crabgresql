@@ -9130,9 +9130,11 @@ fn execute_create_schema(
         )
         .with_detail("The prefix \"pg_\" is reserved for system schemas."));
     }
-    // A name collides with an existing user schema or a reserved built-in.
-    let exists =
-        engine.schema_exists(&name) || matches!(name.as_str(), "public" | "information_schema");
+    // A name collides with an existing user schema or a built-in one. The
+    // built-ins are asked of the catalog rather than listed here: `pg_namespace`
+    // publishes them, so a schema that shows up in a `SELECT` and could still be
+    // "created" would be two answers to the same question.
+    let exists = engine.schema_exists(&name) || crabgresql_catalog::is_builtin_namespace(&name);
     if exists {
         if if_not_exists {
             return Ok(QueryResult::Command {
@@ -9181,6 +9183,21 @@ fn execute_drop_schema(
     let mut notices = Vec::new();
     let mut to_drop: Vec<String> = Vec::new();
     for name in &snames {
+        // A system schema is refused ahead of everything else, `IF EXISTS`
+        // included: that clause forgives a schema that is absent, and these are
+        // present. PostgreSQL words it exactly this way for `pg_catalog` and
+        // `pg_toast`.
+        //
+        // `information_schema` is the deliberate deviation. PostgreSQL treats it
+        // as an ordinary schema full of dependent objects — RESTRICT reports
+        // those, CASCADE drops the lot — but here its views are compiled in,
+        // with no rows to cascade to, so it answers like the other two.
+        if crabgresql_catalog::is_system_namespace(name) {
+            return Err(PgError::new(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                format!("cannot drop schema {name} because it is required by the database system"),
+            ));
+        }
         if engine.schema_exists(name) {
             to_drop.push(name.clone());
         } else if if_exists {

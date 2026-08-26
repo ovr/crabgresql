@@ -50,3 +50,10 @@ ERROR:  table "app.base" specified more than once
 DROP TABLE app.base CASCADE;
 NOTICE:  drop cascades to view pubv
 DROP SCHEMA app;
+-- A schema the database system requires cannot be dropped, and IF EXISTS does
+-- not forgive it: the clause covers a schema that is absent, and this one is
+-- present.
+DROP SCHEMA pg_catalog;
+ERROR:  cannot drop schema pg_catalog because it is required by the database system
+DROP SCHEMA IF EXISTS pg_toast;
+ERROR:  cannot drop schema pg_toast because it is required by the database system

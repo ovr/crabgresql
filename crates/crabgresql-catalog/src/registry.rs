@@ -1253,6 +1253,27 @@ fn catalog_namespace(namespace: &str) -> Option<CatalogNamespace> {
     }
 }
 
+/// The SQL spelling of `namespace`; the inverse of [`catalog_namespace`].
+pub(crate) fn catalog_namespace_name(namespace: CatalogNamespace) -> &'static str {
+    match namespace {
+        CatalogNamespace::PgCatalog => "pg_catalog",
+        CatalogNamespace::InformationSchema => "information_schema",
+    }
+}
+
+/// The served relation `oid` identifies, in either schema — the by-OID
+/// direction of [`lookup`], and the one place that walk lives.
+///
+/// `InvalidOid` is never an object to ask about, so 0 answers nothing even
+/// though no entry claims it.
+pub(crate) fn def_by_oid(oid: u32) -> Option<&'static CatalogRelDef> {
+    // Linear, unlike the by-name direction: both tables are sorted by name, and
+    // a second sorted-by-OID copy would be one more thing to keep in step.
+    (oid != 0)
+        .then(|| all().find(|def| def.oid == oid))
+        .flatten()
+}
+
 /// Kept separate from [`builtin_relation_oid`] because the lookups are not
 /// interchangeable.
 ///
@@ -1266,17 +1287,10 @@ pub fn builtin_relation_oid_in(namespace: &str, name: &str) -> Option<u32> {
     lookup(catalog_namespace(namespace)?, name).map(|def| def.oid)
 }
 
-/// `InvalidOid` is never an object to ask about, so 0 answers nothing even
-/// though no entry claims it.
+/// The `(namespace, name)` of the served relation `oid` identifies. What renders
+/// `13916` back as `information_schema.tables`.
 pub fn builtin_relation_ref(oid: u32) -> Option<(&'static str, &'static str)> {
-    // Linear, unlike the by-name direction: both tables are sorted by name, and
-    // a second sorted-by-OID copy would be one more thing to keep in step.
-    all()
-        .find(|def| def.oid == oid && oid != 0)
-        .map(|def| match def.namespace {
-            CatalogNamespace::PgCatalog => ("pg_catalog", def.name),
-            CatalogNamespace::InformationSchema => ("information_schema", def.name),
-        })
+    def_by_oid(oid).map(|def| (catalog_namespace_name(def.namespace), def.name))
 }
 
 /// The `pg_catalog` relations `initdb` keeps *closed* to PUBLIC — everything a
