@@ -34,8 +34,7 @@ DROP TABLE app.base;
 DROP TABLE app.base, app.base;
 DROP TABLE app.base CASCADE;
 DROP SCHEMA app;
--- A schema the database system requires cannot be dropped, and IF EXISTS does
--- not forgive it: the clause covers a schema that is absent, and this one is
--- present.
+-- a schema the database system requires cannot be dropped, and IF EXISTS does
+-- not forgive it: that clause covers a schema that is absent
 DROP SCHEMA pg_catalog;
 DROP SCHEMA IF EXISTS pg_toast;

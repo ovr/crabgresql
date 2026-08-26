@@ -1214,14 +1214,9 @@ async fn create_drop_schema_and_qualified_relations_match_pg() -> anyhow::Result
     );
     client.simple_query("DROP SCHEMA IF EXISTS nope").await?;
 
-    // A system schema is refused before `IF EXISTS` is even consulted — that
-    // clause forgives a schema that is absent, and these are present. The two
-    // `pg_` ones are PostgreSQL's own wording and SQLSTATE.
-    //
-    // `information_schema` is a deliberate deviation: PostgreSQL treats it as an
-    // ordinary schema full of dependent objects, so RESTRICT reports those and
-    // CASCADE drops the whole schema. Here its views are compiled in, so there
-    // is nothing to cascade to and both forms answer like `pg_catalog`.
+    // A system schema is refused before `IF EXISTS` or CASCADE is consulted —
+    // see `execute_drop_schema` for why `information_schema` joins the two
+    // `pg_` ones here.
     for stmt in [
         "DROP SCHEMA pg_catalog",
         "DROP SCHEMA IF EXISTS pg_toast",

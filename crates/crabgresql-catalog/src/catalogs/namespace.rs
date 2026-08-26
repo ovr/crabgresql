@@ -34,17 +34,15 @@ pub(crate) const BUILTIN_NAMESPACES: &[(u32, &str)] = &[
     (INFORMATION_SCHEMA_NAMESPACE_OID, "information_schema"),
 ];
 
-/// Whether `name` is one of the schemas this build publishes without anyone
-/// having run `CREATE SCHEMA` — the set a duplicate-name check has to consider
-/// beyond the engine's own.
+/// The schemas this build publishes without anyone having run `CREATE SCHEMA` —
+/// the set a duplicate-name check has to consider beyond the engine's own.
 pub fn is_builtin_namespace(name: &str) -> bool {
     BUILTIN_NAMESPACES.iter().any(|(_, n)| *n == name)
 }
 
-/// Whether `name` is a schema the database system requires, which is every
-/// built-in one except `public`: PostgreSQL lets its owner drop `public`, and
-/// refuses the rest with `cannot drop schema … because it is required by the
-/// database system`.
+/// A schema the database system requires. `public` is excluded because
+/// PostgreSQL lets its owner drop it; the rest it refuses with `cannot drop
+/// schema … because it is required by the database system`.
 pub fn is_system_namespace(name: &str) -> bool {
     is_builtin_namespace(name) && name != "public"
 }

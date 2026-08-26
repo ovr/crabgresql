@@ -1253,7 +1253,6 @@ fn catalog_namespace(namespace: &str) -> Option<CatalogNamespace> {
     }
 }
 
-/// The SQL spelling of `namespace`; the inverse of [`catalog_namespace`].
 pub(crate) fn catalog_namespace_name(namespace: CatalogNamespace) -> &'static str {
     match namespace {
         CatalogNamespace::PgCatalog => "pg_catalog",
@@ -1264,8 +1263,7 @@ pub(crate) fn catalog_namespace_name(namespace: CatalogNamespace) -> &'static st
 /// The served relation `oid` identifies, in either schema — the by-OID
 /// direction of [`lookup`], and the one place that walk lives.
 ///
-/// `InvalidOid` is never an object to ask about, so 0 answers nothing even
-/// though no entry claims it.
+/// `InvalidOid` is never an object to ask about, so 0 answers nothing.
 pub(crate) fn def_by_oid(oid: u32) -> Option<&'static CatalogRelDef> {
     // Linear, unlike the by-name direction: both tables are sorted by name, and
     // a second sorted-by-OID copy would be one more thing to keep in step.
@@ -1287,8 +1285,7 @@ pub fn builtin_relation_oid_in(namespace: &str, name: &str) -> Option<u32> {
     lookup(catalog_namespace(namespace)?, name).map(|def| def.oid)
 }
 
-/// The `(namespace, name)` of the served relation `oid` identifies. What renders
-/// `13916` back as `information_schema.tables`.
+/// What renders `13916` back as `information_schema.tables`.
 pub fn builtin_relation_ref(oid: u32) -> Option<(&'static str, &'static str)> {
     def_by_oid(oid).map(|def| (catalog_namespace_name(def.namespace), def.name))
 }
