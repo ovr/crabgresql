@@ -79,7 +79,6 @@ pub struct LockInfo {
     /// The address it accepts connections on, or `*` for a wildcard bind, as
     /// PostgreSQL writes `listen_addresses`. Empty when nothing will listen.
     pub listen_address: String,
-    /// When the process started, in seconds since the epoch.
     pub start_epoch_secs: i64,
 }
 
@@ -109,10 +108,9 @@ pub struct PostmasterLock {
 impl PostmasterLock {
     /// Claim `data_dir` for this process, or say who already has it.
     ///
-    /// The directory must exist: the lock lives inside it. A caller that may be
-    /// pointed at an absent directory — `initdb` — gets `NotFound` and can treat
-    /// it as "nothing to lock out", since a server cannot be running in a
-    /// directory that is not there.
+    /// The directory must exist, since the lock lives inside it — see
+    /// [`crate::initdb::create_data_dir_if_absent`], which is what every caller
+    /// runs first.
     pub fn acquire(data_dir: &Path, info: &LockInfo) -> io::Result<Self> {
         let path = data_dir.join(LOCK_FILE);
         for _ in 0..TAKEOVER_ATTEMPTS {
@@ -157,8 +155,8 @@ impl PostmasterLock {
             file,
             status_offset,
         };
-        // Written through the guard — `&File` is a `Write` — so a failure below
-        // drops it, and the half-written file goes with it.
+        // Written through the guard, so a failure below drops it and the
+        // half-written file goes with it.
         let mut sink = &lock.file;
         sink.write_all(head.as_bytes())
             .and_then(|()| sink.write_all(STATUS_STARTING.as_bytes()))
@@ -171,10 +169,9 @@ impl PostmasterLock {
         Ok(lock)
     }
 
-    /// Promote line 8 from `starting` to `ready`, once the listener is up.
-    ///
-    /// A fixed-width overwrite: the rest of the file is untouched and its length
-    /// does not change, so a reader can never catch a truncated file.
+    /// Promote line 8 from `starting` to `ready`, once the listener is up. A
+    /// fixed-width overwrite ([`STATUS_READY`]), so a reader can never catch a
+    /// file mid-rewrite.
     pub fn mark_ready(&self) -> io::Result<()> {
         let mut sink = &self.file;
         sink.seek(SeekFrom::Start(self.status_offset))
@@ -183,7 +180,6 @@ impl PostmasterLock {
             .map_err(|e| at(&self.path, "writing", e))
     }
 
-    /// The file this lock is held on, for a caller that wants to name it.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -227,8 +223,7 @@ impl Drop for PostmasterLock {
 /// happens.
 fn take_over(path: &Path, data_dir: &Path) -> io::Result<()> {
     let pid = match read_holder(path)? {
-        // Somebody cleared it between the failed create and this read, which is
-        // the state the caller wanted; it retries the create.
+        // Gone is what the caller was after either way: it retries the create.
         Holder::Vanished => return Ok(()),
         Holder::Empty => return Err(empty(path)),
         Holder::Bogus(line) => return Err(bogus(path, &line)),
@@ -239,7 +234,6 @@ fn take_over(path: &Path, data_dir: &Path) -> io::Result<()> {
     };
     match fs::remove_file(path) {
         Ok(()) => {}
-        // Same again: gone is what we were after.
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(at(path, "removing the stale lock file", error)),
     }
@@ -251,8 +245,7 @@ fn take_over(path: &Path, data_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// What an existing lock file says, once every way of reading it has been
-/// distinguished from every other.
+/// What an existing lock file says.
 ///
 /// The distinctions are the point. Folded together — as one `Option<i32>` where
 /// `None` meant "unreadable, unparseable or absent" — they turned an EACCES on
@@ -260,7 +253,6 @@ fn take_over(path: &Path, data_dir: &Path) -> io::Result<()> {
 /// the empty file of a server that is *this moment* between its `O_EXCL` create
 /// and its first write into the same thing.
 enum Holder {
-    /// Gone by the time it was read.
     Vanished,
     /// Zero length: either a server is in the window described above, or one
     /// crashed inside it.
@@ -270,7 +262,6 @@ enum Holder {
     Pid(i32),
 }
 
-/// Read an existing lock file, or fail saying why it could not be read.
 fn read_holder(path: &Path) -> io::Result<Holder> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -300,10 +291,8 @@ fn read_holder(path: &Path) -> io::Result<Holder> {
     }
 }
 
-/// A lock file of zero length. PostgreSQL refuses on this too, and for the
-/// reason the hint gives: it is indistinguishable from a server that has just
-/// created its own, so treating it as stale is how two servers end up sharing a
-/// cluster.
+/// Refused rather than taken over because it is indistinguishable from a server
+/// that has just created its own — see the module docs.
 fn empty(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::AlreadyExists,
@@ -316,7 +305,7 @@ fn empty(path: &Path) -> io::Error {
 }
 
 /// A lock file this server did not write. Left alone: it belongs to whatever
-/// put it there, and an operator who has read this can remove it in one command.
+/// put it there.
 fn bogus(path: &Path, line: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -327,8 +316,7 @@ fn bogus(path: &Path, line: &str) -> io::Error {
     )
 }
 
-/// The error a second server gets. Two sentences, because the first says what is
-/// on disk and the second says what to do about it.
+/// The error a second server gets.
 fn occupied(path: &Path, data_dir: &Path, pid: Option<i32>) -> io::Error {
     let who = match pid {
         Some(pid) => format!("(PID {pid}) "),
@@ -572,8 +560,8 @@ mod tests {
         assert!(path.exists(), "an unreadable lock file must not be removed");
     }
 
-    /// The lock file is created inside the data directory, so an absent one is
-    /// reported as such — `initdb` reads that as "nothing to lock out".
+    /// An absent directory is reported as such rather than created here: making
+    /// one is `initdb`'s decision, and this must not quietly take it.
     #[test]
     fn an_absent_directory_is_not_found() {
         let dir = tempfile::tempdir().expect("a temp dir");

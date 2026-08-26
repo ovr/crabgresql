@@ -354,16 +354,13 @@ fn make_dir_all(path: &Path) -> io::Result<()> {
     tighten(path, created)
 }
 
-/// Create the data directory itself, if it is not there — the one step that has
-/// to happen before anything else, because the lock file
-/// ([`crate::lockfile`]) lives inside it and has to be taken before a single
-/// byte of a cluster is written.
+/// Create the data directory itself, if it is not there — the step that has to
+/// come before every other, because the lock file ([`crate::lockfile`]) lives
+/// inside it and has to be taken before a byte of a cluster is written.
 ///
 /// A directory that already exists is left entirely alone, mode included: `-D`
 /// with a typo must not `chmod 0700` somebody's home directory on its way to
-/// refusing it. One we create ourselves is restricted immediately, by
-/// [`make_dir_all`], rather than a moment later when the cluster is written
-/// into it.
+/// refusing it.
 pub fn create_data_dir_if_absent(dir: &Path) -> io::Result<()> {
     match dir.exists() {
         true => Ok(()),
@@ -416,7 +413,6 @@ pub(crate) fn create_new_private(path: &Path) -> io::Result<fs::File> {
     private().create_new(true).open(path)
 }
 
-/// The half both share: write access, and `0600` on anything created.
 #[cfg(unix)]
 fn private() -> fs::OpenOptions {
     use std::os::unix::fs::OpenOptionsExt;

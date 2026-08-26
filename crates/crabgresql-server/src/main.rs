@@ -130,16 +130,10 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     // see [`Shutdown::install`].
     let mut shutdown = Shutdown::install();
 
-    // The lock comes before *everything* that touches the directory — before the
-    // engine, and before the cluster is even created. Two servers over one data
-    // directory each replay the same WAL and write the same files, which loses
-    // data rather than merely making a mess, and creating a cluster is as much a
-    // write as any other: a start racing a running `initdb` would otherwise
-    // overwrite `global/pg_control` and only then be refused.
-    //
-    // Which is why the directory itself is created first — the lock file lives
-    // inside it — and why `initdb` treats a directory holding nothing but a lock
-    // file as empty. The lock is released when this function returns.
+    // Before *everything* that touches the directory, creating the cluster
+    // included: that is as much a write as any other, so a start racing a
+    // running `initdb` would otherwise overwrite `global/pg_control` and only
+    // then be refused. Released when this function returns.
     initdb::create_data_dir_if_absent(&cli.data_dir)?;
     let lock = lockfile::PostmasterLock::acquire(
         &cli.data_dir,
@@ -150,20 +144,16 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         },
     )?;
 
-    // From here until the server is serving, a shutdown signal is this task's
-    // to handle: see `watch_startup`.
     let startup_done = watch_startup(lock.path().to_path_buf());
 
     tracing::info!(
         "opening durable heap engine at {} (running recovery)",
         cli.data_dir.display()
     );
-    // All of it on a blocking thread, and awaited rather than called: every step
-    // is synchronous, and recovery is minutes of it on a large cluster. Run on
-    // the runtime's worker it would hold that worker for the whole of startup —
-    // and on a one-core container there is only one, so the task watching for a
-    // shutdown signal would never be polled, which is exactly the case
-    // `watch_startup` exists for.
+    // On a blocking thread because all of it is synchronous, and recovery is
+    // minutes of it on a large cluster. Left on a runtime worker it would hold
+    // that worker for the whole of startup — and a one-core container has
+    // exactly one, so `watch_startup` would never be polled.
     let data_dir = cli.data_dir.clone();
     let superuser = cli.superuser.clone();
     let (engine, txnmgr, roles) = tokio::task::spawn_blocking(move || {
@@ -214,16 +204,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         cli.listen_address,
         cli.port
     );
-    // Only now is the cluster actually open for business, which is what the
-    // lock file's status line reports. A failure to say so is not worth
-    // refusing to serve over.
+    // Only now is the cluster open for business, which is what the status line
+    // reports. Failing to say so is not worth refusing to serve over.
     if let Err(error) = lock.mark_ready() {
         tracing::warn!(%error, "could not mark the lock file ready");
     }
 
-    // Startup is over, so the watcher stands down and the select below — which
-    // can flush the engine on the way out, as the watcher cannot — takes the
-    // signals from here on.
+    // Startup is over: the select below can flush the engine on the way out, as
+    // the watcher cannot, so the signals are its from here on.
     let _ = startup_done.send(());
 
     tokio::select! {
@@ -239,25 +227,19 @@ async fn run(cli: Cli) -> std::io::Result<()> {
 /// Handle a shutdown signal that arrives while the server is still starting,
 /// for as long as that lasts. Returns the sender that stands it down.
 ///
-/// Startup is not a moment: it opens the engine, which replays the WAL, which
-/// on a large cluster is minutes. A supervisor that stops the server in that
-/// window — `docker stop`, `systemctl stop`, a Ctrl-C — has to be obeyed *then*,
-/// not after recovery finishes, and until [`Shutdown`] existed it was, by the
-/// signal's default disposition. Installing the handlers early took that away
-/// and gave nothing back until the listener was up, so this task is the
-/// replacement: it ends the process the way the default disposition did, and
-/// removes the lock file on the way out, which the default disposition could
-/// not.
-///
-/// It cannot do better than that — there is no engine to flush yet, and the
+/// Startup is not a moment: it opens the engine, which replays the WAL, which on
+/// a large cluster is minutes. `docker stop` in that window has to be obeyed
+/// *then*, not after recovery finishes — and it was, by the signal's default
+/// disposition, until [`Shutdown`] took that disposition away and gave nothing
+/// back until the listener was up. This is the replacement, and it can do no
+/// better than the default did: there is no engine to flush yet, and the
 /// blocking recovery it interrupts is on another thread, exactly where a signal
-/// would have interrupted it before. Once the server is serving, the sender
-/// hands the signals to the select in [`run`], which can flush. A signal in the
-/// instant between the two is handled here, which is the older behavior and no
-/// worse than it.
+/// would have interrupted it before. What it adds is removing the lock file.
 ///
-/// The `initdb` subcommand deliberately has no watcher: its work is short, and
-/// a killed `initdb` leaves a complete lock file with a dead PID, which the next
+/// A signal in the instant between standing down and the select in [`run`]
+/// taking over is still handled here, which is that older behavior — no worse
+/// than it. The `initdb` subcommand has no watcher at all: its work is short,
+/// and a killed `initdb` leaves a complete file with a dead PID, which the next
 /// start takes over.
 fn watch_startup(lock_path: PathBuf) -> tokio::sync::oneshot::Sender<()> {
     let (done, stood_down) = tokio::sync::oneshot::channel();
@@ -266,9 +248,8 @@ fn watch_startup(lock_path: PathBuf) -> tokio::sync::oneshot::Sender<()> {
     let mut watch = Shutdown::install();
     tokio::spawn(async move {
         tokio::select! {
-            // Biased so that a stood-down watcher cannot also take a signal that
-            // arrived at the same moment: the server is serving, and the select
-            // in `run` is the one that can shut it down cleanly.
+            // So that a stood-down watcher cannot also take a signal that
+            // arrived at the same moment: by then `run` handles it better.
             biased;
             _ = stood_down => {}
             () = watch.recv() => {
@@ -277,9 +258,8 @@ fn watch_startup(lock_path: PathBuf) -> tokio::sync::oneshot::Sender<()> {
                      cluster was open"
                 );
                 lockfile::PostmasterLock::release_at(&lock_path);
-                // A requested stop is not a failure, and `exit` is the point:
-                // nothing above us can return, because `run` is blocked inside
-                // startup.
+                // `exit` because nothing above can return: `run` is inside
+                // startup. Status 0 because the stop was asked for.
                 std::process::exit(0);
             }
         }
