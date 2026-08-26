@@ -327,8 +327,7 @@ fn create(dir: &Path, opts: &InitOptions) -> io::Result<()> {
     stamp_version(dir, opts)
 }
 
-/// Create the cluster's role catalog: the bootstrap superuser, and its password
-/// if one was given.
+/// Create the cluster's role catalog.
 ///
 /// Before `PG_VERSION`, like everything else the stamp vouches for. Roles are a
 /// cluster object, so this file is as much a part of a cluster as `pg_control`

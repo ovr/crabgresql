@@ -749,9 +749,8 @@ fn bootstrap_store(superuser: &str) -> RoleStore {
     }
 }
 
-/// Write the role catalog a fresh cluster starts with: one superuser named
-/// `superuser`, with `password` if one was given. What `initdb` puts on disk,
-/// before it stamps `PG_VERSION`.
+/// Write the role catalog a fresh cluster starts with: one superuser, and
+/// nothing else. What `initdb` puts on disk before it stamps `PG_VERSION`.
 ///
 /// `password` is plaintext and is hashed into a SCRAM verifier here — the
 /// cleartext is never written anywhere. A file that already exists is left
@@ -1066,8 +1065,6 @@ pub mod scram {
     /// PostgreSQL's default `password_encryption` iteration count.
     const ITERATIONS: u32 = 4096;
     const SALT_LEN: usize = 16;
-    /// The prefix that says a stored password is a SCRAM verifier rather than
-    /// an `md5…` hash.
     pub const PREFIX: &str = "SCRAM-SHA-256$";
 
     /// A stored verifier taken apart: everything the server side of SCRAM

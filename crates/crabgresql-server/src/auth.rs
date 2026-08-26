@@ -210,7 +210,7 @@ fn split_gs2_header(message: &str) -> Result<(&str, &str), AuthError> {
         }
         _ => return Err(AuthError::protocol("malformed SASL gs2 header")),
     }
-    // Header is `<flag>,<authzid>,` — the third comma ends it.
+    // The header is `<flag>,<authzid>,`, so its second comma is where it ends.
     let mut commas = message.match_indices(',');
     commas.next();
     let (second, _) = commas
@@ -220,7 +220,7 @@ fn split_gs2_header(message: &str) -> Result<(&str, &str), AuthError> {
 }
 
 /// The value of the `<key>=<value>` attribute in a comma-separated SCRAM
-/// message, or `None` when it carries no such attribute.
+/// message.
 fn field(message: &str, key: char) -> Option<&str> {
     message.split(',').find_map(|attr| {
         let mut chars = attr.chars();
@@ -330,7 +330,6 @@ mod tests {
                 .finish(final_message.as_bytes(), "postgres")
                 .unwrap_or_else(|error| panic!("{typed:?} should authenticate: {}", error.message));
         }
-        // And a genuinely different password still does not.
         let wrong = client_final("paSS", bare, &server_first);
         assert_eq!(
             exchange
@@ -357,7 +356,6 @@ mod tests {
 
         let without_proof = final_message.rsplit_once(",p=").expect("proof").0;
         let auth_message = format!("{bare},{server_first},{without_proof}");
-        // The client recomputes ServerKey from the password, as a driver does.
         let salted = salted_password("secret", &server_first);
         let server_key = scram::hmac_sha256(&salted, b"Server Key");
         let expected = scram::hmac_sha256(&server_key, auth_message.as_bytes());
@@ -473,7 +471,6 @@ mod tests {
         assert_eq!(verifier.iterations, 4096);
         assert_eq!(verifier.salt.len(), 16);
         assert_eq!(verifier.stored_key.len(), 32);
-        // An md5 password is not a verifier, and neither is a truncated one.
         assert_eq!(Verifier::parse(&format!("md5{}", "0".repeat(32))), None);
         assert_eq!(Verifier::parse("SCRAM-SHA-256$4096:notbase64"), None);
     }

@@ -19146,7 +19146,6 @@ async fn a_role_with_a_password_must_authenticate() -> anyhow::Result<()> {
 
     let port = spawn_server().await;
     let setup = connect(port).await;
-    // Before: no password, and the connection above needed none.
     setup
         .batch_execute("ALTER ROLE postgres PASSWORD 'sekret'")
         .await?;
@@ -19336,7 +19335,6 @@ async fn a_scram_shaped_password_is_hashed_not_stored() -> anyhow::Result<()> {
         "it should have been hashed"
     );
 
-    // And it is usable as what it is: the password.
     let client = connect_with_password(port, "impostor", "SCRAM-SHA-256$nonsense").await;
     assert_eq!(
         rows(&client.simple_query("SELECT current_user").await?)[0].get(0),

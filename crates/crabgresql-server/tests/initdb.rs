@@ -505,7 +505,6 @@ fn an_empty_password_file_is_refused() -> anyhow::Result<()> {
         "the complaint should name the file: {error}"
     );
 
-    // And a file that is not there at all names itself too.
     let missing = initdb::password_from_file(&dir.path().join("nope"))
         .expect_err("a password file that does not exist");
     assert!(missing.to_string().contains("nope"), "{missing}");

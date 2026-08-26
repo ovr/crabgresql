@@ -145,9 +145,6 @@ where
     }));
     writer.flush().await?;
 
-    // SASLInitialResponse: the mechanism name, then an i32 length and the
-    // client's first message. A length of -1 is "no initial response", which
-    // SCRAM does not allow — its first message is mandatory.
     let Some(body) = read_password_message(reader).await? else {
         return Ok(Err(AuthError {
             code: sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
