@@ -339,7 +339,6 @@ fn bind_subscript(
                     "array slice access is not supported yet",
                 ));
             }
-            // A `Dot` here follows a subscript: field access.
             ast::AccessExpr::Dot(_) => return Err(unsupported()),
         }
     }

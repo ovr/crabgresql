@@ -154,7 +154,6 @@ const DETAIL_LBRACE: &str = "Unexpected \"{\" character.";
 /// in length (`{{1,2},{3}}`).
 const DETAIL_RAGGED: &str =
     "Multidimensional arrays must have sub-arrays with matching dimensions.";
-/// A `[l:u]…` prefix not followed by `=`.
 const DETAIL_NO_EQUALS: &str = "Missing \"=\" after array dimensions.";
 /// A bracket pair that never closes (`'[2:3'`).
 const DETAIL_NO_RBRACKET: &str = "Missing \"]\" after array dimensions.";
@@ -586,7 +585,6 @@ impl Scan<'_> {
             match chars.next() {
                 Some(c) if c == self.delim => skip_ws(chars),
                 Some('}') => break,
-                // EOF before a closing brace, or any other stray character.
                 None => return Err(malformed(self.input, DETAIL_EOF)),
                 Some(_) => return Err(malformed(self.input, detail_delim(self.delim))),
             }
@@ -740,7 +738,6 @@ mod tests {
         Ok(array_in(input, elem, &FmtCtx::utc_default())?.1)
     }
 
-    /// Parse and print back, which is the property most of these tests want.
     fn round_trip(input: &str, elem: PgType) -> Result<String, ArrayError> {
         let (dims, elems) = array_in(input, elem, &FmtCtx::utc_default())?;
         Ok(format(elem, &dims, &elems, &FmtCtx::utc_default()))

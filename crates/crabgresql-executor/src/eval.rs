@@ -277,8 +277,6 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
                 .map(|e| eval(e, row, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             if *nested {
-                // Sub-arrays that disagree about their shape, or that would
-                // stack past `MAXDIM`, each have their own message.
                 crabgresql_types::array::stack(*elem, &values)
                     .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
             } else {
