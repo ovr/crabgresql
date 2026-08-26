@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787768487152,
+  "lastUpdate": 1787768489392,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -62068,6 +62068,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 18312.982945,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9858c178d513427e04c9809af1972fe8efbe27f4",
+          "message": "feat: Lock the data directory with postmaster.pid at startup (#286)",
+          "timestamp": "2026-08-26T17:44:05Z",
+          "tree_id": "67ae9207e7d75369161383c356f83baf1c37446f",
+          "url": "https://github.com/ovr/crabgresql/commit/9858c178d513427e04c9809af1972fe8efbe27f4"
+        },
+        "date": 1787768489159,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1260.794798,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 18078.800054,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
