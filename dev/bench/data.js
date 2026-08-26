@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787771050645,
+  "lastUpdate": 1787771052371,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -62716,6 +62716,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 18078.800054,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "73f9a12d190df1e82ab2ac97c6e8654aa3cdb804",
+          "message": "feat: Create the role catalog in initdb, and authenticate with SCRAM-SHA-256 (#287)",
+          "timestamp": "2026-08-26T20:20:33+02:00",
+          "tree_id": "ab916513ee0792c837f975d27f60d705b40a89c3",
+          "url": "https://github.com/ovr/crabgresql/commit/73f9a12d190df1e82ab2ac97c6e8654aa3cdb804"
+        },
+        "date": 1787771052233,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1230.263301,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 18144.406681,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
