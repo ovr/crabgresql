@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787745401917,
+  "lastUpdate": 1787745403637,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -61420,6 +61420,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 34791.811668,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "235681b667e20595a8666cf48e2b08b77284761c",
+          "message": "feat: Support multi-dimensional arrays (#285)",
+          "timestamp": "2026-08-26T13:03:57+02:00",
+          "tree_id": "b04afc2dc3aec1cfadf9c77709a340d6acd93427",
+          "url": "https://github.com/ovr/crabgresql/commit/235681b667e20595a8666cf48e2b08b77284761c"
+        },
+        "date": 1787745403504,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1224.037596,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 18312.982945,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
