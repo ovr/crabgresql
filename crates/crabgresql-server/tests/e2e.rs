@@ -109,6 +109,39 @@ async fn connect_as(port: u16, user: &str, database: &str) -> tokio_postgres::Cl
     client
 }
 
+/// Connect with a password, the way a driver does when the role has one.
+async fn connect_with_password(port: u16, user: &str, password: &str) -> tokio_postgres::Client {
+    let (client, conn) = password_config(port, user, Some(password))
+        .connect(NoTls)
+        .await
+        .expect("handshake should succeed");
+    tokio::spawn(conn);
+    client
+}
+
+/// The error a refused connection ends with. `expect_err` cannot be used
+/// directly here: the success half of the pair holds a `Connection`, which is
+/// not `Debug`.
+async fn connect_refused(port: u16, user: &str, password: Option<&str>) -> tokio_postgres::Error {
+    match password_config(port, user, password).connect(NoTls).await {
+        Ok(_) => panic!("the connection should have been refused"),
+        Err(error) => error,
+    }
+}
+
+fn password_config(port: u16, user: &str, password: Option<&str>) -> tokio_postgres::Config {
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host("127.0.0.1")
+        .port(port)
+        .user(user)
+        .dbname("postgres");
+    if let Some(password) = password {
+        config.password(password);
+    }
+    config
+}
+
 /// No `WITHOUT FUNCTION` cast may name an enum. An enum value is the OID of a
 /// `pg_enum` row, so a binary cast would relabel an integer as a member that
 /// exists only in this database — and the executor would then hold a value whose
@@ -19099,5 +19132,134 @@ async fn a_trust_session_never_leaves_its_synthetic_oid_behind() -> anyhow::Resu
         err.as_db_error().expect("database error").message(),
         "current user cannot be dropped"
     );
+    Ok(())
+}
+
+/// A password on a role turns its connections from trusted into authenticated.
+///
+/// The whole of the rest of this suite connects without one, which is the other
+/// half of the rule: a cluster where nothing has a password behaves exactly as
+/// this server always has.
+#[tokio::test]
+async fn a_role_with_a_password_must_authenticate() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let port = spawn_server().await;
+    let setup = connect(port).await;
+    // Before: no password, and the connection above needed none.
+    setup
+        .batch_execute("ALTER ROLE postgres PASSWORD 'sekret'")
+        .await?;
+
+    // The right password completes a real SCRAM-SHA-256 exchange, driven by
+    // tokio-postgres rather than by our own idea of one.
+    let client = connect_with_password(port, "postgres", "sekret").await;
+    let who = client.simple_query("SELECT current_user").await?;
+    assert_eq!(rows(&who)[0].get(0), Some("postgres"));
+
+    // The wrong one is 28P01, and says nothing about which half was wrong.
+    let error = connect_refused(port, "postgres", Some("not sekret")).await;
+    let db = error.as_db_error().expect("a database error");
+    assert_eq!(db.code(), &SqlState::INVALID_PASSWORD);
+    assert_eq!(
+        db.message(),
+        "password authentication failed for user \"postgres\""
+    );
+
+    // And no password at all does not get in either. The refusal comes from the
+    // driver rather than the server — asked for SASL with nothing configured to
+    // answer with, libpq and tokio-postgres both give up before replying — so
+    // what is checked here is that the connection failed and why.
+    let error = connect_refused(port, "postgres", None).await;
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let mut chain = String::new();
+    while let Some(error) = cause {
+        chain.push_str(&error.to_string());
+        chain.push(';');
+        cause = error.source();
+    }
+    assert!(chain.contains("password"), "{chain}");
+
+    Ok(())
+}
+
+/// The trust fallback for a name the catalog does not have is what lets this
+/// suite connect as roles nobody created. It has to stop the moment a password
+/// exists, or every password in the cluster is bypassed by connecting under a
+/// name that was never used.
+#[tokio::test]
+async fn an_unknown_role_is_trusted_only_until_a_password_exists() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let port = spawn_server().await;
+    // Nothing has a password: a name the catalog never heard of gets a session.
+    let ghost = connect_as(port, "nobody", "postgres").await;
+    assert_eq!(
+        rows(&ghost.simple_query("SELECT current_user").await?)[0].get(0),
+        Some("nobody")
+    );
+
+    connect(port)
+        .await
+        .batch_execute("ALTER ROLE postgres PASSWORD 'sekret'")
+        .await?;
+
+    let error = connect_refused(port, "nobody", Some("sekret")).await;
+    let db = error.as_db_error().expect("a database error");
+    assert_eq!(db.code(), &SqlState::INVALID_AUTHORIZATION_SPECIFICATION);
+    assert_eq!(db.message(), "role \"nobody\" does not exist");
+
+    Ok(())
+}
+
+/// `PASSWORD NULL` puts a role back to trusted. The catalog is the only thing
+/// that decides, so clearing the verifier has to be as effective as setting it.
+#[tokio::test]
+async fn clearing_a_password_makes_the_role_trusted_again() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let setup = connect(port).await;
+    setup
+        .batch_execute("ALTER ROLE postgres PASSWORD 'sekret'")
+        .await?;
+    connect_refused(port, "postgres", None).await;
+
+    setup
+        .batch_execute("ALTER ROLE postgres PASSWORD NULL")
+        .await?;
+    let client = connect(port).await;
+    assert_eq!(
+        rows(&client.simple_query("SELECT current_user").await?)[0].get(0),
+        Some("postgres")
+    );
+
+    Ok(())
+}
+
+/// A role whose stored password is a pre-hashed `md5…` string cannot be
+/// authenticated: only SCRAM is implemented. It has to say so, rather than
+/// offering SASL against a verifier that is not one.
+#[tokio::test]
+async fn an_md5_password_is_refused_with_an_explanation() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let port = spawn_server().await;
+    let setup = connect(port).await;
+    // PostgreSQL stores a string that already looks like a hash verbatim.
+    setup
+        .batch_execute(&format!(
+            "CREATE ROLE legacy LOGIN PASSWORD 'md5{}'",
+            "0".repeat(32)
+        ))
+        .await?;
+
+    let error = connect_refused(port, "legacy", Some("whatever")).await;
+    let db = error.as_db_error().expect("a database error");
+    assert_eq!(db.code(), &SqlState::INVALID_AUTHORIZATION_SPECIFICATION);
+    assert!(
+        db.message().contains("only SCRAM-SHA-256 is supported"),
+        "the message should say what to do: {}",
+        db.message()
+    );
+
     Ok(())
 }

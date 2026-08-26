@@ -200,6 +200,14 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
         self.write(&BackendMessage::EmptyQueryResponse);
     }
 
+    /// ErrorResponse with severity FATAL: the connection ends with this
+    /// message, and no ReadyForQuery follows it.
+    pub fn fatal_response(&mut self, code: &str, message: &str) {
+        self.write(&BackendMessage::ErrorResponse(ErrorFields::fatal(
+            code, message,
+        )));
+    }
+
     /// ErrorResponse with severity ERROR. `code` is a 5-char SQLSTATE.
     pub fn error_response(&mut self, code: &str, message: &str) {
         self.write(&BackendMessage::ErrorResponse(ErrorFields::error(

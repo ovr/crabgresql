@@ -1,4 +1,10 @@
-//! One client connection: startup handshake, then the simple-query loop.
+//! One client connection: startup handshake, authentication, then the
+//! simple-query loop.
+//!
+//! The handshake decides two things before a session exists: which role the
+//! connection runs as ([`crate::roles::RoleCatalog::login`]) and what it has to
+//! prove to run as it ([`crate::auth`]). Both refusals are FATAL, because the
+//! startup phase has no ReadyForQuery to recover into.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -6,8 +12,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use crabgresql_executor::OutputColumn;
 use crabgresql_parser::ast;
 use crabgresql_pg_wire::{
-    BackendMessage, BackendWriter, CopyResponse, FieldDescription, Format, FrontendMessage,
-    FrontendReader, ProtocolError, StartupRequest, Target, TransactionStatus, sqlstate,
+    AuthRequest, BackendMessage, BackendWriter, CopyResponse, FieldDescription, Format,
+    FrontendMessage, FrontendReader, ProtocolError, StartupRequest, Target, TransactionStatus,
+    sqlstate,
 };
 use crabgresql_storage_api::TableEngine;
 use crabgresql_storage_api::pgstat::PgStatCounters;
@@ -16,6 +23,7 @@ use crabgresql_types::cast::CastError;
 use crabgresql_types::{FmtCtx, PgType, Value, wire};
 use tokio::net::TcpStream;
 
+use crate::auth::{self, AuthError};
 use crate::error::PgError;
 use crate::global_catalog::GlobalCatalog;
 use crate::guc;
@@ -23,7 +31,7 @@ use crate::query::{
     Analyzed, BoundParams, Notice, QueryResult, RowTag, analyze_statement, execute_statement,
     executed_columns, fetch_columns, prepare_copy_from, run_copy_insert,
 };
-use crate::roles::RoleCatalog;
+use crate::roles::{Login, RoleCatalog, scram};
 use crate::session::{Portal, PortalState, PreparedStatement, Session, SuspendedRows};
 
 /// Fake backend pids for BackendKeyData: every connection needs a distinct
@@ -53,6 +61,153 @@ impl Drop for BackendGuard<'_> {
     fn drop(&mut self) {
         self.0.backend_ended();
     }
+}
+
+/// Send a FATAL and close: the startup phase has no ReadyForQuery to fall back
+/// to, so a refusal here *is* the end of the connection.
+///
+/// `Ok(())` because the connection did what it was supposed to — a client that
+/// offered the wrong password is not a server error, and logging it as one
+/// would bury the real ones.
+async fn fail_startup<W>(
+    writer: &mut BackendWriter<W>,
+    code: &str,
+    message: &str,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    writer.fatal_response(code, message);
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Run whatever `user` has to prove before the connection is established.
+///
+/// The outer `Result` is the socket: a client that hung up mid-exchange is an
+/// IO error and propagates. The inner one is the answer — `Err` means refuse,
+/// and the caller turns it into the FATAL.
+async fn authenticate<R, W>(
+    reader: &mut FrontendReader<R>,
+    writer: &mut BackendWriter<W>,
+    user: &crate::roles::Role,
+) -> Result<Result<(), AuthError>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let Some(stored) = user.password.as_deref() else {
+        // No password, no question to ask. Every cluster starts this way, and
+        // one that stays this way behaves exactly as this server always has.
+        writer.authentication_ok();
+        return Ok(Ok(()));
+    };
+    let Some(verifier) = scram::Verifier::parse(stored) else {
+        // An `md5…` password, or one this build cannot read. PostgreSQL would
+        // answer md5 with AuthenticationMD5Password; this server implements
+        // SCRAM only, and pretending otherwise would fail later and less
+        // clearly.
+        return Ok(Err(AuthError {
+            code: sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
+            message: format!(
+                "role \"{}\" has a password this server cannot authenticate \
+                 against; only SCRAM-SHA-256 is supported, so reset it with \
+                 ALTER ROLE … PASSWORD",
+                user.name
+            ),
+        }));
+    };
+
+    writer.write(&BackendMessage::Authentication(AuthRequest::Sasl {
+        mechanisms: vec![auth::MECHANISM.to_string()],
+    }));
+    writer.flush().await?;
+
+    // SASLInitialResponse: the mechanism name, then an i32 length and the
+    // client's first message. A length of -1 is "no initial response", which
+    // SCRAM does not allow — its first message is mandatory.
+    let Some(body) = read_password_message(reader).await? else {
+        return Ok(Err(AuthError {
+            code: sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
+            message: "the client sent no password message during authentication".into(),
+        }));
+    };
+    let initial = match split_sasl_initial(&body) {
+        Ok(initial) => initial,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (exchange, server_first) = match auth::Exchange::start(verifier, initial) {
+        Ok(started) => started,
+        Err(error) => return Ok(Err(error)),
+    };
+    writer.write(&BackendMessage::Authentication(AuthRequest::SaslContinue {
+        data: server_first.into_bytes(),
+    }));
+    writer.flush().await?;
+
+    let Some(client_final) = read_password_message(reader).await? else {
+        return Ok(Err(AuthError {
+            code: sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
+            message: "the client sent no password message during authentication".into(),
+        }));
+    };
+    let server_final = match exchange.finish(&client_final, &user.name) {
+        Ok(message) => message,
+        Err(error) => return Ok(Err(error)),
+    };
+    writer.write(&BackendMessage::Authentication(AuthRequest::SaslFinal {
+        data: server_final.into_bytes(),
+    }));
+    writer.authentication_ok();
+    writer.flush().await?;
+    Ok(Ok(()))
+}
+
+/// The next `p` message's body, or `None` if the client went away or sent
+/// something else — during authentication there is nothing else to send.
+async fn read_password_message<R>(
+    reader: &mut FrontendReader<R>,
+) -> Result<Option<Vec<u8>>, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match reader.read_message().await? {
+        Some(FrontendMessage::PasswordMessage(body)) => Ok(Some(body)),
+        _ => Ok(None),
+    }
+}
+
+/// Split a SASLInitialResponse body into the mechanism it selected and the
+/// initial response that follows: `<mechanism>\0<i32 length><bytes>`.
+fn split_sasl_initial(body: &[u8]) -> Result<&[u8], AuthError> {
+    let refuse = |message: &str| AuthError {
+        code: sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
+        message: message.to_string(),
+    };
+    let end = memchr::memchr(0, body).ok_or_else(|| refuse("malformed SASLInitialResponse"))?;
+    let mechanism =
+        std::str::from_utf8(&body[..end]).map_err(|_| refuse("malformed SASLInitialResponse"))?;
+    if mechanism != auth::MECHANISM {
+        // Only one mechanism was offered, so anything else is a client
+        // selecting something it was not given — including the `-PLUS` variant,
+        // which a server without TLS must never accept.
+        return Err(refuse(&format!(
+            "the client selected the SASL mechanism \"{mechanism}\", which this \
+             server did not offer"
+        )));
+    }
+    let rest = &body[end + 1..];
+    if rest.len() < 4 {
+        return Err(refuse("malformed SASLInitialResponse"));
+    }
+    let len = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    let response = &rest[4..];
+    if len < 0 || len as usize != response.len() {
+        return Err(refuse(
+            "SASLInitialResponse length does not match its payload",
+        ));
+    }
+    Ok(response)
 }
 
 pub async fn handle_connection(
@@ -90,13 +245,6 @@ pub async fn handle_connection(
         }
     };
 
-    // TODO: authenticate the client (SCRAM-SHA-256) instead of accepting
-    // every connection as trusted, whatever it sent in `user`.
-    writer.authentication_ok();
-
-    // Per-connection session state (GUCs). A fresh connection resets them,
-    // matching how the regression runner gives each test its own session. Built
-    // before the ParameterStatus burst below, which reports its values.
     let backend_id = NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed);
     let name = params
         .get("user")
@@ -106,21 +254,37 @@ pub async fn handle_connection(
         .get("database")
         .cloned()
         .unwrap_or_else(|| name.clone());
-    // PostgreSQL would refuse a role it does not have with a FATAL 28000. Until
-    // startup authenticates, such a name gets a synthetic superuser instead —
-    // logged, because a connection that names an unknown role is either a typo
-    // or a client that would be rejected by a real server.
+
+    // The role is resolved before it is authenticated, because what it has to
+    // prove is a property of the role: one with a stored password must pass
+    // SCRAM, one without is trusted. See `RoleCatalog::login`.
     let user = match roles.login(&name) {
-        Ok(role) => role,
-        Err(role) => {
+        Login::Known(role) => role,
+        Login::Trusted(role) => {
             tracing::warn!(
                 user = %name,
                 "no such role; accepting the connection as a trusted superuser \
-                 because authentication is not implemented yet"
+                 because no role in this cluster has a password"
             );
             role
         }
+        Login::NoSuchRole => {
+            return fail_startup(
+                &mut writer,
+                sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
+                &format!("role \"{name}\" does not exist"),
+            )
+            .await;
+        }
     };
+    if let Err(error) = authenticate(&mut reader, &mut writer, &user).await? {
+        tracing::warn!(user = %name, message = %error.message, "authentication failed");
+        return fail_startup(&mut writer, error.code, &error.message).await;
+    }
+
+    // Per-connection session state (GUCs). A fresh connection resets them,
+    // matching how the regression runner gives each test its own session. Built
+    // before the ParameterStatus burst below, which reports its values.
     let role_config = user.config.clone();
     let mut session = Session::with_identity(
         txnmgr.clone(),
