@@ -873,6 +873,7 @@ contents serve the same purpose:
 ```
 <PGDATA>/
   PG_VERSION           # major version that wrote this directory
+  postmaster.pid       # the running server's PID; absent when none is running
   base/                # one file per heap/index relfilenode
   global/
     pg_control         # redo point, XID floor, clean-shutdown flag
@@ -899,6 +900,18 @@ A directory holding a control file or `base/` but no `PG_VERSION` is a cluster
 written before the stamp existed. It is adopted — stamped in place, data
 untouched — because the on-disk format is a compatibility boundary. A directory
 holding anything else is refused: it was almost certainly named by mistake.
+
+Opening a cluster is exclusive (`crabgresql_server::lockfile`). `PG_VERSION`
+says whose directory this is and of what version; `postmaster.pid` says whether
+somebody has it open *now*. It is created with `O_EXCL` before the engine opens
+anything, carries the eight lines PostgreSQL writes (PID, directory, start time,
+port, socket directory, listen address, shared-memory key, status), and is
+unlinked when the server exits. An existing one whose PID is alive
+(`kill(pid, 0)`) stops the start; one whose PID is dead is a stale file a crash
+left, and is taken over. Two servers replaying one WAL into one set of relation
+files is the failure this rules out — it loses data rather than merely making a
+mess — and the `initdb` subcommand takes the same lock, since rewriting the
+skeleton of a live cluster is that failure with a different command line.
 
 ## 4. Workspace layout (crates)
 

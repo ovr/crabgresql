@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use crabgresql_config as config;
-use crabgresql_server::initdb;
+use crabgresql_server::{initdb, lockfile};
 use tokio::net::TcpListener;
 
 /// crabgresql — a PostgreSQL-compatible server.
@@ -113,15 +113,43 @@ async fn main() -> std::process::ExitCode {
 
 async fn run(cli: Cli) -> std::io::Result<()> {
     if let Some(Command::Initdb { no_sync }) = &cli.command {
+        // Held across the whole of `initdb`, so it cannot rewrite the skeleton
+        // of a cluster a server has open. An absent directory has nothing to
+        // lock — and no server in it either.
+        let _lock = match lockfile::PostmasterLock::acquire(
+            &cli.data_dir,
+            &lockfile::LockInfo::for_initdb(start_epoch_secs()),
+        ) {
+            Ok(lock) => Some(lock),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         let opts = initdb::InitOptions { sync: !no_sync };
         report(initdb::init_data_dir(&cli.data_dir, &opts)?, &cli.data_dir);
         return Ok(());
     }
 
+    // Before any of the slow work, so the handlers exist for the whole of it —
+    // see [`Shutdown::install`].
+    let mut shutdown = Shutdown::install();
+
     // Before the engine opens anything: an absent or empty directory becomes a
     // cluster, and a directory that is not one is refused here rather than
     // silently filled in piece by piece by whichever component ran first.
     report(initdb::ensure_initialized(&cli.data_dir)?, &cli.data_dir);
+
+    // And before *anything* is opened: two servers over one data directory each
+    // replay the same WAL and write the same files, which loses data rather
+    // than merely making a mess. The lock is released when this function
+    // returns — every exit path below is a return, including the signal one.
+    let lock = lockfile::PostmasterLock::acquire(
+        &cli.data_dir,
+        &lockfile::LockInfo {
+            port: cli.port,
+            listen_address: listen_address_line(cli.listen_address),
+            start_epoch_secs: start_epoch_secs(),
+        },
+    )?;
 
     tracing::info!(
         "opening durable heap engine at {} (running recovery)",
@@ -169,14 +197,44 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         cli.listen_address,
         cli.port
     );
+    // Only now is the cluster actually open for business, which is what the
+    // lock file's status line reports. A failure to say so is not worth
+    // refusing to serve over.
+    if let Err(error) = lock.mark_ready() {
+        tracing::warn!(%error, "could not mark the lock file ready");
+    }
 
     tokio::select! {
         result = crabgresql_server::serve_with(listener, engine, txnmgr, copy_files, roles) => result,
-        () = shutdown_signal() => {
+        () = shutdown.recv() => {
             tracing::info!("received shutdown signal; flushing for a clean shutdown");
             engine_for_shutdown.shutdown();
             Ok(())
         }
+    }
+}
+
+/// When this process started, in whole seconds since the epoch — the lock
+/// file's third line.
+///
+/// Taken from the same stamp `pg_postmaster_start_time()` reports, so the file
+/// and the function can never disagree about when the server came up. That
+/// stamp counts from PostgreSQL's 2000 epoch and this line is a `time_t`, so it
+/// crosses `to_unix_micros` on the way out — a `date -r` on the raw value would
+/// otherwise read thirty years early.
+fn start_epoch_secs() -> i64 {
+    let micros = crabgresql_types::tz::postmaster_start_micros();
+    crabgresql_types::tz::to_unix_micros(micros).div_euclid(1_000_000)
+}
+
+/// The lock file's sixth line: the address the server accepts connections on,
+/// as PostgreSQL writes `listen_addresses` there — `*` for a wildcard bind,
+/// because "0.0.0.0" and "::" say the same thing in two spellings and the file
+/// is read by people.
+fn listen_address_line(address: IpAddr) -> String {
+    match address.is_unspecified() {
+        true => "*".to_string(),
+        false => address.to_string(),
     }
 }
 
@@ -205,20 +263,59 @@ fn report(outcome: initdb::Outcome, data_dir: &std::path::Path) {
     }
 }
 
-/// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM.
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(term) => term,
-        Err(error) => {
-            tracing::warn!(%error, "could not install SIGTERM handler; Ctrl-C only");
-            let _ = tokio::signal::ctrl_c().await;
-            return;
+/// SIGINT (Ctrl-C) and SIGTERM, with their handlers already installed.
+///
+/// Installed at the top of startup rather than at the moment we first await
+/// them, because until a handler exists the signal's *default* disposition
+/// applies and kills the process outright: no clean-shutdown flush, no
+/// `postmaster.pid` removed, and a control file left dirty enough to reset
+/// every unlogged relation on the next start. The window used to cover
+/// recovery, which takes minutes on a large cluster, and — worse — the moment
+/// straight after the "listening" line, which is exactly when a supervisor or a
+/// test harness stops a server it has just watched come up.
+///
+/// A signal that arrives before the wait is not lost: tokio's driver records it
+/// against the handler and [`Shutdown::recv`] returns immediately.
+struct Shutdown {
+    /// `None` when the handler could not be installed. Nothing here can undo
+    /// that, and a server that refused to start over it would be worse than one
+    /// that can only be stopped the other way.
+    interrupt: Option<tokio::signal::unix::Signal>,
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl Shutdown {
+    fn install() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        let install = |kind: SignalKind, name: &str| match signal(kind) {
+            Ok(handler) => Some(handler),
+            Err(error) => {
+                tracing::warn!(%error, "could not install the {name} handler");
+                None
+            }
+        };
+        Shutdown {
+            interrupt: install(SignalKind::interrupt(), "SIGINT"),
+            terminate: install(SignalKind::terminate(), "SIGTERM"),
         }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    }
+
+    /// Resolves when either signal arrives, and never if neither handler could
+    /// be installed — there is nothing to wait for, and the caller's other
+    /// branch is the whole server.
+    async fn recv(&mut self) {
+        match (&mut self.interrupt, &mut self.terminate) {
+            (Some(interrupt), Some(terminate)) => {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            (Some(only), None) | (None, Some(only)) => {
+                only.recv().await;
+            }
+            (None, None) => std::future::pending().await,
+        }
     }
 }
 
@@ -252,6 +349,32 @@ mod tests {
         assert!(cli.command.is_none());
         assert_eq!(cli.data_dir, PathBuf::from("/tmp/pg"));
         assert_eq!(cli.port, 5555);
+    }
+
+    /// The lock file's third line is a `time_t`, and the stamp it comes from
+    /// counts from 2000 — a missed epoch shift puts the server's start time in
+    /// 1996 and nothing but a human reading the file would notice.
+    #[test]
+    fn the_start_time_is_a_unix_timestamp() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_secs() as i64;
+        let start = start_epoch_secs();
+        assert!(
+            (now - start).abs() < 60 * 60,
+            "start time {start} is not within an hour of now ({now})"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_bind_is_written_as_a_star() {
+        assert_eq!(listen_address_line("0.0.0.0".parse().expect("v4")), "*");
+        assert_eq!(listen_address_line("::".parse().expect("v6")), "*");
+        assert_eq!(
+            listen_address_line("127.0.0.1".parse().expect("v4")),
+            "127.0.0.1"
+        );
     }
 
     #[test]

@@ -103,6 +103,21 @@ tree. So is a cluster whose `PG_VERSION` names another major version. A director
 written by a build from before `PG_VERSION` existed is stamped and opened, data
 intact.
 
+One server at a time, per directory. A running server holds a `postmaster.pid`
+in it — PostgreSQL's eight lines, PID first and status last — and a second
+server (or a second `initdb`) over the same directory refuses to start rather
+than replaying the same WAL and writing the same files underneath the first:
+
+```console
+$ crabgresql -D ./pgdata
+crabgresql: lock file "./pgdata/postmaster.pid" already exists — is another
+crabgresql server (PID 4711) running in data directory "./pgdata"?
+```
+
+A server that was killed outright leaves the file behind; the next start finds
+its PID dead and takes the directory over, so this is not something to clean up
+by hand.
+
 ## Configuration
 
 Every environment variable the server reads is declared in one place,
