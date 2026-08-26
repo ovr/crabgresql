@@ -408,14 +408,23 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             }),
             ret,
         },
-        BoundExpr::ArrayCtor { elem, ty, elems } => BoundExpr::ArrayCtor {
+        BoundExpr::ArrayCtor {
             elem,
+            nested,
+            ty,
+            elems,
+        } => BoundExpr::ArrayCtor {
+            elem,
+            nested,
             ty,
             elems: elems.into_iter().map(|a| inline_params(a, args)).collect(),
         },
-        BoundExpr::Subscript { base, index, ty } => BoundExpr::Subscript {
+        BoundExpr::Subscript { base, indexes, ty } => BoundExpr::Subscript {
             base: Box::new(inline_params(*base, args)),
-            index: Box::new(inline_params(*index, args)),
+            indexes: indexes
+                .into_iter()
+                .map(|i| inline_params(i, args))
+                .collect(),
             ty,
         },
         // `x op ANY/ALL(array)` carries no subplan and can appear in a scalar

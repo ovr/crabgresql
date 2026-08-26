@@ -111,12 +111,28 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
         // The text-search types carry their own total orders.
         PgType::Tsvector => tsvector::cmp(tsvector_of(l), tsvector_of(r)),
         PgType::Tsquery => tsquery::cmp(tsquery_of(l), tsquery_of(r)),
-        // Arrays: element-wise comparison, then the shorter array is less on a
-        // common prefix (PG's `array_cmp`). A NULL element sorts after any
-        // non-NULL (NULLS-LAST), matching the default btree order.
+        // Arrays: element-wise comparison over the flat, row-major elements, then
+        // the shorter array is less on a common prefix (PG's `array_cmp`). A NULL
+        // element sorts after any non-NULL (NULLS-LAST), matching the default
+        // btree order.
+        //
+        // Shape only breaks a tie. Two arrays holding the same elements in the
+        // same order but under different dimensions or bounds are *not* equal —
+        // `ARRAY[[1,2]] = ARRAY[1,2]` and `'[2:3]={1,2}'::int[] = '{1,2}'` are
+        // both false.
+        //
+        // The shape is read in three passes, not dimension by dimension: the
+        // number of dimensions, then *every* length, then *every* lower bound.
+        // Comparing each dimension as a `(lower, len)` pair would let a high
+        // lower bound on the first dimension outvote a longer one, and PG orders
+        // `'[5:5][1:4]={{1,2,3,4}}'` *below* `'{{1,2},{3,4}}'`.
         PgType::Array(elem_oid) => {
             let elem = PgType::from_oid(elem_oid).expect("orderable array element type resolves");
+            let (dl, dr) = (array_dims(l), array_dims(r));
             compare_elementwise(elem, array_elems(l), array_elems(r))
+                .then_with(|| dl.len().cmp(&dr.len()))
+                .then_with(|| dl.iter().map(|d| d.len).cmp(dr.iter().map(|d| d.len)))
+                .then_with(|| dl.iter().map(|d| d.lower).cmp(dr.iter().map(|d| d.lower)))
         }
         // `oidvector` is the one type whose *sort* order is not its element-wise
         // order: PG gives it its own operator class (`btoidvectorcmp`), which
@@ -183,6 +199,13 @@ pub fn int2(v: &Value) -> i16 {
 pub fn array_elems(v: &Value) -> &[Value] {
     match v {
         Value::Array { elems, .. } => elems,
+        other => unreachable!("expected array, got {other:?}"),
+    }
+}
+
+pub fn array_dims(v: &Value) -> &[crate::ArrayDim] {
+    match v {
+        Value::Array { dims, .. } => dims,
         other => unreachable!("expected array, got {other:?}"),
     }
 }
@@ -492,6 +515,65 @@ mod vector_cmp_tests {
                 "{kind:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod array_cmp_tests {
+    use super::compare_values;
+    use crate::{FmtCtx, PgType, Value, oid};
+    use std::cmp::Ordering;
+
+    /// Two array literals compared as `int[]`, so the expectations below read as
+    /// the SQL that produced them against PostgreSQL 18.4.
+    fn cmp(l: &str, r: &str) -> Ordering {
+        let parse = |s: &str| {
+            let (dims, elems) = crate::array::array_in(s, PgType::Int4, &FmtCtx::utc_default())
+                .expect("test literal parses");
+            Value::Array {
+                elem: PgType::Int4,
+                dims,
+                elems,
+            }
+        };
+        compare_values(PgType::Array(oid::INT4), &parse(l), &parse(r))
+    }
+
+    /// The elements settle it before the shape ever comes up, however different
+    /// the two shapes are.
+    #[test]
+    fn elements_outrank_shape() {
+        assert_eq!(cmp("{{1,2}}", "{1,2,3}"), Ordering::Less);
+        assert_eq!(cmp("{{1,3}}", "{1,2,3}"), Ordering::Greater);
+        assert_eq!(cmp("{1,2}", "{1,2}"), Ordering::Equal);
+    }
+
+    /// Same elements in the same order: the number of dimensions decides first.
+    #[test]
+    fn more_dimensions_sort_after() {
+        assert_eq!(cmp("{{1,2}}", "{1,2}"), Ordering::Greater);
+        assert_eq!(cmp("{{{1,2}}}", "{{1,2}}"), Ordering::Greater);
+    }
+
+    /// At equal dimensionality *every* length is compared before *any* lower
+    /// bound — not dimension by dimension as a `(lower, len)` pair, which would
+    /// let a high lower bound on the first dimension outvote a longer one.
+    #[test]
+    fn all_lengths_outrank_all_lower_bounds() {
+        // `[5:5][1:4]` is 1x4 at lower bounds (5, 1); `{{1,2},{3,4}}` is 2x2 at
+        // (1, 1). Lengths decide: 1 < 2, so the shifted one is *less* even though
+        // its first lower bound is higher.
+        assert_eq!(
+            cmp("[5:5][1:4]={{1,2,3,4}}", "{{1,2},{3,4}}"),
+            Ordering::Less
+        );
+        // With every length equal the lower bounds decide, left to right.
+        assert_eq!(cmp("[1:2]={1,2}", "[5:6]={1,2}"), Ordering::Less);
+        assert_eq!(
+            cmp("[1:2][5:6]={{1,2},{3,4}}", "[1:2][1:2]={{1,2},{3,4}}"),
+            Ordering::Greater
+        );
+        assert_eq!(cmp("[2:3]={1,2}", "{1,2}"), Ordering::Greater);
     }
 }
 

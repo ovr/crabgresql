@@ -187,9 +187,11 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
             ast::GeometricTypeKind::Line => PgType::Line,
             ast::GeometricTypeKind::Circle => PgType::Circle,
         },
-        // `T[]` / `ARRAY[N]` / `ARRAY<T>`: a one-dimensional array of the element
-        // type. The `int[5]` length is accepted and ignored (PG does not enforce
-        // array length). A bare `ARRAY` (no element type) has no meaning here.
+        // `T[]` / `ARRAY[N]` / `ARRAY<T>`: an array of the element type. The
+        // `int[5]` length is accepted and ignored (PG does not enforce array
+        // length), and so is *depth*: `int[][]` names the same type as `int[]`,
+        // because an array's dimensionality belongs to the value, not the type.
+        // A bare `ARRAY` (no element type) has no meaning here.
         DataType::Array(elem_def) => {
             let inner = match elem_def {
                 ast::ArrayElemTypeDef::SquareBracket(inner, _)
@@ -201,12 +203,24 @@ pub fn map_data_type(dt: &ast::DataType) -> Result<PgType, BindError> {
                     ));
                 }
             };
-            let elem = map_data_type(inner)?;
+            // A nested `DataType::Array` is one more `[]` in the declaration, so
+            // peel it off to reach the type that is actually the element. Only
+            // the *syntax* peels: `int4[][]` is `integer[]`, but `_int4[]` names
+            // an array of an array type, which PG has no such thing as and the
+            // check below refuses.
+            let inner_ty = map_data_type(inner)?;
+            let elem = match inner_ty {
+                PgType::Array(elem_oid) if matches!(inner.as_ref(), DataType::Array(_)) => {
+                    PgType::from_oid(elem_oid).ok_or_else(|| {
+                        BindError::feature_not_supported(format!(
+                            "type \"{dt}\" is not supported yet"
+                        ))
+                    })?
+                }
+                elem => elem,
+            };
             // Only element types this build has an array type for are supported;
-            // this also rejects an array element type, i.e. a multi-dimensional
-            // array.
-            // TODO: support multi-dimensional array declarations such as
-            // `int4[][][]`, which PG accepts (upstream `arrays` regress test).
+            // this is what rejects an array element type reached by name.
             if crabgresql_types::array::array_oid_for_elem(elem.oid()).is_none() {
                 return Err(BindError::feature_not_supported(format!(
                     "type \"{dt}\" is not supported yet"

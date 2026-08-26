@@ -122,10 +122,7 @@ pub fn decode_binary(ty: PgType, b: &[u8]) -> Result<Value, CastError> {
 /// — see it for the layout.
 ///
 /// A header this build cannot represent is rejected rather than reinterpreted,
-/// because a foreign element OID or an unexpected lower bound would each change
-/// the value *silently*. The second dimension is the one refused with `0A000`
-/// rather than as malformed input: PG sends it perfectly well, and only
-/// `crate::array`'s 1-D representation has nowhere to put it.
+/// because a foreign element OID would change the value *silently*.
 fn decode_array(b: &[u8], ty: PgType, elem_oid: u32) -> Result<Value, CastError> {
     let be = |s: &[u8]| i32::from_be_bytes([s[0], s[1], s[2], s[3]]);
     if b.len() < 12 {
@@ -143,23 +140,43 @@ fn decode_array(b: &[u8], ty: PgType, elem_oid: u32) -> Result<Value, CastError>
         if b.len() != 12 {
             return Err(invalid_binary(ty));
         }
-        return Ok(Value::Array {
-            elem,
-            elems: Vec::new(),
-        });
+        return Ok(Value::array_1d(elem, Vec::new()));
     }
-    if ndim != 1 {
-        return Err(no_binary(ty));
-    }
-    if b.len() < 20 {
+    if ndim < 0 || ndim as usize > crate::array::MAXDIM {
         return Err(invalid_binary(ty));
     }
-    let (count, lower) = (be(&b[12..16]), be(&b[16..20]));
-    if count < 0 || lower != 1 {
+    let ndim = ndim as usize;
+    if b.len() < 12 + ndim * 8 {
         return Err(invalid_binary(ty));
+    }
+    let mut dims = Vec::with_capacity(ndim);
+    // The element count is the product of the dimension lengths. Each element
+    // costs at least its four length bytes, so that product can never exceed the
+    // buffer's own budget — and the running check has to be *inside* the loop and
+    // *checked*: three dimensions of `i32::MAX` overflow even an i64, which would
+    // otherwise wrap to a small count that walks straight past a check after the
+    // loop and yields a `Value::Array` whose `dims` and `elems` disagree.
+    let budget = (b.len() / 4) as i64;
+    let mut count: i64 = 1;
+    for d in 0..ndim {
+        let at = 12 + d * 8;
+        let (len, lower) = (be(&b[at..at + 4]), be(&b[at + 4..at + 8]));
+        if len < 0 {
+            return Err(invalid_binary(ty));
+        }
+        // A dimension whose upper bound would not fit in i32 is not a value PG
+        // can have sent.
+        if i64::from(lower) + i64::from(len) - 1 > i64::from(i32::MAX) {
+            return Err(invalid_binary(ty));
+        }
+        count = count
+            .checked_mul(i64::from(len))
+            .filter(|c| *c <= budget)
+            .ok_or_else(|| invalid_binary(ty))?;
+        dims.push(crate::ArrayDim { lower, len });
     }
     let mut elems = Vec::with_capacity(count as usize);
-    let mut pos = 20;
+    let mut pos = 12 + ndim * 8;
     for _ in 0..count {
         if pos + 4 > b.len() {
             return Err(invalid_binary(ty));
@@ -182,7 +199,12 @@ fn decode_array(b: &[u8], ty: PgType, elem_oid: u32) -> Result<Value, CastError>
     if pos != b.len() {
         return Err(invalid_binary(ty));
     }
-    Ok(Value::Array { elem, elems })
+    // A dimension list whose lengths multiply out to zero describes no elements
+    // at all, which is the zero-dimension empty array rather than a shaped one.
+    if elems.is_empty() {
+        dims.clear();
+    }
+    Ok(Value::Array { elem, dims, elems })
 }
 
 /// `oidvectorrecv`/`int2vectorrecv`: PG sends these in the ordinary array binary
@@ -288,16 +310,15 @@ impl Value {
             // after the element OID, twelve bytes. Probed against PostgreSQL
             // 18.4 via `COPY … (FORMAT binary)` and pinned byte for byte by
             // `array_binary_layout_matches_pg` below.
-            Value::Array { elem, elems } => {
+            Value::Array { elem, dims, elems } => {
                 let mut out = Vec::with_capacity(20 + elems.len() * 8);
-                let empty = elems.is_empty();
                 let has_nulls = elems.iter().any(|e| matches!(e, Value::Null));
-                out.extend_from_slice(&i32::from(!empty).to_be_bytes()); // ndim
+                out.extend_from_slice(&(dims.len() as i32).to_be_bytes()); // ndim
                 out.extend_from_slice(&i32::from(has_nulls).to_be_bytes());
                 out.extend_from_slice(&elem.oid().to_be_bytes());
-                if !empty {
-                    out.extend_from_slice(&(elems.len() as i32).to_be_bytes());
-                    out.extend_from_slice(&1i32.to_be_bytes()); // lower bound
+                for d in dims {
+                    out.extend_from_slice(&d.len.to_be_bytes());
+                    out.extend_from_slice(&d.lower.to_be_bytes());
                 }
                 for e in elems {
                     // `?`, so an element type with no binary form of its own
@@ -476,7 +497,7 @@ mod tests {
         #[rustfmt::skip]
         let cases = [
             (
-                Value::Array { elem: PgType::Int4, elems: vec![Value::Int4(1), Value::Null] },
+                Value::array_1d(PgType::Int4, vec![Value::Int4(1), Value::Null]),
                 PgType::Array(oid::INT4),
                 vec![
                     0, 0, 0, 1,     // ndim
@@ -489,15 +510,12 @@ mod tests {
                 ],
             ),
             (
-                Value::Array { elem: PgType::Int4, elems: vec![] },
+                Value::array_1d(PgType::Int4, vec![]),
                 PgType::Array(oid::INT4),
                 vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23],
             ),
             (
-                Value::Array {
-                    elem: PgType::Text,
-                    elems: vec![Value::Text("ab".into()), Value::Text(String::new())],
-                },
+                Value::array_1d(PgType::Text, vec![Value::Text("ab".into()), Value::Text(String::new())]),
                 PgType::Array(oid::TEXT),
                 vec![
                     0, 0, 0, 1,
@@ -510,7 +528,7 @@ mod tests {
                 ],
             ),
             (
-                Value::Array { elem: PgType::Bool, elems: vec![Value::Bool(true), Value::Bool(false)] },
+                Value::array_1d(PgType::Bool, vec![Value::Bool(true), Value::Bool(false)]),
                 PgType::Array(oid::BOOL),
                 vec![
                     0, 0, 0, 1,
@@ -536,7 +554,16 @@ mod tests {
         let ia = PgType::Array(oid::INT4);
         for bad in [
             vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 1, 0, 0, 0, 1], // count 1, no element
-            vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 0, 0, 0, 0, 0], // lower bound 0
+            vec![
+                0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 255, 255, 255, 255, 0, 0, 0, 1,
+            ], // length -1
+            vec![0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 0, 0, 0, 0, 1], // ndim past MAXDIM
+            // Three dimensions of `i32::MAX`: the element count their product
+            // implies does not fit in i64, let alone in these 36 bytes.
+            vec![
+                0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 23, 127, 255, 255, 255, 0, 0, 0, 1, 127, 255, 255,
+                255, 0, 0, 0, 1, 127, 255, 255, 255, 0, 0, 0, 1,
+            ],
             vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 25, 0, 0, 0, 0, 0, 0, 0, 1], // element type text
             vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 0],                      // ndim 0 with a tail
             vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23],                         // 1-D, no dim header
@@ -556,29 +583,40 @@ mod tests {
             );
         }
 
-        // A second dimension is `0A000`, not malformed input: PG sends it
-        // perfectly well and this build has nowhere to put it.
+        // A 2×2 `int4[]`, byte for byte as PostgreSQL 18.4 writes it under
+        // `COPY (SELECT ARRAY[[7,8],[9,10]]::int4[]) TO … (FORMAT binary)`:
+        // ndim, the has-nulls flag, the element OID, then per dimension its
+        // *length* followed by its lower bound, then the elements row-major.
         #[rustfmt::skip]
         let two_d = vec![
             0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 23,
-            0, 0, 0, 1, 0, 0, 0, 1,
-            0, 0, 0, 1, 0, 0, 0, 1,
+            0, 0, 0, 2, 0, 0, 0, 1,
+            0, 0, 0, 2, 0, 0, 0, 1,
             0, 0, 0, 4, 0, 0, 0, 7,
+            0, 0, 0, 4, 0, 0, 0, 8,
+            0, 0, 0, 4, 0, 0, 0, 9,
+            0, 0, 0, 4, 0, 0, 0, 10,
         ];
+        let matrix = Value::Array {
+            elem: PgType::Int4,
+            dims: vec![crate::ArrayDim { lower: 1, len: 2 }; 2],
+            elems: [7, 8, 9, 10].map(Value::Int4).to_vec(),
+        };
+        assert_eq!(decode_binary(ia, &two_d)?, matrix);
         assert_eq!(
-            decode_binary(ia, &two_d)
-                .expect_err("two-dimensional")
-                .sqlstate,
-            "0A000"
+            matrix
+                .encode_binary()?
+                .ok_or_else(|| anyhow::anyhow!("int4[][] encoded as NULL"))?,
+            two_d
         );
 
         // An element type with no binary form of its own propagates that error
         // rather than emitting a buffer the client would misread.
         assert_eq!(
-            Value::Array {
-                elem: PgType::Numeric,
-                elems: vec![Value::Numeric(crate::Numeric::from_i128(1))],
-            }
+            Value::array_1d(
+                PgType::Numeric,
+                vec![Value::Numeric(crate::Numeric::from_i128(1))]
+            )
             .encode_binary()
             .expect_err("numeric has no binary form")
             .sqlstate,

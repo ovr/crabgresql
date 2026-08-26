@@ -19,7 +19,7 @@ use crabgresql_types::{Interval, PgType, Value, arith, cast};
 // `crabgresql-types`, where the engine (column statistics) and the planner
 // (selectivity) can reach them too. Re-exported rather than moved-and-renamed so
 // every caller that knows them as `executor::compare_values` still compiles.
-pub(crate) use crabgresql_types::compare::{array_elems, uuid_of, vector_elems};
+pub(crate) use crabgresql_types::compare::{array_dims, array_elems, uuid_of, vector_elems};
 use crabgresql_types::compare::{compare_elementwise, int8, oid_of};
 pub use crabgresql_types::compare::{compare_values, compare_values_collated};
 
@@ -266,30 +266,48 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             let value = routines.call(*oid, arg_values, ctx, txn)?;
             coerce_value(value, *ret, ctx)
         }
-        BoundExpr::ArrayCtor { elem, elems, .. } => {
+        BoundExpr::ArrayCtor {
+            elem,
+            nested,
+            elems,
+            ..
+        } => {
             let values = elems
                 .iter()
                 .map(|e| eval(e, row, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Value::Array {
-                elem: *elem,
-                elems: values,
-            })
+            if *nested {
+                crabgresql_types::array::stack(*elem, &values)
+                    .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
+            } else {
+                Ok(Value::array_1d(*elem, values))
+            }
         }
-        // `a[i]`: element access. A NULL base or NULL/out-of-range subscript
-        // yields NULL (PG semantics), never an error.
-        BoundExpr::Subscript { base, index, .. } => {
+        // `a[i]` / `a[i][j]`: element access. A NULL base or NULL/out-of-range
+        // subscript yields NULL (PG semantics), never an error.
+        BoundExpr::Subscript { base, indexes, .. } => {
             let base = eval(base, row, ctx)?;
             // Evaluated before the base is inspected, so a NULL base still
             // raises whatever the subscript expression raises:
             // `(NULL::int[])[1/0]` is a division-by-zero error, not NULL.
-            let idx = eval(index, row, ctx)?;
-            // An array's lower bound is 1, but `oidvector`/`int2vector` are
-            // stored with a lower bound of 0, so `('11 22 33'::oidvector)[0]` is
-            // `11` where `(array[11,22,33])[0]` is NULL. See `types::vector`.
-            let (elems, lower) = match &base {
-                Value::Array { elems, .. } => (elems, 1i32),
-                Value::Vector { elems, .. } => (elems, 0i32),
+            let subscripts = indexes
+                .iter()
+                .map(|i| eval(i, row, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            // An array carries its own bounds. A vector has none of its own: it
+            // is always one dimension with a lower bound of **0**, so
+            // `('11 22 33'::oidvector)[0]` is `11` where `(array[11,22,33])[0]`
+            // is NULL. See `types::vector`.
+            let vector_dim;
+            let (elems, dims) = match &base {
+                Value::Array { elems, dims, .. } => (elems, dims.as_slice()),
+                Value::Vector { elems, .. } => {
+                    vector_dim = [crabgresql_types::ArrayDim {
+                        lower: 0,
+                        len: elems.len() as i32,
+                    }];
+                    (elems, vector_dim.as_slice())
+                }
                 // NULL base → NULL element.
                 Value::Null => return Ok(Value::Null),
                 other => {
@@ -299,24 +317,34 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
                     ));
                 }
             };
-            let i = match idx {
-                Value::Int4(i) => i,
-                Value::Null => return Ok(Value::Null),
-                other => {
-                    return Err(ExecError::new(
-                        sqlstate::INTERNAL_ERROR,
-                        format!("array subscript is not an int4: {other:?}"),
-                    ));
-                }
-            };
-            // Outside `[lower, lower + len)` is NULL. The offset is computed in
-            // i64 so a subscript near `i32::MIN`/`MAX` cannot wrap into range.
-            let offset = i64::from(i) - i64::from(lower);
-            if offset < 0 || offset >= elems.len() as i64 {
-                Ok(Value::Null)
-            } else {
-                Ok(elems[offset as usize].clone())
+            // Under-subscripting (`(ARRAY[[1,2],[3,4]])[1]`) or over-subscripting
+            // is NULL rather than an error, and so is any subscript of an empty
+            // array, which has no dimensions at all.
+            if subscripts.len() != dims.len() {
+                return Ok(Value::Null);
             }
+            // Row-major: each subscript indexes a block of the stride below it.
+            // Offsets are computed in i64 so a subscript near `i32::MIN`/`MAX`
+            // cannot wrap into range.
+            let mut offset = 0i64;
+            for (idx, dim) in subscripts.iter().zip(dims) {
+                let i = match idx {
+                    Value::Int4(i) => *i,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(ExecError::new(
+                            sqlstate::INTERNAL_ERROR,
+                            format!("array subscript is not an int4: {other:?}"),
+                        ));
+                    }
+                };
+                let at = i64::from(i) - i64::from(dim.lower);
+                if at < 0 || at >= i64::from(dim.len) {
+                    return Ok(Value::Null);
+                }
+                offset = offset * i64::from(dim.len) + at;
+            }
+            Ok(elems[offset as usize].clone())
         }
         // CASE tests conditions top-to-bottom and evaluates only the winning
         // branch's result (false and NULL conditions both skip); a missing ELSE
@@ -541,32 +569,141 @@ fn eval_array_ctor_fn(
             _ => None,
         }
     };
+    // `array_append`/`array_prepend` grow a list, which only makes sense along a
+    // single dimension; PG refuses anything else with `22000`.
+    let one_dimensional = |v: &Value| match v {
+        Value::Array { dims, .. } if dims.len() > 1 => Err(ExecError::new(
+            "22000",
+            "argument must be empty or one-dimensional array",
+        )),
+        Value::Array { dims, .. } => Ok(dims.first().map_or(1, |d| d.lower)),
+        // A NULL array counts as empty, and an empty one has no bounds to keep.
+        _ => Ok(1),
+    };
     let result = match func {
         // `array_cat(a, b)`: a NULL side is treated as empty; both NULL → NULL.
         ScalarFn::ArrayCat => match (elems_of(&args[0]), elems_of(&args[1])) {
             (None, None) => return Some(Ok(Value::Null)),
-            (a, b) => {
-                let mut elems = a.unwrap_or_default();
-                elems.extend(b.unwrap_or_default());
-                Value::Array { elem, elems }
-            }
+            _ => match array_cat(elem, &args[0], &args[1]) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            },
         },
         // `array_append(arr, e)`: a NULL array is treated as empty; `e` (possibly
-        // NULL) is appended.
+        // NULL) is appended. The array's lower bound survives, so appending to
+        // `'[4:5]={1,2}'` yields `[4:6]`.
         ScalarFn::ArrayAppend => {
+            let lower = match one_dimensional(&args[0]) {
+                Ok(lower) => lower,
+                Err(e) => return Some(Err(e)),
+            };
             let mut elems = elems_of(&args[0]).unwrap_or_default();
             elems.push(args[1].clone());
-            Value::Array { elem, elems }
+            rebound(elem, lower, elems)
         }
-        // `array_prepend(e, arr)`: `e` (possibly NULL) is prepended.
+        // `array_prepend(e, arr)`: `e` (possibly NULL) is prepended. As with
+        // append the lower bound is kept rather than shifted, so prepending to
+        // `'[4:5]={1,2}'` yields `[4:6]={9,1,2}` — the elements move, the bounds
+        // do not.
         ScalarFn::ArrayPrepend => {
+            let lower = match one_dimensional(&args[1]) {
+                Ok(lower) => lower,
+                Err(e) => return Some(Err(e)),
+            };
             let mut elems = vec![args[0].clone()];
             elems.extend(elems_of(&args[1]).unwrap_or_default());
-            Value::Array { elem, elems }
+            rebound(elem, lower, elems)
         }
         _ => unreachable!(),
     };
     Some(Ok(result))
+}
+
+/// A 1-D array of `elems` starting at `lower`.
+fn rebound(elem: PgType, lower: i32, elems: Vec<Value>) -> Value {
+    let dims = if elems.is_empty() {
+        Vec::new()
+    } else {
+        vec![crabgresql_types::ArrayDim {
+            lower,
+            len: elems.len() as i32,
+        }]
+    };
+    Value::Array { elem, dims, elems }
+}
+
+/// `array_cat(a, b)` / `a || b` over arrays of any dimensionality.
+///
+/// Two arrays of the same shape join along their **first** dimension, which is
+/// the only one that can grow: the rest of the shape has to match exactly. An
+/// operand with one dimension *fewer* is a single slice of the other and is
+/// joined the same way. Any wider gap, or a shape mismatch below the first
+/// dimension, is PG's `2202E`.
+///
+/// The subscript bounds come from whichever operand has more dimensions (the
+/// left one at a tie), which is why `'[4:5]={1,2}' || '{7,8}'` is `[4:7]`.
+fn array_cat(elem: PgType, a: &Value, b: &Value) -> Result<Value, ExecError> {
+    let incompatible = |detail: String| {
+        ExecError::new("2202E", "cannot concatenate incompatible arrays").with_detail(Some(detail))
+    };
+    // A NULL or empty operand contributes nothing at all — not even a shape.
+    fn parts(v: &Value) -> Option<(&[crabgresql_types::ArrayDim], &[Value])> {
+        match v {
+            Value::Array { dims, elems, .. } if !elems.is_empty() => {
+                Some((dims.as_slice(), elems.as_slice()))
+            }
+            _ => None,
+        }
+    }
+    let (Some((da, ea)), Some((db, eb))) = (parts(a), parts(b)) else {
+        return Ok(match (parts(a), parts(b)) {
+            (Some(_), _) => a.clone(),
+            (_, Some(_)) => b.clone(),
+            _ => Value::array_1d(elem, Vec::new()),
+        });
+    };
+    let mut elems = ea.to_vec();
+    elems.extend_from_slice(eb);
+    let dims = match (da.len() as i64) - (db.len() as i64) {
+        // Same shape: the first dimension is the sum, the rest must agree.
+        0 => {
+            if da[1..] != db[1..] {
+                return Err(incompatible(
+                    "Arrays with differing element dimensions are not compatible for concatenation."
+                        .to_string(),
+                ));
+            }
+            let mut dims = da.to_vec();
+            dims[0].len += db[0].len;
+            dims
+        }
+        // `b` is one slice of `a` (or the mirror image), so its whole shape has
+        // to match what a slice of the other looks like.
+        1 | -1 => {
+            let (outer, slice) = if da.len() > db.len() {
+                (da, db)
+            } else {
+                (db, da)
+            };
+            if outer[1..] != *slice {
+                return Err(incompatible(
+                    "Arrays with differing dimensions are not compatible for concatenation."
+                        .to_string(),
+                ));
+            }
+            let mut dims = outer.to_vec();
+            dims[0].len += 1;
+            dims
+        }
+        _ => {
+            return Err(incompatible(format!(
+                "Arrays of {} and {} dimensions are not compatible for concatenation.",
+                da.len(),
+                db.len()
+            )));
+        }
+    };
+    Ok(Value::Array { elem, dims, elems })
 }
 
 /// Dispatch the transaction-state functions. Returns `None` for any other
@@ -1008,14 +1145,13 @@ fn eval_catalog_fn(
         // before the `oid_of` below.
         ScalarFn::CurrentSchemas => {
             let include_implicit = matches!(args[0], Value::Bool(true));
-            return Some(Ok(Value::Array {
-                elem: crabgresql_types::PgType::Name,
-                elems: ops
-                    .search_path(include_implicit)
+            return Some(Ok(Value::array_1d(
+                crabgresql_types::PgType::Name,
+                ops.search_path(include_implicit)
                     .into_iter()
                     .map(Value::Text)
                     .collect(),
-            }));
+            )));
         }
         _ => {}
     }

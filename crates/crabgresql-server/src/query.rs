@@ -7884,7 +7884,7 @@ fn execute_call(
     // would evaluate its elements uncoerced.
     if let Some(elem) = sig.variadic_elem.filter(|_| !variadic_call) {
         let elems = values.split_off(sig.arg_types.len() - 1);
-        values.push(Value::Array { elem, elems });
+        values.push(Value::array_1d(elem, elems));
     }
 
     if let Err(e) = routines.call(sig.oid, values, &exec_ctx, &txn) {

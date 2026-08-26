@@ -2583,9 +2583,10 @@ fn array_arg_type(b: &Binding) -> Option<(PgType, PgType)> {
     }
 }
 
-/// The argument type of the three size-reporting functions — `cardinality`,
-/// `array_length`, `array_upper` — which read only how many elements a value has
-/// and so accept `oidvector`/`int2vector` as well as a real array.
+/// The argument type of the shape-reporting functions — `cardinality`,
+/// `array_length`, `array_upper`, `array_lower`, `array_ndims`, `array_dims` —
+/// which read only a value's shape and so accept `oidvector`/`int2vector` as
+/// well as a real array.
 ///
 /// Deliberately *not* folded into [`array_arg_type`]. PostgreSQL gives the
 /// vectors a `typelem`, so every `anyarray` function accepts them there; here
@@ -2795,13 +2796,25 @@ pub(crate) fn bind_array_function(
                 vec![resolve_operand(b, arg_ty)?],
             )
         }
-        "array_length" | "array_upper" => {
+        "array_ndims" | "array_dims" => {
+            let [b] = bindings else {
+                return Err(undefined());
+            };
+            let (func, ret) = match name {
+                "array_ndims" => (ScalarFn::ArrayNdims, PgType::Int4),
+                _ => (ScalarFn::ArrayDims, PgType::Text),
+            };
+            let arg_ty = size_arg_type(b).ok_or_else(undefined)?;
+            call(func, ret, vec![resolve_operand(b, arg_ty)?])
+        }
+        "array_length" | "array_upper" | "array_lower" => {
             let [a, dim] = bindings else {
                 return Err(undefined());
             };
             let func = match name {
                 "array_length" => ScalarFn::ArrayLength,
-                _ => ScalarFn::ArrayUpper,
+                "array_upper" => ScalarFn::ArrayUpper,
+                _ => ScalarFn::ArrayLower,
             };
             let arg_ty = size_arg_type(a).ok_or_else(undefined)?;
             call(

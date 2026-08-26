@@ -548,7 +548,7 @@ impl Accumulator {
                             compare_element(*elem, a, b, *collation) == Ordering::Equal
                         });
                     }
-                    Value::Array { elem: *elem, elems }
+                    Value::array_1d(*elem, elems)
                 }
             },
         })

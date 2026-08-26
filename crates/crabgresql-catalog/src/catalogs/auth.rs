@@ -133,14 +133,13 @@ fn config(role: &CatalogRole) -> Value {
     if role.config.is_empty() {
         return Value::Null;
     }
-    Value::Array {
-        elem: PgType::Text,
-        elems: role
-            .config
+    Value::array_1d(
+        PgType::Text,
+        role.config
             .iter()
             .map(|entry| Value::Text(entry.clone()))
             .collect(),
-    }
+    )
 }
 
 /// The shared column list of `pg_user` and `pg_shadow`: the login roles, under
@@ -232,14 +231,14 @@ pub(crate) fn pg_group_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             vec![
                 Value::Text(r.name.clone()),
                 Value::Oid(r.oid),
-                Value::Array {
-                    elem: PgType::Oid,
-                    elems: members
+                Value::array_1d(
+                    PgType::Oid,
+                    members
                         .iter()
                         .filter(|m| m.role == r.oid)
                         .map(|m| Value::Oid(m.member))
                         .collect(),
-                },
+                ),
             ]
         })
         .collect()

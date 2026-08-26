@@ -625,9 +625,11 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         | BoundExpr::Coalesce { args, .. }
         | BoundExpr::MinMax { args, .. } => subst_exprs(args, params),
         BoundExpr::ArrayCtor { elems, .. } => subst_exprs(elems, params),
-        BoundExpr::Subscript { base, index, .. } => {
+        BoundExpr::Subscript { base, indexes, .. } => {
             subst_expr(base, params);
-            subst_expr(index, params);
+            for i in indexes {
+                subst_expr(i, params);
+            }
         }
         BoundExpr::Case { whens, else_, .. } => {
             for (cond, result) in whens {
@@ -986,9 +988,11 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
                 subst_outer_expr(a, outer, depth);
             }
         }
-        BoundExpr::Subscript { base, index, .. } => {
+        BoundExpr::Subscript { base, indexes, .. } => {
             subst_outer_expr(base, outer, depth);
-            subst_outer_expr(index, outer, depth);
+            for i in indexes {
+                subst_outer_expr(i, outer, depth);
+            }
         }
         BoundExpr::Case { whens, else_, .. } => {
             for (cond, result) in whens {
@@ -1425,9 +1429,11 @@ pub(crate) fn for_each_subexpr(
         BoundExpr::ArrayCtor { elems, .. } => {
             elems.iter().for_each(|e| for_each_subexpr(e, depth, f));
         }
-        BoundExpr::Subscript { base, index, .. } => {
+        BoundExpr::Subscript { base, indexes, .. } => {
             for_each_subexpr(base, depth, f);
-            for_each_subexpr(index, depth, f);
+            for i in indexes {
+                for_each_subexpr(i, depth, f);
+            }
         }
         BoundExpr::Case { whens, else_, .. } => {
             for (condition, result) in whens {
@@ -5520,8 +5526,14 @@ fn rewrite_over_window(
             ret,
             args: rewrite_all_over_window(args, input_width, groups)?,
         }),
-        BoundExpr::ArrayCtor { elem, ty, elems } => Ok(BoundExpr::ArrayCtor {
+        BoundExpr::ArrayCtor {
             elem,
+            nested,
+            ty,
+            elems,
+        } => Ok(BoundExpr::ArrayCtor {
+            elem,
+            nested,
             ty,
             elems: rewrite_all_over_window(elems, input_width, groups)?,
         }),
@@ -5540,9 +5552,9 @@ fn rewrite_over_window(
             ty,
             collation,
         }),
-        BoundExpr::Subscript { base, index, ty } => Ok(BoundExpr::Subscript {
+        BoundExpr::Subscript { base, indexes, ty } => Ok(BoundExpr::Subscript {
             base: Box::new(rewrite_over_window(*base, input_width, groups)?),
-            index: Box::new(rewrite_over_window(*index, input_width, groups)?),
+            indexes: rewrite_all_over_window(indexes, input_width, groups)?,
             ty,
         }),
         BoundExpr::Case { whens, else_, ty } => Ok(BoundExpr::Case {
@@ -5937,12 +5949,22 @@ fn rewrite_over_aggregate(
                 ret,
             })
         }
-        BoundExpr::ArrayCtor { elem, ty, elems } => {
+        BoundExpr::ArrayCtor {
+            elem,
+            nested,
+            ty,
+            elems,
+        } => {
             let elems = elems
                 .into_iter()
                 .map(|a| rewrite_over_aggregate(a, group_exprs, aggregates, scope))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(BoundExpr::ArrayCtor { elem, ty, elems })
+            Ok(BoundExpr::ArrayCtor {
+                elem,
+                nested,
+                ty,
+                elems,
+            })
         }
         BoundExpr::Coalesce { args, ty } => {
             let args = args
@@ -5968,19 +5990,17 @@ fn rewrite_over_aggregate(
                 collation,
             })
         }
-        BoundExpr::Subscript { base, index, ty } => Ok(BoundExpr::Subscript {
+        BoundExpr::Subscript { base, indexes, ty } => Ok(BoundExpr::Subscript {
             base: Box::new(rewrite_over_aggregate(
                 *base,
                 group_exprs,
                 aggregates,
                 scope,
             )?),
-            index: Box::new(rewrite_over_aggregate(
-                *index,
-                group_exprs,
-                aggregates,
-                scope,
-            )?),
+            indexes: indexes
+                .into_iter()
+                .map(|i| rewrite_over_aggregate(i, group_exprs, aggregates, scope))
+                .collect::<Result<Vec<_>, _>>()?,
             ty,
         }),
         BoundExpr::Case { whens, else_, ty } => {

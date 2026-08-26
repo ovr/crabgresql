@@ -251,21 +251,31 @@ pub enum BoundExpr {
         args: Vec<BoundExpr>,
         ret: PgType,
     },
-    /// An array constructor (`ARRAY[a, b, c]` or `ARRAY[]::t[]`). Every element
-    /// is already coerced to `elem`, the common element type; `ty` is the
-    /// resulting `PgType::Array(elem.oid())`. Evaluates element-wise to a
+    /// An array constructor (`ARRAY[a, b, c]` or `ARRAY[]::t[]`). `ty` is the
+    /// resulting `PgType::Array(elem.oid())`, and evaluation produces a
     /// [`Value::Array`].
+    ///
+    /// `nested` says what the operands in `elems` are. Normally they are the
+    /// array's *elements*, each already coerced to `elem`. When it is set —
+    /// `ARRAY[[1,2],[3,4]]`, `ARRAY[ARRAY[…]]` — they are whole sub-arrays of
+    /// type `ty` instead, and the constructor stacks them into one more
+    /// dimension. The flag exists so that the "every operand has type `elem`"
+    /// invariant cannot quietly stop holding: PG has no nested array type, so
+    /// `ty` alone does not distinguish the two shapes.
     ArrayCtor {
         elem: PgType,
+        nested: bool,
         ty: PgType,
         elems: Vec<BoundExpr>,
     },
-    /// Array element access (`a[i]`). `base` is an array expression, `index` is
-    /// an int4; the result type `ty` is the element type. A NULL or out-of-range
-    /// subscript yields NULL (PG semantics), never an error.
+    /// Array element access (`a[i]`, `a[i][j]`). `base` is an array expression
+    /// and `indexes` holds one int4 per subscript written; the result type `ty`
+    /// is the element type. A NULL or out-of-range subscript yields NULL (PG
+    /// semantics), never an error — and so does a subscript count that does not
+    /// match the value's own number of dimensions, which is not knowable here.
     Subscript {
         base: Box<BoundExpr>,
-        index: Box<BoundExpr>,
+        indexes: Vec<BoundExpr>,
         ty: PgType,
     },
     /// `CASE`: WHEN conditions are boolean and evaluated top-to-bottom; the
@@ -746,7 +756,9 @@ impl BoundExpr {
                     || spec.exprs().any(BoundExpr::contains_srf)
             }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_srf),
-            BoundExpr::Subscript { base, index, .. } => base.contains_srf() || index.contains_srf(),
+            BoundExpr::Subscript { base, indexes, .. } => {
+                base.contains_srf() || indexes.iter().any(BoundExpr::contains_srf)
+            }
             BoundExpr::Case { whens, else_, .. } => {
                 whens
                     .iter()
@@ -802,7 +814,7 @@ impl BoundExpr {
                 kind.args().iter().any(any) || spec.exprs().any(any)
             }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(any),
-            BoundExpr::Subscript { base, index, .. } => any(base) || any(index),
+            BoundExpr::Subscript { base, indexes, .. } => any(base) || indexes.iter().any(any),
             BoundExpr::Case { whens, else_, .. } => {
                 whens
                     .iter()
@@ -856,8 +868,8 @@ impl BoundExpr {
             | BoundExpr::Coalesce { args, .. }
             | BoundExpr::MinMax { args, .. } => args.iter().any(BoundExpr::contains_aggregate),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_aggregate),
-            BoundExpr::Subscript { base, index, .. } => {
-                base.contains_aggregate() || index.contains_aggregate()
+            BoundExpr::Subscript { base, indexes, .. } => {
+                base.contains_aggregate() || indexes.iter().any(BoundExpr::contains_aggregate)
             }
             BoundExpr::Case { whens, else_, .. } => {
                 whens
@@ -926,8 +938,8 @@ impl BoundExpr {
                 agg_args, order_by, ..
             } => Self::agg_exprs(agg_args, order_by).any(BoundExpr::contains_window),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_window),
-            BoundExpr::Subscript { base, index, .. } => {
-                base.contains_window() || index.contains_window()
+            BoundExpr::Subscript { base, indexes, .. } => {
+                base.contains_window() || indexes.iter().any(BoundExpr::contains_window)
             }
             BoundExpr::Case { whens, else_, .. } => {
                 whens
@@ -983,9 +995,9 @@ impl BoundExpr {
             | BoundExpr::Coalesce { args, .. }
             | BoundExpr::MinMax { args, .. } => first(args),
             BoundExpr::ArrayCtor { elems, .. } => first(elems),
-            BoundExpr::Subscript { base, index, .. } => base
-                .first_agg_or_window()
-                .or_else(|| index.first_agg_or_window()),
+            BoundExpr::Subscript { base, indexes, .. } => {
+                base.first_agg_or_window().or_else(|| first(indexes))
+            }
             BoundExpr::Case { whens, else_, .. } => {
                 for (cond, result) in whens {
                     if let Some(found) = cond
@@ -1073,8 +1085,8 @@ impl BoundExpr {
                     || spec.exprs().any(BoundExpr::contains_volatile_fn)
             }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_volatile_fn),
-            BoundExpr::Subscript { base, index, .. } => {
-                base.contains_volatile_fn() || index.contains_volatile_fn()
+            BoundExpr::Subscript { base, indexes, .. } => {
+                base.contains_volatile_fn() || indexes.iter().any(BoundExpr::contains_volatile_fn)
             }
             BoundExpr::Unary { expr, .. }
             | BoundExpr::IsNull { expr, .. }
@@ -1149,8 +1161,8 @@ impl BoundExpr {
                     || spec.exprs().any(BoundExpr::contains_subquery)
             }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_subquery),
-            BoundExpr::Subscript { base, index, .. } => {
-                base.contains_subquery() || index.contains_subquery()
+            BoundExpr::Subscript { base, indexes, .. } => {
+                base.contains_subquery() || indexes.iter().any(BoundExpr::contains_subquery)
             }
             BoundExpr::Case { whens, else_, .. } => {
                 whens
@@ -1193,9 +1205,13 @@ impl BoundExpr {
             BoundExpr::ArrayCtor { elems, .. } => {
                 elems.iter().map(|a| a.count_param_refs(index)).sum()
             }
-            BoundExpr::Subscript {
-                base, index: idx, ..
-            } => base.count_param_refs(index) + idx.count_param_refs(index),
+            BoundExpr::Subscript { base, indexes, .. } => {
+                base.count_param_refs(index)
+                    + indexes
+                        .iter()
+                        .map(|i| i.count_param_refs(index))
+                        .sum::<usize>()
+            }
             BoundExpr::Case { whens, else_, .. } => {
                 whens
                     .iter()
@@ -1266,9 +1282,9 @@ impl BoundExpr {
                     args.iter().for_each(|a| fold(a, acc));
                 }
                 BoundExpr::ArrayCtor { elems, .. } => elems.iter().for_each(|a| fold(a, acc)),
-                BoundExpr::Subscript { base, index, .. } => {
+                BoundExpr::Subscript { base, indexes, .. } => {
                     fold(base, acc);
-                    fold(index, acc);
+                    indexes.iter().for_each(|i| fold(i, acc));
                 }
                 BoundExpr::Case { whens, else_, .. } => {
                     for (c, r) in whens {
@@ -1368,8 +1384,12 @@ impl BoundExpr {
                 agg_args, order_by, ..
             } => Self::agg_exprs(agg_args, order_by).all(|a| a.collect_column_refs(out)),
             BoundExpr::ArrayCtor { elems, .. } => Self::collect_all(elems, out),
-            BoundExpr::Subscript { base, index, .. } => {
-                base.collect_column_refs(out) && index.collect_column_refs(out)
+            BoundExpr::Subscript { base, indexes, .. } => {
+                let mut complete = base.collect_column_refs(out);
+                for i in indexes {
+                    complete &= i.collect_column_refs(out);
+                }
+                complete
             }
             BoundExpr::Case { whens, else_, .. } => {
                 let mut complete = true;
@@ -1491,9 +1511,11 @@ impl BoundExpr {
             BoundExpr::ArrayCtor { elems, .. } => {
                 elems.iter_mut().for_each(|e| e.shift_column_refs(delta));
             }
-            BoundExpr::Subscript { base, index, .. } => {
+            BoundExpr::Subscript { base, indexes, .. } => {
                 base.shift_column_refs(delta);
-                index.shift_column_refs(delta);
+                for i in indexes {
+                    i.shift_column_refs(delta);
+                }
             }
             BoundExpr::Case { whens, else_, .. } => {
                 for (c, r) in whens {

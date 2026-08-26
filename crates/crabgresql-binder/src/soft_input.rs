@@ -414,11 +414,10 @@ mod tests {
     /// be told apart from a typo without a catalog, and stays 42704.
     #[test]
     fn unmodelled_spec_keeps_its_not_supported_error() {
-        assert_eq!(
-            hard("int4[][]"),
-            "0A000: type \"INT4[][]\" is not supported yet"
-        );
         assert_eq!(hard("xml[]"), "0A000: type \"xml\" is not supported yet");
+        // The refusal comes from the *element* type, so extra `[]` do not change
+        // it — `int4[][]` is a supported spec, `xml[][]` is not.
+        assert_eq!(hard("xml[][]"), "0A000: type \"xml\" is not supported yet");
     }
 
     #[test]

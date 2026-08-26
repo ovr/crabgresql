@@ -116,9 +116,11 @@ fn fold_children(
                 changed |= fold(elem, fmt, on_subplan);
             }
         }
-        BoundExpr::Subscript { base, index, .. } => {
+        BoundExpr::Subscript { base, indexes, .. } => {
             changed |= fold(base, fmt, on_subplan);
-            changed |= fold(index, fmt, on_subplan);
+            for i in indexes {
+                changed |= fold(i, fmt, on_subplan);
+            }
         }
         BoundExpr::Case { whens, else_, .. } => {
             for (condition, result) in whens {
@@ -239,15 +241,24 @@ fn eval_const(expr: &BoundExpr, fmt: &FmtCtx) -> Option<Value> {
         }
         // Never folded — see `foldable`.
         BoundExpr::CoerceToDomain { .. } => None,
-        BoundExpr::ArrayCtor { elem, elems, .. } => {
+        BoundExpr::ArrayCtor {
+            elem,
+            nested,
+            elems,
+            ..
+        } => {
             let values = elems
                 .iter()
                 .map(|e| eval_const(e, fmt))
                 .collect::<Option<Vec<_>>>()?;
-            Some(Value::Array {
-                elem: *elem,
-                elems: values,
-            })
+            if *nested {
+                // A constructor that cannot be stacked — ragged operands, or one
+                // dimension too many — has no value to fold to, and the executor
+                // is what raises for it at run time.
+                crabgresql_types::array::stack(*elem, &values).ok()
+            } else {
+                Some(Value::array_1d(*elem, values))
+            }
         }
         // Lazy, as at run time: only the arm that is reached is evaluated, so
         // `CASE WHEN false THEN 1/0 ELSE 1 END` folds to `1`.

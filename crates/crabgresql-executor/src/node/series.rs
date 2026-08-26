@@ -150,19 +150,27 @@ pub(crate) fn unnest_series(values: &[Value]) -> Series {
 /// `reverse` is true).
 ///
 /// The function is STRICT, so a NULL argument yields no rows, and so does a
-/// dimension the value does not have — including every `dim` other than 1 here,
-/// since the engine's arrays are one-dimensional. An array's lower bound is 1;
-/// `oidvector`/`int2vector` are stored from 0, the same convention subscripting
-/// follows (see `eval`'s `Subscript` arm).
+/// dimension the value does not have — which for an empty array is every one of
+/// them. `oidvector`/`int2vector` have exactly one dimension, stored from 0, the
+/// same convention subscripting follows (see `eval`'s `Subscript` arm).
 pub(crate) fn generate_subscripts_series(values: &[Value]) -> Series {
+    let Some(Value::Int4(dim)) = values.get(1) else {
+        return Series::Empty;
+    };
     let (len, lower) = match values.first() {
-        Some(Value::Array { elems, .. }) => (elems.len(), 1i64),
-        Some(Value::Vector { elems, .. }) => (elems.len(), 0i64),
+        Some(Value::Array { dims, .. }) => {
+            let Some(d) = usize::try_from(*dim)
+                .ok()
+                .and_then(|d| d.checked_sub(1))
+                .and_then(|d| dims.get(d))
+            else {
+                return Series::Empty;
+            };
+            (d.len as usize, i64::from(d.lower))
+        }
+        Some(Value::Vector { elems, .. }) if *dim == 1 => (elems.len(), 0i64),
         _ => return Series::Empty,
     };
-    if !matches!(values.get(1), Some(Value::Int4(1))) {
-        return Series::Empty;
-    }
     let reverse = match values.get(2) {
         None | Some(Value::Bool(false)) => false,
         Some(Value::Bool(true)) => true,

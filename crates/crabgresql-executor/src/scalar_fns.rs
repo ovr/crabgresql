@@ -25,7 +25,7 @@ use crabgresql_types::{
 };
 
 use crate::ExecError;
-use crate::eval::{arith_error, array_elems, uuid_of};
+use crate::eval::{arith_error, array_dims, array_elems, uuid_of};
 use crate::hash;
 
 const RADIANS_PER_DEGREE: f64 = 0.017_453_292_519_943_295;
@@ -446,7 +446,12 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // it is empty — PostgreSQL 18.4 prints `array_dims(''::oidvector)` as
         // `[0:-1]`, so an empty vector's length is 0 where an empty array's is
         // NULL. `array_elems` panics on a vector, so this arm has to come first.
-        ScalarFn::ArrayLength | ScalarFn::ArrayUpper | ScalarFn::Cardinality
+        ScalarFn::ArrayLength
+        | ScalarFn::ArrayUpper
+        | ScalarFn::ArrayLower
+        | ScalarFn::ArrayNdims
+        | ScalarFn::ArrayDims
+        | ScalarFn::Cardinality
             if matches!(&args[0], Value::Vector { .. }) =>
         {
             let Value::Vector { elems, .. } = &args[0] else {
@@ -455,22 +460,46 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
             let len = elems.len() as i32;
             return Ok(match func {
                 ScalarFn::Cardinality => Value::Int4(len),
+                // A vector always *has* its one dimension, so unlike an empty
+                // array an empty one still reports it — as `[0:-1]`.
+                ScalarFn::ArrayNdims => Value::Int4(1),
+                ScalarFn::ArrayDims => Value::Text(format!("[0:{}]", len - 1)),
                 _ if i4(&args[1]) != 1 => Value::Null,
                 ScalarFn::ArrayUpper => Value::Int4(len - 1),
+                ScalarFn::ArrayLower => Value::Int4(0),
                 _ => Value::Int4(len),
             });
         }
-        ScalarFn::ArrayLength | ScalarFn::ArrayUpper => {
-            // `array_length(arr, dim)` / `array_upper(arr, dim)`: for a
-            // one-dimensional value the 1-based upper bound of dimension 1 is
-            // its length. An empty array or any other dimension yields NULL.
-            // TODO: answer for dimensions above 1 once multi-dimensional arrays
-            // are modeled.
-            let elems = array_elems(&args[0]);
-            return Ok(if i4(&args[1]) == 1 && !elems.is_empty() {
-                Value::Int4(elems.len() as i32)
-            } else {
-                Value::Null
+        // A dimension the value does not have — including any dimension of an
+        // empty array, which has none — yields NULL.
+        ScalarFn::ArrayLength | ScalarFn::ArrayUpper | ScalarFn::ArrayLower => {
+            let dim = i4(&args[1]);
+            let Some(d) = usize::try_from(dim)
+                .ok()
+                .and_then(|d| d.checked_sub(1))
+                .and_then(|d| array_dims(&args[0]).get(d))
+            else {
+                return Ok(Value::Null);
+            };
+            return Ok(Value::Int4(match func {
+                ScalarFn::ArrayUpper => d.upper(),
+                ScalarFn::ArrayLower => d.lower,
+                _ => d.len,
+            }));
+        }
+        // Both are NULL for an empty array rather than 0 or `[1:0]`.
+        ScalarFn::ArrayNdims | ScalarFn::ArrayDims => {
+            let dims = array_dims(&args[0]);
+            if dims.is_empty() {
+                return Ok(Value::Null);
+            }
+            return Ok(match func {
+                ScalarFn::ArrayNdims => Value::Int4(dims.len() as i32),
+                _ => Value::Text(
+                    dims.iter()
+                        .map(|d| format!("[{}:{}]", d.lower, d.upper()))
+                        .collect(),
+                ),
             });
         }
         ScalarFn::Cardinality => {
@@ -2263,13 +2292,13 @@ fn eval_ts<'a>(f: TsFn, args: &'a [Value]) -> Result<Value, ExecError> {
             }
             Value::Tsvector(tsvector::ts_filter(vector(&args[0]), &weights))
         }
-        TsFn::VectorToArray => Value::Array {
-            elem: PgType::Text,
-            elems: tsvector::to_array(vector(&args[0]))
+        TsFn::VectorToArray => Value::array_1d(
+            PgType::Text,
+            tsvector::to_array(vector(&args[0]))
                 .into_iter()
                 .map(Value::Text)
                 .collect(),
-        },
+        ),
         TsFn::ArrayToVector => {
             Value::Tsvector(tsvector::from_array(&words(&args[0])).map_err(ts_err)?)
         }

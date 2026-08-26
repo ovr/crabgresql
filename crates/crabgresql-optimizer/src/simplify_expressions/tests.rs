@@ -293,6 +293,7 @@ fn an_any_all_template_keeps_its_shape() {
     let folded = rewrite(BoundExpr::QuantifiedArray {
         array: Box::new(BoundExpr::ArrayCtor {
             elem: PgType::Int4,
+            nested: false,
             ty: PgType::Array(PgType::Int4.oid()),
             elems: vec![int4(1), int4(5)],
         }),

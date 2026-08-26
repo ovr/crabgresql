@@ -335,7 +335,9 @@ pub(crate) fn is_relocatable(expr: &BoundExpr) -> bool {
                 agg_args, order_by, ..
             } => BoundExpr::agg_exprs(agg_args, order_by).any(opaque),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(opaque),
-            BoundExpr::Subscript { base, index, .. } => opaque(base) || opaque(index),
+            BoundExpr::Subscript { base, indexes, .. } => {
+                opaque(base) || indexes.iter().any(opaque)
+            }
             BoundExpr::Case { whens, else_, .. } => {
                 whens.iter().any(|(c, r)| opaque(c) || opaque(r))
                     || else_.as_deref().is_some_and(opaque)

@@ -896,16 +896,19 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
         (Value::Text(s), PgType::Array(elem_oid)) => {
             let elem = PgType::from_oid(elem_oid).ok_or_else(|| cannot_coerce(from, to))?;
             crate::array::array_in(s, elem, fmt)
-                .map(|elems| Value::Array { elem, elems })
+                .map(|(dims, elems)| Value::Array { elem, dims, elems })
                 .map_err(|e| CastError {
                     sqlstate: e.sqlstate,
                     message: e.message,
-                    detail: None,
+                    // `array_in`'s DETAIL is the half of the message that says
+                    // *what* is malformed, so it has to survive the conversion.
+                    detail: e.detail,
                 })
         }
         // `array` → `array` with a different element type: recast every element
-        // (e.g. an `int4[]` literal assigned to a `numeric[]` column).
-        (Value::Array { elems, .. }, PgType::Array(elem_oid)) => {
+        // (e.g. an `int4[]` literal assigned to a `numeric[]` column). The shape
+        // is untouched — only the element type changes.
+        (Value::Array { dims, elems, .. }, PgType::Array(elem_oid)) => {
             let elem = PgType::from_oid(elem_oid).ok_or_else(|| cannot_coerce(from, to))?;
             let recast = elems
                 .iter()
@@ -913,6 +916,7 @@ pub fn cast_value(v: Value, to: PgType, fmt: &FmtCtx) -> Result<Value, CastError
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Array {
                 elem,
+                dims: dims.clone(),
                 elems: recast,
             })
         }

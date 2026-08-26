@@ -51,6 +51,7 @@ test: json
 test: jsonb
 test: jsonpath
 test: array
+test: array_multidim
 test: inet
 test: cidr
 test: pg_catalog
