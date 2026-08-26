@@ -13,6 +13,7 @@ mod func_deps;
 mod global_catalog;
 mod guc;
 pub mod initdb;
+pub mod lockfile;
 mod prepare;
 mod query;
 mod role_stmt;

@@ -30,6 +30,8 @@ crabgresql-txn.workspace = true
 crabgresql-types.workspace = true
 crabgresql-wal.workspace = true
 clap.workspace = true
+# For `kill(pid, 0)` behind the `postmaster.pid` lock file.
+libc.workspace = true
 memchr.workspace = true
 # A stored password is a SCRAM verifier: PBKDF2-HMAC-SHA-256 over `sha2`, with
 # `rand` for the salt (the same pair `crabgresql-executor` already digests with).
@@ -41,6 +43,10 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+# The lock-file test needs two *processes* over one data directory, which only
+# the shipped binary can be. No cycle: that crate spawns the binary and does not
+# link this library.
+crabgresql-server-process.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 tempfile.workspace = true

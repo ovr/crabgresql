@@ -46,6 +46,13 @@ pub const PG_VERSION_FILE: &str = "PG_VERSION";
 /// exception, and without it no ext4 mount could be used as a data directory.
 const LOST_AND_FOUND: &str = "lost+found";
 
+/// So is one holding nothing but a lock file — and this rule is load-bearing,
+/// not merely tolerant: the lock is taken *before* a cluster is created
+/// ([`crate::lockfile`]), so the caller's own `postmaster.pid` is sitting in the
+/// directory at the moment [`inspect`] decides whether it is empty. A server
+/// killed before it wrote anything else leaves the same shape behind.
+const IGNORED_WHEN_EMPTY: [&str; 2] = [LOST_AND_FOUND, crate::lockfile::LOCK_FILE];
+
 /// How much durability the caller wants to pay for while initializing.
 #[derive(Clone, Copy, Debug)]
 pub struct InitOptions {
@@ -215,7 +222,7 @@ fn inspect(dir: &Path) -> io::Result<State> {
                 .to_string();
             return Ok(State::Initialized(version));
         }
-        if name != LOST_AND_FOUND {
+        if !IGNORED_WHEN_EMPTY.iter().any(|ignored| name == *ignored) {
             occupied = true;
         }
     }
@@ -347,6 +354,20 @@ fn make_dir_all(path: &Path) -> io::Result<()> {
     tighten(path, created)
 }
 
+/// Create the data directory itself, if it is not there — the step that has to
+/// come before every other, because the lock file ([`crate::lockfile`]) lives
+/// inside it and has to be taken before a byte of a cluster is written.
+///
+/// A directory that already exists is left entirely alone, mode included: `-D`
+/// with a typo must not `chmod 0700` somebody's home directory on its way to
+/// refusing it.
+pub fn create_data_dir_if_absent(dir: &Path) -> io::Result<()> {
+    match dir.exists() {
+        true => Ok(()),
+        false => make_dir_all(dir),
+    }
+}
+
 /// Restrict `path` to its owner, tolerating a refusal on a directory `created`
 /// says we did not make. See [`make_dir`] for why that tolerance exists.
 fn tighten(path: &Path, created: bool) -> io::Result<()> {
@@ -370,7 +391,7 @@ fn tighten(path: &Path, created: bool) -> io::Result<()> {
 /// `ErrorKind` survives, so callers keep matching on it; what changes is that
 /// `-D` at a path that cannot be created says *which* path, instead of a bare
 /// "No such file or directory" naming nothing.
-fn at(path: &Path, what: &str, error: io::Error) -> io::Error {
+pub(crate) fn at(path: &Path, what: &str, error: io::Error) -> io::Error {
     io::Error::new(
         error.kind(),
         format!("{what} \"{}\": {error}", path.display()),
@@ -380,20 +401,31 @@ fn at(path: &Path, what: &str, error: io::Error) -> io::Error {
 /// Create (or truncate) `path` owner-only, in one step — a `create` followed by
 /// a `chmod` would leave a window where the file is readable, and everything in
 /// a data directory is readable as plain bytes.
-#[cfg(unix)]
 fn create_private(path: &Path) -> io::Result<fs::File> {
+    private().truncate(true).open(path)
+}
+
+/// The same, but failing with `AlreadyExists` rather than truncating what is
+/// there. This is the create half of the lock file's interlock
+/// ([`crate::lockfile`]), so the exclusion has to be the filesystem's — a
+/// `exists()` check followed by a create is two racing servers' happy path.
+pub(crate) fn create_new_private(path: &Path) -> io::Result<fs::File> {
+    private().create_new(true).open(path)
+}
+
+#[cfg(unix)]
+fn private() -> fs::OpenOptions {
     use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).mode(0o600);
+    opts
 }
 
 #[cfg(not(unix))]
-fn create_private(path: &Path) -> io::Result<fs::File> {
-    fs::File::create(path)
+fn private() -> fs::OpenOptions {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true);
+    opts
 }
 
 #[cfg(unix)]

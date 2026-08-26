@@ -112,6 +112,26 @@ fn a_directory_holding_only_lost_and_found_is_empty() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A server killed before it wrote anything else leaves a lock file and nothing
+/// more. That directory is still an empty one: refusing it as "occupied by
+/// something that is not a cluster" would need an `rm` nobody could guess.
+#[test]
+fn a_directory_holding_only_a_lock_file_is_empty() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join(crabgresql_server::lockfile::LOCK_FILE),
+        "424242\n",
+    )?;
+
+    assert_eq!(
+        initdb::init_data_dir(dir.path(), &InitOptions::default())?,
+        Outcome::Created
+    );
+    assert_is_cluster(dir.path());
+
+    Ok(())
+}
+
 #[test]
 fn initdb_refuses_a_directory_that_already_holds_a_cluster() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
