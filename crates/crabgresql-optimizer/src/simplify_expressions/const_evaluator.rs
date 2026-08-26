@@ -253,9 +253,10 @@ fn eval_const(expr: &BoundExpr, fmt: &FmtCtx) -> Option<Value> {
                 .collect::<Option<Vec<_>>>()?;
             if *nested {
                 // A nested constructor stacks its operands into one more
-                // dimension. Ragged operands have no value to fold to — the
-                // executor raises `2202E` for them at run time.
-                crabgresql_types::array::stack(*elem, &values)
+                // dimension. A constructor that cannot be stacked — ragged
+                // operands, or one dimension too many — has no value to fold to,
+                // and the executor is what raises for it at run time.
+                crabgresql_types::array::stack(*elem, &values).ok()
             } else {
                 Some(Value::array_1d(*elem, values))
             }

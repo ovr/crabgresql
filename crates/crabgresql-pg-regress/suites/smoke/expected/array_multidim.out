@@ -136,6 +136,62 @@ SELECT '[1:2]={1,2}'::int[];
  {1,2}
 (1 row)
 
+-- a dimension may name only its upper bound, and the spellings mix
+SELECT '[3]={1,2,3}'::int[] AS upper_only,
+       '[1:2][3]={{1,2,3},{4,5,6}}'::int[] AS mixed,
+       array_dims('[3][2]={{1,2},{3,4},{5,6}}'::int[]) AS dims;
+ upper_only |       mixed       |    dims    
+------------+-------------------+------------
+ {1,2,3}    | {{1,2,3},{4,5,6}} | [1:3][1:2]
+(1 row)
+
+-- signed bounds
+SELECT '[-2:-1]={1,2}'::int[] AS negative, '[+2:3]={1,2}'::int[] AS plus_signed;
+   negative    | plus_signed 
+---------------+-------------
+ [-2:-1]={1,2} | [2:3]={1,2}
+(1 row)
+
+-- whitespace is allowed between the bracket pairs and around the `=`
+SELECT '[2:3] = {1,2}'::int[] AS spaced,
+       '[1:2] [1:2]={{1,2},{3,4}}'::int[] AS spaced_between;
+   spaced    | spaced_between 
+-------------+----------------
+ [2:3]={1,2} | {{1,2},{3,4}}
+(1 row)
+
+-- but not inside a bracket pair
+SELECT '[ 2 : 3 ]={1,2}'::int[];
+ERROR:  malformed array literal: "[ 2 : 3 ]={1,2}"
+LINE 1: SELECT '[ 2 : 3 ]={1,2}'::int[];
+               ^
+DETAIL:  "[" must introduce explicitly-specified array dimensions.
+SELECT '[a:b]={1,2}'::int[];
+ERROR:  malformed array literal: "[a:b]={1,2}"
+LINE 1: SELECT '[a:b]={1,2}'::int[];
+               ^
+DETAIL:  "[" must introduce explicitly-specified array dimensions.
+SELECT '[]={1,2}'::int[];
+ERROR:  malformed array literal: "[]={1,2}"
+LINE 1: SELECT '[]={1,2}'::int[];
+               ^
+DETAIL:  "[" must introduce explicitly-specified array dimensions.
+SELECT '[2:3'::int[];
+ERROR:  malformed array literal: "[2:3"
+LINE 1: SELECT '[2:3'::int[];
+               ^
+DETAIL:  Missing "]" after array dimensions.
+SELECT '[1:2]'::int[];
+ERROR:  malformed array literal: "[1:2]"
+LINE 1: SELECT '[1:2]'::int[];
+               ^
+DETAIL:  Missing "=" after array dimensions.
+-- dimensions read, but nothing to assign them to
+SELECT '[2:3]='::int[];
+ERROR:  malformed array literal: "[2:3]="
+LINE 1: SELECT '[2:3]='::int[];
+               ^
+DETAIL:  Array contents must start with "{".
 -- the bounds are part of the value: same elements, different array
 SELECT '[2:3]={1,2}'::int[] = '{1,2}'::int[] AS eq,
        '[2:3]={1,2}'::int[] > '{1,2}'::int[] AS gt,
@@ -145,6 +201,15 @@ SELECT '[2:3]={1,2}'::int[] = '{1,2}'::int[] AS eq,
  eq | gt | eq_ndims | gt_ndims | elements_first 
 ----+----+----------+----------+----------------
  f  | t  | f        | t        | f
+(1 row)
+
+-- every dimension's length outranks every lower bound, so the 1x4 array below
+-- sorts under the 2x2 one despite its higher first lower bound
+SELECT '[5:5][1:4]={{1,2,3,4}}'::int[] > '{{1,2},{3,4}}'::int[] AS lengths_first,
+       '[1:2][5:6]={{1,2},{3,4}}'::int[] > '[1:2][1:2]={{1,2},{3,4}}'::int[] AS then_bounds;
+ lengths_first | then_bounds 
+---------------+-------------
+ f             | t
 (1 row)
 
 -- unnest and generate_subscripts read the value row-major, dimension by dimension
@@ -261,6 +326,16 @@ LINE 1: SELECT '[2:1]={}'::int[];
 -- a constructor whose operands disagree fails at run time, not at parse time
 SELECT ARRAY[ARRAY[1, 2], ARRAY[3]];
 ERROR:  multidimensional arrays must have array expressions with matching dimensions
+-- the constructor is capped at six dimensions too, and names the count it was
+-- asked for where the literal parser does not
+SELECT array_ndims(ARRAY[ARRAY[ARRAY[ARRAY[ARRAY[ARRAY[1]]]]]]) AS six_is_fine;
+ six_is_fine 
+-------------
+           6
+(1 row)
+
+SELECT ARRAY[ARRAY[ARRAY[ARRAY[ARRAY[ARRAY[ARRAY[1]]]]]]];
+ERROR:  number of array dimensions (7) exceeds the maximum allowed (6)
 -- a column declared `int[][]` is the same type as `int[]` and stores either
 CREATE TABLE md (id int, a int[][]);
 INSERT INTO md VALUES (1, '{{1,2},{3,4}}');

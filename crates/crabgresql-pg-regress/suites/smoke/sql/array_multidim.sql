@@ -59,12 +59,33 @@ SELECT '[2:3][0:1]={{1,2},{3,4}}'::int[] AS shifted2,
        ('[2:3][0:1]={{1,2},{3,4}}'::int[])[3][0] AS elem;
 -- at the default bounds the prefix is dropped again
 SELECT '[1:2]={1,2}'::int[];
+-- a dimension may name only its upper bound, and the spellings mix
+SELECT '[3]={1,2,3}'::int[] AS upper_only,
+       '[1:2][3]={{1,2,3},{4,5,6}}'::int[] AS mixed,
+       array_dims('[3][2]={{1,2},{3,4},{5,6}}'::int[]) AS dims;
+-- signed bounds
+SELECT '[-2:-1]={1,2}'::int[] AS negative, '[+2:3]={1,2}'::int[] AS plus_signed;
+-- whitespace is allowed between the bracket pairs and around the `=`
+SELECT '[2:3] = {1,2}'::int[] AS spaced,
+       '[1:2] [1:2]={{1,2},{3,4}}'::int[] AS spaced_between;
+-- but not inside a bracket pair
+SELECT '[ 2 : 3 ]={1,2}'::int[];
+SELECT '[a:b]={1,2}'::int[];
+SELECT '[]={1,2}'::int[];
+SELECT '[2:3'::int[];
+SELECT '[1:2]'::int[];
+-- dimensions read, but nothing to assign them to
+SELECT '[2:3]='::int[];
 -- the bounds are part of the value: same elements, different array
 SELECT '[2:3]={1,2}'::int[] = '{1,2}'::int[] AS eq,
        '[2:3]={1,2}'::int[] > '{1,2}'::int[] AS gt,
        ARRAY[[1, 2]] = ARRAY[1, 2] AS eq_ndims,
        ARRAY[[1, 2]] > ARRAY[1, 2] AS gt_ndims,
        ARRAY[[1, 2]] > ARRAY[1, 2, 3] AS elements_first;
+-- every dimension's length outranks every lower bound, so the 1x4 array below
+-- sorts under the 2x2 one despite its higher first lower bound
+SELECT '[5:5][1:4]={{1,2,3,4}}'::int[] > '{{1,2},{3,4}}'::int[] AS lengths_first,
+       '[1:2][5:6]={{1,2},{3,4}}'::int[] > '[1:2][1:2]={{1,2},{3,4}}'::int[] AS then_bounds;
 
 -- unnest and generate_subscripts read the value row-major, dimension by dimension
 SELECT unnest(ARRAY[[1, 2], [3, 4]]);
@@ -108,6 +129,10 @@ SELECT '[1:2]{1,2}'::int[];
 SELECT '[2:1]={}'::int[];
 -- a constructor whose operands disagree fails at run time, not at parse time
 SELECT ARRAY[ARRAY[1, 2], ARRAY[3]];
+-- the constructor is capped at six dimensions too, and names the count it was
+-- asked for where the literal parser does not
+SELECT array_ndims(ARRAY[ARRAY[ARRAY[ARRAY[ARRAY[ARRAY[1]]]]]]) AS six_is_fine;
+SELECT ARRAY[ARRAY[ARRAY[ARRAY[ARRAY[ARRAY[ARRAY[1]]]]]]];
 
 -- a column declared `int[][]` is the same type as `int[]` and stores either
 CREATE TABLE md (id int, a int[][]);

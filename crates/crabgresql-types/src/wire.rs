@@ -150,8 +150,13 @@ fn decode_array(b: &[u8], ty: PgType, elem_oid: u32) -> Result<Value, CastError>
         return Err(invalid_binary(ty));
     }
     let mut dims = Vec::with_capacity(ndim);
-    // The element count is the product of the dimension lengths, in i64 so a
-    // crafted header cannot overflow its way into a small allocation.
+    // The element count is the product of the dimension lengths. Each element
+    // costs at least its four length bytes, so that product can never exceed the
+    // buffer's own budget — and the running check has to be *inside* the loop and
+    // *checked*: three dimensions of `i32::MAX` overflow even an i64, which would
+    // otherwise wrap to a small count that walks straight past a check after the
+    // loop and yields a `Value::Array` whose `dims` and `elems` disagree.
+    let budget = (b.len() / 4) as i64;
     let mut count: i64 = 1;
     for d in 0..ndim {
         let at = 12 + d * 8;
@@ -164,13 +169,11 @@ fn decode_array(b: &[u8], ty: PgType, elem_oid: u32) -> Result<Value, CastError>
         if i64::from(lower) + i64::from(len) - 1 > i64::from(i32::MAX) {
             return Err(invalid_binary(ty));
         }
-        count *= i64::from(len);
+        count = count
+            .checked_mul(i64::from(len))
+            .filter(|c| *c <= budget)
+            .ok_or_else(|| invalid_binary(ty))?;
         dims.push(crate::ArrayDim { lower, len });
-    }
-    // Each element costs at least its four length bytes, so a count past that
-    // budget is corrupt — checked before reserving.
-    if count > (b.len() / 4) as i64 {
-        return Err(invalid_binary(ty));
     }
     let mut elems = Vec::with_capacity(count as usize);
     let mut pos = 12 + ndim * 8;
@@ -555,6 +558,12 @@ mod tests {
                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23, 255, 255, 255, 255, 0, 0, 0, 1,
             ], // length -1
             vec![0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 23, 0, 0, 0, 0, 0, 0, 0, 1], // ndim past MAXDIM
+            // Three dimensions of `i32::MAX`: the element count their product
+            // implies does not fit in i64, let alone in these 36 bytes.
+            vec![
+                0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 23, 127, 255, 255, 255, 0, 0, 0, 1, 127, 255, 255,
+                255, 0, 0, 0, 1, 127, 255, 255, 255, 0, 0, 0, 1,
+            ],
             vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 25, 0, 0, 0, 0, 0, 0, 0, 1], // element type text
             vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 0],                      // ndim 0 with a tail
             vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23],                         // 1-D, no dim header

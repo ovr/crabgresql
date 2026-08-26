@@ -277,13 +277,10 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
                 .map(|e| eval(e, row, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             if *nested {
-                // Sub-arrays that disagree about their shape have no stacking.
-                crabgresql_types::array::stack(*elem, &values).ok_or_else(|| {
-                    ExecError::new(
-                        "2202E",
-                        "multidimensional arrays must have array expressions with matching dimensions",
-                    )
-                })
+                // Sub-arrays that disagree about their shape, or that would
+                // stack past `MAXDIM`, each have their own message.
+                crabgresql_types::array::stack(*elem, &values)
+                    .map_err(|e| ExecError::new(e.sqlstate, e.message).with_detail(e.detail))
             } else {
                 Ok(Value::array_1d(*elem, values))
             }
@@ -664,7 +661,6 @@ fn array_cat(elem: PgType, a: &Value, b: &Value) -> Result<Value, ExecError> {
         return Ok(match (parts(a), parts(b)) {
             (Some(_), _) => a.clone(),
             (_, Some(_)) => b.clone(),
-            // Both sides empty: so is the result.
             _ => Value::array_1d(elem, Vec::new()),
         });
     };

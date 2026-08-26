@@ -470,10 +470,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 _ => Value::Int4(len),
             });
         }
-        // `array_length(arr, dim)` / `array_upper(arr, dim)` /
-        // `array_lower(arr, dim)`: that dimension's length, or either of its
-        // subscript bounds. A dimension the value does not have — including any
-        // dimension of an empty array, which has none — yields NULL.
+        // A dimension the value does not have — including any dimension of an
+        // empty array, which has none — yields NULL.
         ScalarFn::ArrayLength | ScalarFn::ArrayUpper | ScalarFn::ArrayLower => {
             let dim = i4(&args[1]);
             let Some(d) = usize::try_from(dim)
@@ -489,8 +487,7 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 _ => d.len,
             }));
         }
-        // `array_ndims(arr)` / `array_dims(arr)`: the shape itself. Both are NULL
-        // for an empty array rather than 0 or `[1:0]`.
+        // Both are NULL for an empty array rather than 0 or `[1:0]`.
         ScalarFn::ArrayNdims | ScalarFn::ArrayDims => {
             let dims = array_dims(&args[0]);
             if dims.is_empty() {
@@ -505,7 +502,6 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 ),
             });
         }
-        // `cardinality(arr)`: every element, across every dimension.
         ScalarFn::Cardinality => {
             return Ok(Value::Int4(array_elems(&args[0]).len() as i32));
         }

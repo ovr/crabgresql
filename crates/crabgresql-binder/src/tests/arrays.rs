@@ -138,7 +138,6 @@ fn a_nested_array_constructor_is_marked_nested() -> anyhow::Result<()> {
             "for `{sql}`"
         );
     }
-    // A flat one is not.
     let QueryPlan { projections, .. } = bind("SELECT ARRAY[1,2] FROM arr")?.into_query()?;
     assert!(
         matches!(&projections[0], BoundExpr::ArrayCtor { nested: false, .. }),

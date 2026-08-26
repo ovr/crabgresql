@@ -2796,8 +2796,6 @@ pub(crate) fn bind_array_function(
                 vec![resolve_operand(b, arg_ty)?],
             )
         }
-        // The two shape-reporting functions that take no dimension: how many
-        // dimensions there are, and what all of them are.
         "array_ndims" | "array_dims" => {
             let [b] = bindings else {
                 return Err(undefined());

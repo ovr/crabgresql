@@ -331,13 +331,8 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
         }
         // An array: element type OID, element count, then per element a presence
         // byte (0 = NULL, 1 = a self-describing datum). Elements recurse through
-        // `encode_datum`, so nested value types work automatically.
-        //
-        // The plain [`T_ARRAY`] form describes only the shape it was introduced
-        // with — one dimension at the default lower bound — so anything else
-        // takes [`T_ARRAY_ND`], which carries the dimension list. Keeping the
-        // common shape on the old tag is what lets pages written before
-        // multi-dimensional arrays existed keep decoding byte for byte.
+        // `encode_datum`, so nested value types work automatically. A shape the
+        // original tag cannot describe takes [`T_ARRAY_ND`] instead.
         Value::Array { elem, dims, elems } => {
             let flat = matches!(dims.as_slice(), [] | [crate::ArrayDim { lower: 1, .. }]);
             out.push(if flat { T_ARRAY } else { T_ARRAY_ND });
@@ -1119,8 +1114,6 @@ mod tests {
             PgType::Text,
             vec![Value::Text("a".into()), Value::Text("b,c".into())],
         ));
-        // Shapes the plain `T_ARRAY` tag cannot describe: more than one
-        // dimension, and a lower bound other than 1.
         roundtrip(Value::Array {
             elem: PgType::Int4,
             dims: vec![

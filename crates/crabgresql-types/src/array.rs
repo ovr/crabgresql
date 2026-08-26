@@ -21,7 +21,12 @@ pub const MAXDIM: usize = 6;
 /// another one (`'[2:3]={1,2}'::int[]`), and that bound is part of the value —
 /// it shifts subscripts, prints back out as a `[lower:upper]=` prefix, and makes
 /// the value unequal to the same elements at the default bound.
-#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Deliberately **not** `Ord`. A field-order comparison would read as the
+/// obvious way to break a tie between two shapes, and it is the wrong one: PG
+/// weighs every dimension's length before any lower bound, which no per-dimension
+/// ordering can express. `compare::compare_values` spells that out.
+#[derive(deepsize::DeepSizeOf, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArrayDim {
     pub lower: i32,
     pub len: i32,
@@ -57,12 +62,23 @@ pub fn dims_1d(len: usize) -> Vec<ArrayDim> {
 
 /// Stack the operands of a nested `ARRAY[…]` constructor
 /// (`ARRAY[[1,2],[3,4]]`, `ARRAY[ARRAY[…]]`) into one array with one more
-/// dimension, or `None` if they do not all have the same shape.
+/// dimension.
 ///
 /// The operands are already row-major, so the result's elements are simply
 /// theirs concatenated; only the dimension list grows, by the operand count at
 /// the front.
-pub fn stack(elem: PgType, operands: &[Value]) -> Option<Value> {
+///
+/// Two ways to fail, and PostgreSQL words them differently: operands that
+/// disagree about their shape are `2202E`, and stacking past [`MAXDIM`] is
+/// `54000` — the *constructor's* wording of that limit names the offending
+/// count, where the literal parser's does not.
+pub fn stack(elem: PgType, operands: &[Value]) -> Result<Value, ArrayError> {
+    let ragged = || ArrayError {
+        sqlstate: ARRAY_SUBSCRIPT_ERROR,
+        message: "multidimensional arrays must have array expressions with matching dimensions"
+            .to_string(),
+        detail: None,
+    };
     let mut dims: Option<&[ArrayDim]> = None;
     let mut elems = Vec::new();
     for operand in operands {
@@ -73,21 +89,24 @@ pub fn stack(elem: PgType, operands: &[Value]) -> Option<Value> {
             ..
         } = operand
         else {
-            return None;
+            return Err(ragged());
         };
         match dims {
             None => dims = Some(sub),
             Some(established) if established == sub => {}
-            Some(_) => return None,
+            Some(_) => return Err(ragged()),
         }
         elems.extend(e.iter().cloned());
     }
     let mut dims = dims.unwrap_or_default().to_vec();
     // Every operand was itself empty, so the whole constructor is: no dimensions.
     if !dims.is_empty() {
+        if dims.len() >= MAXDIM {
+            return Err(too_many_dimensions_n(dims.len() + 1));
+        }
         dims.insert(0, ArrayDim::new(operands.len()));
     }
-    Some(Value::Array { elem, dims, elems })
+    Ok(Value::Array { elem, dims, elems })
 }
 
 /// SQLSTATE + message (+ optional DETAIL) for a failed array input (`array_in`).
@@ -137,6 +156,15 @@ const DETAIL_RAGGED: &str =
     "Multidimensional arrays must have sub-arrays with matching dimensions.";
 /// A `[l:u]…` prefix not followed by `=`.
 const DETAIL_NO_EQUALS: &str = "Missing \"=\" after array dimensions.";
+/// A bracket pair that never closes (`'[2:3'`).
+const DETAIL_NO_RBRACKET: &str = "Missing \"]\" after array dimensions.";
+/// A bracket pair holding something other than a bound (or nothing at all):
+/// `'[a:b]=…'`, `'[]=…'`, `'[ 2 : 3 ]=…'`.
+const DETAIL_BAD_DIMS: &str = "\"[\" must introduce explicitly-specified array dimensions.";
+/// A complete `[l:u]…=` prefix with no `{` after it. Once the dimensions have
+/// been read PG stops offering them as an alternative, so this is a *different*
+/// line from [`DETAIL_START`].
+const DETAIL_NO_CONTENTS: &str = "Array contents must start with \"{\".";
 /// A `[l:u]…=` prefix that disagrees with the braces after it, in either the
 /// number of dimensions or a length.
 const DETAIL_DIM_MISMATCH: &str = "Specified array dimensions do not match array contents.";
@@ -356,7 +384,14 @@ pub fn array_in(
     let mut chars = trimmed.chars().peekable();
     let declared = read_dimension_prefix(&mut chars, input)?;
     if chars.peek() != Some(&'{') {
-        return Err(malformed(input, DETAIL_START));
+        return Err(malformed(
+            input,
+            if declared.is_some() {
+                DETAIL_NO_CONTENTS
+            } else {
+                DETAIL_START
+            },
+        ));
     }
     let mut scan = Scan {
         input,
@@ -404,6 +439,11 @@ pub fn array_in(
 
 /// Read an optional `[lower:upper][lower:upper]…=` prefix, leaving the iterator
 /// on the first `{`. `None` when the literal does not start with `[`.
+///
+/// A dimension may also name only its upper bound (`[3]`, meaning `[1:3]`), and
+/// the two spellings mix freely (`'[1:2][3]={{1,2,3},{4,5,6}}'`). Whitespace is
+/// allowed *between* the brackets and around the `=`, but not *inside* a bracket
+/// pair: PostgreSQL accepts `'[2:3] = {1,2}'` and rejects `'[ 2 : 3 ]={1,2}'`.
 fn read_dimension_prefix(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     input: &str,
@@ -417,8 +457,14 @@ fn read_dimension_prefix(
         if dims.len() == MAXDIM {
             return Err(too_many_dimensions());
         }
-        let lower = read_bound(chars, input, ':')?;
-        let upper = read_bound(chars, input, ']')?;
+        // The first bound is the lower one only if a `:` follows it; a bound that
+        // runs straight into `]` is the upper one, at the default lower bound.
+        let (first, ended_pair) = read_bound(chars, input)?;
+        let (lower, upper) = if ended_pair {
+            (1, first)
+        } else {
+            (first, read_bound(chars, input)?.0)
+        };
         if upper < lower {
             // Not a malformed literal to PostgreSQL — the syntax parsed, the
             // bounds are what it objects to.
@@ -433,37 +479,57 @@ fn read_dimension_prefix(
         let len = i64::from(upper) - i64::from(lower) + 1;
         let len = i32::try_from(len).map_err(|_| too_many_dimensions())?;
         dims.push(ArrayDim { lower, len });
+        skip_ws(chars);
     }
     if chars.next() != Some('=') {
         return Err(malformed(input, DETAIL_NO_EQUALS));
     }
+    skip_ws(chars);
     Ok(Some(dims))
 }
 
-/// One signed decimal bound of a `[lower:upper]` pair, up to `terminator`.
+/// One signed decimal bound inside a `[…]` pair, returning its value and whether
+/// the `]` that ends the whole pair came with it (rather than a `:`).
+///
+/// The digits are taken exactly as written — no trimming — because PostgreSQL
+/// treats a space inside the brackets as malformed. A leading `+` or `-` is fine,
+/// which `i32`'s own parser already accepts.
 fn read_bound(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     input: &str,
-    terminator: char,
-) -> Result<i32, ArrayError> {
+) -> Result<(i32, bool), ArrayError> {
     let mut s = String::new();
-    loop {
+    let ended_pair = loop {
         match chars.next() {
-            Some(c) if c == terminator => break,
+            Some(']') => break true,
+            Some(':') => break false,
             Some(c) => s.push(c),
-            None => return Err(malformed(input, DETAIL_EOF)),
+            None => return Err(malformed(input, DETAIL_NO_RBRACKET)),
         }
-    }
-    s.trim()
+    };
+    let value = s
         .parse::<i32>()
-        .map_err(|_| malformed(input, DETAIL_START))
+        .map_err(|_| malformed(input, DETAIL_BAD_DIMS))?;
+    Ok((value, ended_pair))
 }
 
 /// The `54000` raised when a literal nests more than [`MAXDIM`] brace levels.
+/// The parser does not say how deep the literal went — only the constructor
+/// does, via [`too_many_dimensions_n`].
 fn too_many_dimensions() -> ArrayError {
     ArrayError {
         sqlstate: PROGRAM_LIMIT_EXCEEDED,
         message: format!("number of array dimensions exceeds the maximum allowed ({MAXDIM})"),
+        detail: None,
+    }
+}
+
+/// The same `54000` as [`too_many_dimensions`], worded as the `ARRAY[…]`
+/// constructor words it: naming the count it was asked for.
+fn too_many_dimensions_n(n: usize) -> ArrayError {
+    ArrayError {
+        sqlstate: PROGRAM_LIMIT_EXCEEDED,
+        message: format!("number of array dimensions ({n}) exceeds the maximum allowed ({MAXDIM})"),
         detail: None,
     }
 }
@@ -495,7 +561,6 @@ impl Scan<'_> {
         if level + 1 > MAXDIM {
             return Err(too_many_dimensions());
         }
-        // The caller only enters a group when it has seen the brace.
         debug_assert_eq!(chars.peek(), Some(&'{'));
         chars.next();
         let mut count = 0usize;
@@ -710,7 +775,6 @@ mod tests {
     #[test]
     fn round_trips_a_multi_dimensional_array() -> Result<(), ArrayError> {
         let (dims, elems) = array_in("{{1,2,3},{4,5,6}}", PgType::Int4, &FmtCtx::utc_default())?;
-        // Row-major: the flat list reads across each row in turn.
         assert_eq!(
             elems,
             (1..=6).map(Value::Int4).collect::<Vec<_>>(),
@@ -724,7 +788,6 @@ mod tests {
             round_trip("{{1,2,3},{4,5,6}}", PgType::Int4)?,
             "{{1,2,3},{4,5,6}}"
         );
-        // Three levels, and whitespace anywhere between the braces.
         assert_eq!(
             round_trip("{ { {1,2} , {3,4} } }", PgType::Int4)?,
             "{{{1,2},{3,4}}}"
@@ -744,9 +807,81 @@ mod tests {
             round_trip("[2:3][0:1]={{1,2},{3,4}}", PgType::Int4)?,
             "[2:3][0:1]={{1,2},{3,4}}"
         );
-        // At the default bounds the prefix is dropped again.
         assert_eq!(round_trip("[1:2]={1,2}", PgType::Int4)?, "{1,2}");
+        assert_eq!(round_trip("[-2:-1]={1,2}", PgType::Int4)?, "[-2:-1]={1,2}");
+        assert_eq!(round_trip("[+2:3]={1,2}", PgType::Int4)?, "[2:3]={1,2}");
         Ok(())
+    }
+
+    /// A dimension may name only its upper bound, which puts the lower one at the
+    /// default 1, and the two spellings mix within one prefix.
+    #[test]
+    fn upper_bound_only_dimensions() -> Result<(), ArrayError> {
+        let (dims, elems) = array_in("[3]={1,2,3}", PgType::Int4, &FmtCtx::utc_default())?;
+        assert_eq!(elems, (1..=3).map(Value::Int4).collect::<Vec<_>>());
+        assert_eq!(dims, vec![ArrayDim { lower: 1, len: 3 }]);
+        assert_eq!(round_trip("[3]={1,2,3}", PgType::Int4)?, "{1,2,3}");
+        assert_eq!(
+            round_trip("[1:2][3]={{1,2,3},{4,5,6}}", PgType::Int4)?,
+            "{{1,2,3},{4,5,6}}"
+        );
+        assert_eq!(
+            array_in("[0]={1}", PgType::Int4, &FmtCtx::utc_default())
+                .expect_err("an upper bound of 0 is below the implied lower bound of 1")
+                .sqlstate,
+            ARRAY_SUBSCRIPT_ERROR
+        );
+        Ok(())
+    }
+
+    /// Whitespace is allowed between the bracket pairs and around the `=`, but a
+    /// bracket pair itself has to hold nothing but its bounds.
+    #[test]
+    fn whitespace_around_the_dimension_prefix() -> Result<(), ArrayError> {
+        for input in [
+            "[2:3]={1,2}",
+            "[2:3] ={1,2}",
+            "[2:3]= {1,2}",
+            "[2:3] = {1,2}",
+            "  [2:3]={1,2}  ",
+        ] {
+            assert_eq!(
+                round_trip(input, PgType::Int4)?,
+                "[2:3]={1,2}",
+                "for `{input}`"
+            );
+        }
+        assert_eq!(
+            round_trip("[1:2] [1:2]={{1,2},{3,4}}", PgType::Int4)?,
+            "{{1,2},{3,4}}"
+        );
+        let e = array_in("[ 2 : 3 ]={1,2}", PgType::Int4, &FmtCtx::utc_default())
+            .expect_err("whitespace inside a bracket pair is malformed");
+        assert_eq!(e.sqlstate, INVALID_TEXT_REPRESENTATION);
+        assert_eq!(e.detail.as_deref(), Some(DETAIL_BAD_DIMS));
+        Ok(())
+    }
+
+    /// Each way a dimension prefix can be malformed has its own DETAIL.
+    #[test]
+    fn dimension_prefix_details_match_pg() {
+        let d = |s: &str| {
+            array_in(s, PgType::Int4, &FmtCtx::utc_default())
+                .expect_err("a malformed dimension prefix must be rejected")
+                .detail
+                .expect("a malformed-literal error carries a DETAIL line")
+        };
+        assert_eq!(d("[a:b]={1,2}"), DETAIL_BAD_DIMS);
+        assert_eq!(d("[]={1,2}"), DETAIL_BAD_DIMS);
+        assert_eq!(d("[2:3"), DETAIL_NO_RBRACKET);
+        assert_eq!(d("[1:2]"), DETAIL_NO_EQUALS);
+        assert_eq!(d("[1:2]x={1,2}"), DETAIL_NO_EQUALS);
+        assert_eq!(d("[1:2] [1:2]"), DETAIL_NO_EQUALS);
+        assert_eq!(d("[2:3]="), DETAIL_NO_CONTENTS);
+        assert_eq!(d("[2:3]=  "), DETAIL_NO_CONTENTS);
+        // A literal that starts with neither `{` nor `[` never reaches the
+        // prefix parser at all.
+        assert_eq!(d("1,2,3"), DETAIL_START);
     }
 
     #[test]
@@ -785,8 +920,52 @@ mod tests {
             e.message,
             "number of array dimensions exceeds the maximum allowed (6)"
         );
-        // Six is still fine.
         assert!(array_in("{{{{{{1}}}}}}", PgType::Int4, &FmtCtx::utc_default()).is_ok());
+    }
+
+    /// The `ARRAY[…]` constructor is capped at [`MAXDIM`] too, and words that
+    /// limit differently from the literal parser: it names the count it was
+    /// asked for.
+    #[test]
+    fn stacking_past_maxdim_is_a_program_limit() -> Result<(), ArrayError> {
+        let mut v = Value::array_1d(PgType::Int4, vec![Value::Int4(1)]);
+        for _ in 1..MAXDIM {
+            v = stack(PgType::Int4, std::slice::from_ref(&v))?;
+        }
+        let Value::Array { dims, .. } = &v else {
+            unreachable!("stack returns an array");
+        };
+        assert_eq!(dims.len(), MAXDIM, "six dimensions are still fine");
+
+        let e = stack(PgType::Int4, std::slice::from_ref(&v))
+            .expect_err("a seventh dimension must be rejected");
+        assert_eq!(e.sqlstate, PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(
+            e.message,
+            "number of array dimensions (7) exceeds the maximum allowed (6)"
+        );
+        Ok(())
+    }
+
+    /// Operands that disagree about their shape are a different failure, with
+    /// PG's own wording.
+    #[test]
+    fn stacking_ragged_operands_is_a_subscript_error() {
+        let two = Value::array_1d(PgType::Int4, vec![Value::Int4(1), Value::Int4(2)]);
+        let one = Value::array_1d(PgType::Int4, vec![Value::Int4(3)]);
+        let e = stack(PgType::Int4, &[two.clone(), one])
+            .expect_err("sub-arrays of differing length must be rejected");
+        assert_eq!(e.sqlstate, ARRAY_SUBSCRIPT_ERROR);
+        assert_eq!(
+            e.message,
+            "multidimensional arrays must have array expressions with matching dimensions"
+        );
+        assert_eq!(
+            stack(PgType::Int4, &[two, Value::Null])
+                .expect_err("a NULL operand must be rejected")
+                .sqlstate,
+            ARRAY_SUBSCRIPT_ERROR
+        );
     }
 
     /// An inverted `[upper:lower]` is not a *syntax* problem, so PG reports it as
