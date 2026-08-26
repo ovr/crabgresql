@@ -113,17 +113,14 @@ async fn main() -> std::process::ExitCode {
 
 async fn run(cli: Cli) -> std::io::Result<()> {
     if let Some(Command::Initdb { no_sync }) = &cli.command {
-        // Held across the whole of `initdb`, so it cannot rewrite the skeleton
-        // of a cluster a server has open. An absent directory has nothing to
-        // lock — and no server in it either.
-        let _lock = match lockfile::PostmasterLock::acquire(
+        // Held across the whole of `initdb`, so it cannot write into a cluster a
+        // server has open. The directory has to exist for the lock file to be
+        // created in it, and creating it is `initdb`'s first act anyway.
+        initdb::create_data_dir_if_absent(&cli.data_dir)?;
+        let _lock = lockfile::PostmasterLock::acquire(
             &cli.data_dir,
             &lockfile::LockInfo::for_initdb(start_epoch_secs()),
-        ) {
-            Ok(lock) => Some(lock),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
+        )?;
         let opts = initdb::InitOptions { sync: !no_sync };
         report(initdb::init_data_dir(&cli.data_dir, &opts)?, &cli.data_dir);
         return Ok(());
@@ -133,15 +130,17 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     // see [`Shutdown::install`].
     let mut shutdown = Shutdown::install();
 
-    // Before the engine opens anything: an absent or empty directory becomes a
-    // cluster, and a directory that is not one is refused here rather than
-    // silently filled in piece by piece by whichever component ran first.
-    report(initdb::ensure_initialized(&cli.data_dir)?, &cli.data_dir);
-
-    // And before *anything* is opened: two servers over one data directory each
-    // replay the same WAL and write the same files, which loses data rather
-    // than merely making a mess. The lock is released when this function
-    // returns — every exit path below is a return, including the signal one.
+    // The lock comes before *everything* that touches the directory — before the
+    // engine, and before the cluster is even created. Two servers over one data
+    // directory each replay the same WAL and write the same files, which loses
+    // data rather than merely making a mess, and creating a cluster is as much a
+    // write as any other: a start racing a running `initdb` would otherwise
+    // overwrite `global/pg_control` and only then be refused.
+    //
+    // Which is why the directory itself is created first — the lock file lives
+    // inside it — and why `initdb` treats a directory holding nothing but a lock
+    // file as empty. The lock is released when this function returns.
+    initdb::create_data_dir_if_absent(&cli.data_dir)?;
     let lock = lockfile::PostmasterLock::acquire(
         &cli.data_dir,
         &lockfile::LockInfo {
@@ -151,18 +150,36 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         },
     )?;
 
+    // From here until the server is serving, a shutdown signal is this task's
+    // to handle: see `watch_startup`.
+    let startup_done = watch_startup(lock.path().to_path_buf());
+
     tracing::info!(
         "opening durable heap engine at {} (running recovery)",
         cli.data_dir.display()
     );
-    let (engine, txnmgr) = crabgresql_server::open_pg_engine(&cli.data_dir)?;
-
-    // Roles are a cluster object: one catalog for the whole data directory,
-    // rather than one per database as the relation catalog is.
-    let roles = std::sync::Arc::new(crabgresql_server::RoleCatalog::open(
-        &cli.data_dir,
-        &cli.superuser,
-    )?);
+    // All of it on a blocking thread, and awaited rather than called: every step
+    // is synchronous, and recovery is minutes of it on a large cluster. Run on
+    // the runtime's worker it would hold that worker for the whole of startup —
+    // and on a one-core container there is only one, so the task watching for a
+    // shutdown signal would never be polled, which is exactly the case
+    // `watch_startup` exists for.
+    let data_dir = cli.data_dir.clone();
+    let superuser = cli.superuser.clone();
+    let (engine, txnmgr, roles) = tokio::task::spawn_blocking(move || {
+        // The cluster first: an empty directory becomes one, and a directory
+        // that is not one is refused here rather than silently filled in piece
+        // by piece by whichever component ran first.
+        report(initdb::ensure_initialized(&data_dir)?, &data_dir);
+        let (engine, txnmgr) = crabgresql_server::open_pg_engine(&data_dir)?;
+        // Roles are a cluster object: one catalog for the whole data directory,
+        // rather than one per database as the relation catalog is.
+        let roles =
+            std::sync::Arc::new(crabgresql_server::RoleCatalog::open(&data_dir, &superuser)?);
+        Ok::<_, std::io::Error>((engine, txnmgr, roles))
+    })
+    .await
+    .map_err(std::io::Error::other)??;
 
     let copy_files = cli.copy_allow_path.iter().fold(
         crabgresql_server::CopyFileAccess::confined_to(&cli.data_dir),
@@ -204,6 +221,11 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         tracing::warn!(%error, "could not mark the lock file ready");
     }
 
+    // Startup is over, so the watcher stands down and the select below — which
+    // can flush the engine on the way out, as the watcher cannot — takes the
+    // signals from here on.
+    let _ = startup_done.send(());
+
     tokio::select! {
         result = crabgresql_server::serve_with(listener, engine, txnmgr, copy_files, roles) => result,
         () = shutdown.recv() => {
@@ -212,6 +234,57 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Handle a shutdown signal that arrives while the server is still starting,
+/// for as long as that lasts. Returns the sender that stands it down.
+///
+/// Startup is not a moment: it opens the engine, which replays the WAL, which
+/// on a large cluster is minutes. A supervisor that stops the server in that
+/// window — `docker stop`, `systemctl stop`, a Ctrl-C — has to be obeyed *then*,
+/// not after recovery finishes, and until [`Shutdown`] existed it was, by the
+/// signal's default disposition. Installing the handlers early took that away
+/// and gave nothing back until the listener was up, so this task is the
+/// replacement: it ends the process the way the default disposition did, and
+/// removes the lock file on the way out, which the default disposition could
+/// not.
+///
+/// It cannot do better than that — there is no engine to flush yet, and the
+/// blocking recovery it interrupts is on another thread, exactly where a signal
+/// would have interrupted it before. Once the server is serving, the sender
+/// hands the signals to the select in [`run`], which can flush. A signal in the
+/// instant between the two is handled here, which is the older behavior and no
+/// worse than it.
+///
+/// The `initdb` subcommand deliberately has no watcher: its work is short, and
+/// a killed `initdb` leaves a complete lock file with a dead PID, which the next
+/// start takes over.
+fn watch_startup(lock_path: PathBuf) -> tokio::sync::oneshot::Sender<()> {
+    let (done, stood_down) = tokio::sync::oneshot::channel();
+    // Its own handlers: tokio notifies every registered `Signal` of a kind, so
+    // this does not consume the notification the select in `run` is waiting for.
+    let mut watch = Shutdown::install();
+    tokio::spawn(async move {
+        tokio::select! {
+            // Biased so that a stood-down watcher cannot also take a signal that
+            // arrived at the same moment: the server is serving, and the select
+            // in `run` is the one that can shut it down cleanly.
+            biased;
+            _ = stood_down => {}
+            () = watch.recv() => {
+                tracing::info!(
+                    "received a shutdown signal during startup; exiting before the \
+                     cluster was open"
+                );
+                lockfile::PostmasterLock::release_at(&lock_path);
+                // A requested stop is not a failure, and `exit` is the point:
+                // nothing above us can return, because `run` is blocked inside
+                // startup.
+                std::process::exit(0);
+            }
+        }
+    });
+    done
 }
 
 /// When this process started, in whole seconds since the epoch — the lock

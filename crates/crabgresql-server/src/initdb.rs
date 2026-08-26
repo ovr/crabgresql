@@ -46,9 +46,11 @@ pub const PG_VERSION_FILE: &str = "PG_VERSION";
 /// exception, and without it no ext4 mount could be used as a data directory.
 const LOST_AND_FOUND: &str = "lost+found";
 
-/// So is one holding nothing but a lock file. A server killed before it ever
-/// wrote anything else leaves exactly that, and a directory that could no longer
-/// be initialized because of it would need a `rm` nobody could guess.
+/// So is one holding nothing but a lock file — and this rule is load-bearing,
+/// not merely tolerant: the lock is taken *before* a cluster is created
+/// ([`crate::lockfile`]), so the caller's own `postmaster.pid` is sitting in the
+/// directory at the moment [`inspect`] decides whether it is empty. A server
+/// killed before it wrote anything else leaves the same shape behind.
 const IGNORED_WHEN_EMPTY: [&str; 2] = [LOST_AND_FOUND, crate::lockfile::LOCK_FILE];
 
 /// How much durability the caller wants to pay for while initializing.
@@ -350,6 +352,23 @@ fn make_dir_all(path: &Path) -> io::Result<()> {
         return Err(at(path, "creating", error));
     }
     tighten(path, created)
+}
+
+/// Create the data directory itself, if it is not there — the one step that has
+/// to happen before anything else, because the lock file
+/// ([`crate::lockfile`]) lives inside it and has to be taken before a single
+/// byte of a cluster is written.
+///
+/// A directory that already exists is left entirely alone, mode included: `-D`
+/// with a typo must not `chmod 0700` somebody's home directory on its way to
+/// refusing it. One we create ourselves is restricted immediately, by
+/// [`make_dir_all`], rather than a moment later when the cluster is written
+/// into it.
+pub fn create_data_dir_if_absent(dir: &Path) -> io::Result<()> {
+    match dir.exists() {
+        true => Ok(()),
+        false => make_dir_all(dir),
+    }
 }
 
 /// Restrict `path` to its owner, tolerating a refusal on a directory `created`

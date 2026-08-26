@@ -116,7 +116,10 @@ crabgresql server (PID 4711) running in data directory "./pgdata"?
 
 A server that was killed outright leaves the file behind; the next start finds
 its PID dead and takes the directory over, so this is not something to clean up
-by hand.
+by hand. A file that is *empty* or holds something else is the one case that is:
+it is refused rather than taken over — an empty one is also what a server that
+is starting right now looks like — and the error says to remove it if no server
+is running.
 
 ## Configuration
 

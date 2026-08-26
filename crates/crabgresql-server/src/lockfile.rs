@@ -18,12 +18,20 @@
 //!   buy, at the cost of behaving unlike PostgreSQL on filesystems where locks
 //!   are unreliable (NFS) — the interlock people already reason about wins.
 //! - **A stale file is normal.** `Drop` unlinks it, and `SIGKILL` or a panic
-//!   skips `Drop`, so a file left by a dead server is an expected state rather
-//!   than an error: it is taken over, not refused.
-//! - **The takeover has a window.** Two servers can both find the same stale
-//!   file, both unlink it, and both create their own. PostgreSQL has the same
-//!   window; it requires a server that is already dead, and is microseconds
-//!   wide.
+//!   skips `Drop`, so a *complete* file left by a dead server is an expected
+//!   state rather than an error: it is taken over, not refused.
+//! - **Only a complete one.** A file that is empty, unreadable or not ours is
+//!   refused, never unlinked — PostgreSQL refuses on these too. An empty file
+//!   is the state of a server between its `O_EXCL` create and its first write,
+//!   so "stale" is not a conclusion that can be drawn from it; the cost is that
+//!   a crash inside that window leaves a file an operator has to remove, which
+//!   is what the error says to do.
+//!
+//! Those two together are what makes two live servers impossible, in any
+//! interleaving: the loser of a create either sees a live PID, or sees the
+//! winner's empty file, and both readings are a refusal. Which is also why
+//! `Drop` does not check whose PID the file carries before unlinking — it
+//! cannot be anyone else's.
 //!
 //! The contents are PostgreSQL's eight lines, in PostgreSQL's order, so that an
 //! operator reads a file they already know and a `pg_ctl`-shaped tool finds the
@@ -117,8 +125,13 @@ impl PostmasterLock {
             }
         }
         // The file was recreated between our unlink and our create. Whoever did
-        // that is running now, whatever PID the file happens to carry.
-        Err(occupied(&path, data_dir, holder_pid(&path)))
+        // that is running now, whatever the file happens to carry — and if it
+        // cannot be read at all, that is still not our directory to take.
+        let pid = match read_holder(&path) {
+            Ok(Holder::Pid(pid)) => Some(pid),
+            _ => None,
+        };
+        Err(occupied(&path, data_dir, pid))
     }
 
     /// Write the eight lines and make them durable.
@@ -174,62 +187,144 @@ impl PostmasterLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
 
-impl Drop for PostmasterLock {
-    /// Release the directory. A failure here is logged rather than propagated:
-    /// the file left behind is the stale one [`PostmasterLock::acquire`] already
-    /// knows how to take over, so it costs the next start nothing.
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_file(&self.path) {
-            tracing::warn!(
-                path = %self.path.display(),
+    /// Remove a lock file this process holds, by path.
+    ///
+    /// [`Drop`] is the ordinary way, and it is enough for every path that
+    /// *returns*. This exists for the one that does not: a shutdown signal
+    /// during startup ends the process with `exit`, which runs no destructors,
+    /// and a server that has to be stopped before it ever opened its cluster
+    /// should not leave a file behind that the next start has to reason about.
+    ///
+    /// A failure is logged rather than propagated: what is left behind is the
+    /// stale file [`PostmasterLock::acquire`] already knows how to take over.
+    pub fn release_at(path: &Path) {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %path.display(),
                 %error,
                 "could not remove the lock file; the next server will take it over"
-            );
+            ),
         }
     }
 }
 
-/// Decide what an existing lock file means, and clear it if it is stale.
-///
-/// Returns `Ok(())` when the file is gone and the caller may try to create its
-/// own, and an error naming the holder when somebody is running.
-fn take_over(path: &Path, data_dir: &Path) -> io::Result<()> {
-    let pid = holder_pid(path);
-    // An unreadable or unparseable first line is not evidence of a live server —
-    // it is a file some other tool wrote, or one a crash left half-created — so
-    // it is treated as stale rather than blocking every future start.
-    if let Some(pid) = pid
-        && process_is_alive(pid)
-    {
-        return Err(occupied(path, data_dir, Some(pid)));
+impl Drop for PostmasterLock {
+    fn drop(&mut self) {
+        Self::release_at(&self.path);
     }
+}
+
+/// Decide what an existing lock file means, and clear it if — and only if — it
+/// is the remnant of a server that is no longer running.
+///
+/// `Ok(())` means the file is gone and the caller may create its own. Every
+/// other reading is an error, because every other reading is either a live
+/// server or a file nobody here can account for: the one outcome worth ruling
+/// out absolutely is two servers over one cluster, and an unlink is how that
+/// happens.
+fn take_over(path: &Path, data_dir: &Path) -> io::Result<()> {
+    let pid = match read_holder(path)? {
+        // Somebody cleared it between the failed create and this read, which is
+        // the state the caller wanted; it retries the create.
+        Holder::Vanished => return Ok(()),
+        Holder::Empty => return Err(empty(path)),
+        Holder::Bogus(line) => return Err(bogus(path, &line)),
+        Holder::Pid(pid) if process_is_alive(pid) => {
+            return Err(occupied(path, data_dir, Some(pid)));
+        }
+        Holder::Pid(pid) => pid,
+    };
     match fs::remove_file(path) {
         Ok(()) => {}
-        // Somebody else cleared it first, which is the outcome we wanted.
+        // Same again: gone is what we were after.
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(at(path, "removing the stale lock file", error)),
     }
     tracing::info!(
         path = %path.display(),
-        pid = pid.unwrap_or(0),
+        pid,
         "removed a stale lock file left by a server that is no longer running"
     );
     Ok(())
 }
 
-/// The PID on line 1, or `None` if the file cannot be read as one.
-fn holder_pid(path: &Path) -> Option<i32> {
-    let mut text = String::new();
-    // Bounded: a lock file is under a kilobyte, and a caller must not be made to
-    // read whatever a stray file at this path happens to hold.
-    File::open(path)
-        .ok()?
-        .take(1024)
-        .read_to_string(&mut text)
-        .ok()?;
-    text.lines().next()?.trim().parse().ok()
+/// What an existing lock file says, once every way of reading it has been
+/// distinguished from every other.
+///
+/// The distinctions are the point. Folded together — as one `Option<i32>` where
+/// `None` meant "unreadable, unparseable or absent" — they turned an EACCES on
+/// somebody else's lock file into "no live holder" and unlinked it, and turned
+/// the empty file of a server that is *this moment* between its `O_EXCL` create
+/// and its first write into the same thing.
+enum Holder {
+    /// Gone by the time it was read.
+    Vanished,
+    /// Zero length: either a server is in the window described above, or one
+    /// crashed inside it.
+    Empty,
+    /// A first line that is not a PID, so nothing here wrote it.
+    Bogus(String),
+    Pid(i32),
+}
+
+/// Read an existing lock file, or fail saying why it could not be read.
+fn read_holder(path: &Path) -> io::Result<Holder> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Holder::Vanished),
+        Err(error) => return Err(at(path, "reading", error)),
+    };
+    // Bounded: a lock file is under a kilobyte, and a stray file at this path
+    // must not be read into memory whole. Lossy, for the same reason the parse
+    // below is fallible — a first line that is not UTF-8 is `Bogus`, not a
+    // failure to classify.
+    let mut bytes = Vec::new();
+    file.take(1024)
+        .read_to_end(&mut bytes)
+        .map_err(|error| at(path, "reading", error))?;
+    let text = String::from_utf8_lossy(&bytes);
+
+    let first = text.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return Ok(Holder::Empty);
+    }
+    match first.parse::<i32>() {
+        // A non-positive PID cannot name a process: `kill` reads 0 as "this
+        // process group" and -1 as "everything we may signal", so parsing one
+        // and asking about it would be asking the wrong question entirely.
+        Ok(pid) if pid > 0 => Ok(Holder::Pid(pid)),
+        _ => Ok(Holder::Bogus(first.to_string())),
+    }
+}
+
+/// A lock file of zero length. PostgreSQL refuses on this too, and for the
+/// reason the hint gives: it is indistinguishable from a server that has just
+/// created its own, so treating it as stale is how two servers end up sharing a
+/// cluster.
+fn empty(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "lock file \"{}\" is empty — either another server is starting, or one \
+             crashed while starting; remove it if no server is running",
+            path.display()
+        ),
+    )
+}
+
+/// A lock file this server did not write. Left alone: it belongs to whatever
+/// put it there, and an operator who has read this can remove it in one command.
+fn bogus(path: &Path, line: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "bogus data in lock file \"{}\": \"{line}\" — remove it if no server is running",
+            path.display()
+        ),
+    )
 }
 
 /// The error a second server gets. Two sentences, because the first says what is
@@ -394,20 +489,87 @@ mod tests {
         assert_eq!(lines(&lock.path)[0], std::process::id().to_string());
     }
 
-    /// Not written by a server at all: an empty file, a truncated one, a file
-    /// somebody's editor left. None of these is evidence that a server runs, and
-    /// treating them as one would make the directory unopenable by hand.
+    /// An empty file is what a server looks like between its `O_EXCL` create and
+    /// its first write. Taking it over would put two servers in one cluster, so
+    /// it is refused — and the message has to say what to do about the other
+    /// case, a crash inside that window.
     #[test]
-    fn an_unreadable_file_is_taken_over() {
-        for contents in ["", "\n", "not a pid\n", "0\n", "-1\n"] {
+    fn an_empty_file_is_refused_as_a_server_that_may_be_starting() {
+        for contents in ["", "\n", "   \n"] {
             let dir = tempfile::tempdir().expect("a temp dir");
-            fs::write(dir.path().join(LOCK_FILE), contents).expect("a bogus file");
+            let path = dir.path().join(LOCK_FILE);
+            fs::write(&path, contents).expect("an empty file");
 
-            let lock = PostmasterLock::acquire(dir.path(), &info())
-                .unwrap_or_else(|e| panic!("{contents:?} must not lock the directory: {e}"));
+            let error = match PostmasterLock::acquire(dir.path(), &info()) {
+                Ok(_) => panic!("{contents:?} must not be taken over"),
+                Err(error) => error,
+            };
 
-            assert_eq!(lines(&lock.path)[0], std::process::id().to_string());
+            let text = error.to_string();
+            assert!(text.contains("is empty"), "unhelpful error: {text}");
+            assert!(
+                text.contains("another server is starting"),
+                "the error must say what the file might be: {text}"
+            );
+            assert!(path.exists(), "an empty lock file must not be removed");
         }
+    }
+
+    /// A file with a first line nothing here wrote: somebody's editor, another
+    /// tool, a half-written something. Not evidence of a live server, but not
+    /// ours to unlink either.
+    #[test]
+    fn a_bogus_file_is_refused_and_left_alone() {
+        for contents in ["not a pid\n", "0\n", "-1\n", "\u{feff}42\n"] {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let path = dir.path().join(LOCK_FILE);
+            fs::write(&path, contents).expect("a bogus file");
+
+            let error = match PostmasterLock::acquire(dir.path(), &info()) {
+                Ok(_) => panic!("{contents:?} must not be taken over"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let text = error.to_string();
+            assert!(text.contains("bogus data"), "unhelpful error: {text}");
+            assert!(path.exists(), "a bogus lock file must not be removed");
+            assert_eq!(
+                fs::read_to_string(&path).expect("still there"),
+                contents,
+                "the file must be untouched"
+            );
+        }
+    }
+
+    /// The regression this test exists for: a lock file that cannot be *read*
+    /// used to classify as "no live holder" and be unlinked. On a data directory
+    /// owned by another account — the case `initdb` deliberately tolerates —
+    /// that is a second server over a cluster that is already open.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_an_error_rather_than_a_takeover() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` reads one integer out of the kernel and touches
+        // nothing of ours. Root can read a `0000` file, which would make this
+        // test assert the opposite of what it is for.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join(LOCK_FILE);
+        fs::write(&path, "424242\n").expect("a lock file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let error = PostmasterLock::acquire(dir.path(), &info())
+            .expect_err("an unreadable file is an error");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains(LOCK_FILE),
+            "the error must name the file: {error}"
+        );
+        assert!(path.exists(), "an unreadable lock file must not be removed");
     }
 
     /// The lock file is created inside the data directory, so an absent one is
