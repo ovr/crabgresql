@@ -541,6 +541,8 @@ fn adoption_keeps_the_roles_a_legacy_cluster_already_had() -> anyhow::Result<()>
 #[cfg(unix)]
 #[test]
 fn the_role_catalog_is_owner_only() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir()?;
     initdb::init_data_dir(
         dir.path(),
@@ -555,6 +557,17 @@ fn the_role_catalog_is_owner_only() -> anyhow::Result<()> {
     // new file every time a role changes.
     let roles = crabgresql_server::RoleCatalog::open(dir.path(), "ignored")?;
     roles.rename_role(crabgresql_server::DEFAULT_SUPERUSER, "bob")?;
+    assert_eq!(mode(&dir.path().join("crabgresql_authid")), 0o600);
+
+    // A rewrite goes through a temporary file that is renamed over the
+    // catalog, and a rename carries the *temporary* file's mode. One left
+    // behind by a crash — or by a build from before this file was owner-only —
+    // would otherwise publish the verifiers world-readable, because the mode on
+    // `open(2)` applies only when it creates the file.
+    let tmp = dir.path().join("crabgresql_authid.tmp");
+    fs::write(&tmp, b"leftover")?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))?;
+    roles.rename_role("bob", "carol")?;
     assert_eq!(mode(&dir.path().join("crabgresql_authid")), 0o600);
 
     Ok(())

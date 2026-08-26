@@ -19263,3 +19263,85 @@ async fn an_md5_password_is_refused_with_an_explanation() -> anyhow::Result<()> 
 
     Ok(())
 }
+
+/// `VALID UNTIL` is the password's expiry, and it has to be consulted at login:
+/// a date stored in `pg_authid` that nothing reads is a password policy that
+/// does not exist.
+#[tokio::test]
+async fn an_expired_password_does_not_authenticate() -> anyhow::Result<()> {
+    use tokio_postgres::error::SqlState;
+
+    let port = spawn_server().await;
+    let setup = connect(port).await;
+    setup
+        .batch_execute(
+            "CREATE ROLE expired LOGIN PASSWORD 'sekret' VALID UNTIL '2000-01-01 00:00:00+00';
+             CREATE ROLE eternal LOGIN PASSWORD 'sekret' VALID UNTIL 'infinity';
+             CREATE ROLE renewed LOGIN PASSWORD 'sekret' VALID UNTIL '2999-01-01 00:00:00+00'",
+        )
+        .await?;
+
+    let error = connect_refused(port, "expired", Some("sekret")).await;
+    let db = error.as_db_error().expect("a database error");
+    assert_eq!(db.code(), &SqlState::INVALID_PASSWORD);
+    assert_eq!(db.message(), "password for role \"expired\" has expired");
+
+    // `'infinity'` is stored as an ordinary value at the end of the range, so
+    // it needs no case of its own — but it must not read as "long past".
+    for user in ["eternal", "renewed"] {
+        let client = connect_with_password(port, user, "sekret").await;
+        assert_eq!(
+            rows(&client.simple_query("SELECT current_user").await?)[0].get(0),
+            Some(user)
+        );
+    }
+
+    // The expiry belongs to the password, not to the role: without one there is
+    // nothing to expire, and the role connects on trust as it always did.
+    setup
+        .batch_execute("ALTER ROLE expired PASSWORD NULL")
+        .await?;
+    let client = connect_as(port, "expired", "postgres").await;
+    assert_eq!(
+        rows(&client.simple_query("SELECT current_user").await?)[0].get(0),
+        Some("expired")
+    );
+
+    Ok(())
+}
+
+/// A password that merely looks like a stored verifier is a password.
+///
+/// Kept verbatim it would be a role nothing can authenticate — the login path
+/// parses the stored string, fails, and refuses every connection from then on.
+#[tokio::test]
+async fn a_scram_shaped_password_is_hashed_not_stored() -> anyhow::Result<()> {
+    let port = spawn_server().await;
+    let setup = connect(port).await;
+    // Right prefix, nothing else: not a verifier, so it is the plaintext it
+    // looks like.
+    setup
+        .batch_execute("CREATE ROLE impostor LOGIN PASSWORD 'SCRAM-SHA-256$nonsense'")
+        .await?;
+
+    let stored = setup
+        .simple_query("SELECT rolpassword FROM pg_authid WHERE rolname = 'impostor'")
+        .await?;
+    let stored = rows(&stored)[0]
+        .get(0)
+        .expect("a stored password")
+        .to_string();
+    assert_ne!(
+        stored, "SCRAM-SHA-256$nonsense",
+        "it should have been hashed"
+    );
+
+    // And it is usable as what it is: the password.
+    let client = connect_with_password(port, "impostor", "SCRAM-SHA-256$nonsense").await;
+    assert_eq!(
+        rows(&client.simple_query("SELECT current_user").await?)[0].get(0),
+        Some("impostor")
+    );
+
+    Ok(())
+}

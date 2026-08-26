@@ -1119,17 +1119,28 @@ pub mod scram {
     }
 
     /// Whether the string is already a stored verifier rather than a plaintext
-    /// password. `md5` needs the length check: it is a 32-hex-digit digest, and
-    /// a plaintext password may well start with those three letters.
+    /// password.
+    ///
+    /// A SCRAM verifier has to *parse*, not merely start with the right
+    /// letters. Storing an unparseable `SCRAM-SHA-256$…` verbatim would leave a
+    /// role whose password can never be checked — [`Verifier::parse`] returns
+    /// `None` at login and the connection is refused forever, including for the
+    /// bootstrap superuser. PostgreSQL parses it here too, and hashes what does
+    /// not parse as the plaintext it evidently is.
     fn is_verifier(password: &str) -> bool {
-        password.starts_with(PREFIX)
-            || (password.len() == 35
-                && password.starts_with("md5")
-                && password[3..].bytes().all(|b| b.is_ascii_hexdigit()))
+        Verifier::parse(password).is_some() || is_md5(password)
+    }
+
+    /// A legacy `md5<32 hex digits>` hash. The length check is what tells it
+    /// from a plaintext password that merely starts with those three letters.
+    fn is_md5(password: &str) -> bool {
+        password.len() == 35
+            && password.starts_with("md5")
+            && password[3..].bytes().all(|b| b.is_ascii_hexdigit())
     }
 
     fn build(password: &str, salt: &[u8], iterations: u32) -> String {
-        let salted = pbkdf2_sha256(password.as_bytes(), salt, iterations);
+        let salted = pbkdf2_sha256(&prepare(password), salt, iterations);
         let client_key = hmac_sha256(&salted, b"Client Key");
         let stored_key = Sha256::digest(client_key).to_vec();
         let server_key = hmac_sha256(&salted, b"Server Key");
@@ -1139,6 +1150,25 @@ pub mod scram {
             base64(&stored_key),
             base64(&server_key),
         )
+    }
+
+    /// The bytes a password is hashed as: SASLprep (RFC 4013), which RFC 7677
+    /// requires of both sides of the exchange.
+    ///
+    /// Not an optional nicety — the *client* preps the password before it
+    /// computes its proof, so a server that skipped this would produce a
+    /// verifier no client could ever match. With `--pwfile` that locks the only
+    /// role a fresh cluster has out of it.
+    ///
+    /// A password SASLprep refuses (invalid UTF-8, a prohibited character) is
+    /// hashed as it arrived rather than rejected. That is what PostgreSQL does,
+    /// and what the drivers do, so the two halves still agree; refusing would
+    /// instead make a password unusable that a client is perfectly able to send.
+    pub fn prepare(password: &str) -> Vec<u8> {
+        match stringprep::saslprep(password) {
+            Ok(prepared) => prepared.into_owned().into_bytes(),
+            Err(_) => password.as_bytes().to_vec(),
+        }
     }
 
     /// PBKDF2 with HMAC-SHA-256 and a 32-byte output, which is exactly one
@@ -1248,6 +1278,34 @@ pub mod scram {
             let scram = build("secret", b"0123456789abcdef", 4096);
             assert_eq!(encrypt(&scram), scram);
             assert!(encrypt("md5secret").starts_with("SCRAM-SHA-256$"));
+        }
+
+        /// A password that *looks* like a verifier but is not one is a
+        /// password, and gets hashed.
+        ///
+        /// Storing it verbatim would leave a role nothing can authenticate:
+        /// the login path parses the stored string, gets `None`, and refuses
+        /// the connection — every time, forever, with no way back in if it is
+        /// the only superuser. PostgreSQL parses it here for the same reason.
+        #[test]
+        fn a_scram_shaped_string_that_does_not_parse_is_a_password() {
+            for impostor in [
+                "SCRAM-SHA-256$",
+                "SCRAM-SHA-256$4096:not-base64",
+                // Parses as far as its shape goes, but the keys are the wrong
+                // length — a truncated digest is a weaker check, not a failing
+                // one, so `Verifier::parse` refuses it and so must this.
+                "SCRAM-SHA-256$4096:c2FsdA==$c2hvcnQ=:c2hvcnQ=",
+                // A plausible password that happens to start this way.
+                "SCRAM-SHA-256$ecret",
+            ] {
+                let stored = encrypt(impostor);
+                assert_ne!(stored, impostor, "{impostor:?} should have been hashed");
+                assert!(
+                    Verifier::parse(&stored).is_some(),
+                    "{impostor:?} produced a verifier that does not parse: {stored}"
+                );
+            }
         }
     }
 }

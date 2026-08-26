@@ -59,6 +59,11 @@ parquet = { version = "59.1", default-features = false, features = ["arrow", "sn
 rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
 sha2 = { version = "0.11", default-features = false }
 similar = "2"
+# SASLprep (RFC 4013) over a password before it is hashed into a SCRAM
+# verifier. The same crate libpq's Rust equivalents use, which is the point:
+# both sides of a SCRAM exchange have to prepare the password identically or a
+# non-ASCII one can never be matched.
+stringprep = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "process", "sync", "signal", "time"] }
 tracing = "0.1"

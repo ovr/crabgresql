@@ -102,11 +102,33 @@ where
         writer.authentication_ok();
         return Ok(Ok(()));
     };
+    // `VALID UNTIL` is the *password's* expiry, not the role's — which is why
+    // this sits below the trust path rather than above it: a role with no
+    // password and a date long past still connects, as it does in PostgreSQL.
+    //
+    // `'infinity'` and `'-infinity'` are stored as the ends of the `i64` range,
+    // so they need no branch of their own: one never expires and the other
+    // always has.
+    if let Some(expires) = user.valid_until
+        && expires <= crabgresql_types::tz::now_micros()
+    {
+        // PostgreSQL keeps this reason to the server log and tells the client
+        // only that the password failed. Saying it outright does admit to an
+        // unauthenticated client that the role exists — deliberately, because
+        // an operator staring at "password authentication failed" for a
+        // password they know is right has no way to reach the real answer.
+        return Ok(Err(AuthError {
+            code: sqlstate::INVALID_PASSWORD,
+            message: format!("password for role \"{}\" has expired", user.name),
+        }));
+    }
     let Some(verifier) = scram::Verifier::parse(stored) else {
-        // An `md5…` password, or one this build cannot read. PostgreSQL would
-        // answer md5 with AuthenticationMD5Password; this server implements
-        // SCRAM only, and pretending otherwise would fail later and less
-        // clearly.
+        // An `md5…` password: a client may supply one pre-hashed, and it is
+        // stored verbatim. PostgreSQL would answer it with
+        // AuthenticationMD5Password; this server implements SCRAM only, and
+        // pretending otherwise would fail later and less clearly. Anything else
+        // never reaches here — `scram::encrypt` hashes a string it cannot parse
+        // as a verifier rather than storing it.
         return Ok(Err(AuthError {
             code: sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
             message: format!(

@@ -946,10 +946,22 @@ off the catalog instead:
   fallback would hand a superuser session to anyone connecting under an unused
   name, so it becomes a FATAL `28000` instead.
 
+`VALID UNTIL` is the *password's* expiry, not the role's, so it is consulted
+only on the password path: a role with no password and a date long past still
+connects on trust, as it does in PostgreSQL. An expired one is refused with
+`28P01` — naming the expiry, where PostgreSQL keeps that to the server log.
+
+A password is SASLprepped (RFC 4013) before it is hashed, because the client
+preps it before computing its proof; skipping it would make any non-ASCII
+password unmatchable. One SASLprep refuses is hashed as it arrived rather than
+rejected, which is what the drivers do too, so the two halves still agree.
+
 `SCRAM-SHA-256-PLUS` is never advertised: channel binding binds the exchange to
 a TLS session and there is no TLS. An `md5…` password — one a client supplied
 pre-hashed — is refused with a message saying so, rather than answered with a
-method this server does not implement.
+method this server does not implement. A password that merely *looks* like a
+stored verifier but does not parse is a password, and is hashed: keeping it
+verbatim would leave a role nothing could ever authenticate.
 
 ## 4. Workspace layout (crates)
 

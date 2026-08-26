@@ -264,6 +264,11 @@ mod tests {
     /// count the server announced — PBKDF2 the way RFC 8018 defines it for a
     /// single 32-byte block. The one thing a client computes that a server
     /// cannot.
+    ///
+    /// SASLprep first, because that is what a driver does: a helper that hashed
+    /// the raw bytes would be imitating a client that does not exist, and would
+    /// agree with a server that forgot to prep for exactly the same wrong
+    /// reason.
     fn salted_password(password: &str, server_first: &str) -> [u8; 32] {
         let salt =
             crabgresql_types::text::decode(field(server_first, 's').expect("salt"), "base64")
@@ -272,13 +277,14 @@ mod tests {
             .expect("iterations")
             .parse()
             .expect("a decimal iteration count");
+        let password = scram::prepare(password);
 
         let mut block = salt;
         block.extend_from_slice(&1u32.to_be_bytes());
-        let mut u = scram::hmac_sha256(password.as_bytes(), &block);
+        let mut u = scram::hmac_sha256(&password, &block);
         let mut salted = u;
         for _ in 1..iterations {
-            u = scram::hmac_sha256(password.as_bytes(), &u);
+            u = scram::hmac_sha256(&password, &u);
             for (acc, byte) in salted.iter_mut().zip(u.iter()) {
                 *acc ^= byte;
             }
@@ -301,6 +307,38 @@ mod tests {
             .finish(final_message.as_bytes(), "postgres")
             .expect("the proof should check out");
         assert!(server_final.starts_with("v="));
+    }
+
+    /// A password only SASLprep can reconcile.
+    ///
+    /// `U+00AD` (soft hyphen) is one of the characters SASLprep maps to
+    /// nothing, so `"pa\u{ad}ss"` and `"pass"` are the same password to a
+    /// client and must be the same password to the verifier. Without the prep
+    /// on the server side, a `--pwfile` holding this string produces a verifier
+    /// no driver can ever match — and it is the bootstrap superuser's.
+    #[test]
+    fn a_password_is_saslprepped_on_both_sides() {
+        let bare = "n=postgres,r=Zm9vYmFyYmF6";
+        // Built from the string *with* the soft hyphen, as `--pwfile` would.
+        let (exchange, server_first) =
+            Exchange::start(verifier_for("pa\u{ad}ss"), format!("n,,{bare}").as_bytes())
+                .expect("client-first");
+        // Answered by a client that typed it either way: both prep to "pass".
+        for typed in ["pa\u{ad}ss", "pass"] {
+            let final_message = client_final(typed, bare, &server_first);
+            exchange
+                .finish(final_message.as_bytes(), "postgres")
+                .unwrap_or_else(|error| panic!("{typed:?} should authenticate: {}", error.message));
+        }
+        // And a genuinely different password still does not.
+        let wrong = client_final("paSS", bare, &server_first);
+        assert_eq!(
+            exchange
+                .finish(wrong.as_bytes(), "postgres")
+                .expect_err("a different password")
+                .code,
+            sqlstate::INVALID_PASSWORD
+        );
     }
 
     /// The other half of the proof: the client can tell it is talking to a
