@@ -10,10 +10,11 @@
 //! life of the server.
 //!
 //! What this module does *not* do is decide anything: it stores roles, answers
-//! membership questions, and reports PostgreSQL's errors. Authentication (the
-//! stored password is a SCRAM verifier, ready for SASL) and privilege checks on
-//! objects are separate, and neither exists yet — a role with `NOLOGIN` can
-//! still connect, because nothing consults `rolcanlogin` at startup.
+//! membership questions, and reports PostgreSQL's errors. The stored password
+//! is a SCRAM verifier, and [`crate::auth`] is what checks a client against
+//! one; privilege checks on objects are separate again and do not exist yet.
+//! Neither does `rolcanlogin`: a role with `NOLOGIN` can still connect, because
+//! nothing consults it at startup.
 
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
@@ -148,6 +149,20 @@ impl Role {
     }
 }
 
+/// What [`RoleCatalog::login`] found for the name a client connected under.
+#[derive(Clone, Debug)]
+pub enum Login {
+    /// A stored role. Whether it has to prove anything is its `password`: a
+    /// role with one must pass SCRAM, a role without one is trusted.
+    Known(Role),
+    /// No such role, in a cluster where nothing has a password — so there is
+    /// nothing this connection could have been asked to prove. The role is
+    /// synthetic and lives only for this session.
+    Trusted(Role),
+    /// No such role, in a cluster where at least one role has a password.
+    NoSuchRole,
+}
+
 /// One `pg_auth_members` row: `member` is a member of `role`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Membership {
@@ -254,9 +269,12 @@ pub struct RoleCatalog {
 }
 
 impl RoleCatalog {
-    /// Open the catalog stored under `data_dir`, creating it with a single
-    /// bootstrap superuser named `superuser` if the file is not there yet — the
-    /// role set `initdb` would have left behind.
+    /// Open the catalog stored under `data_dir`.
+    ///
+    /// [`write_bootstrap`] is what creates the file, from `initdb`. The
+    /// fallback here — a single bootstrap superuser named `superuser` — is for
+    /// a data directory that predates that, and for callers that open an engine
+    /// directly without going through `initdb` at all.
     pub fn open(data_dir: &Path, superuser: &str) -> io::Result<Self> {
         let path = data_dir.join(ROLE_FILE);
         let store = match std::fs::File::open(&path) {
@@ -329,21 +347,35 @@ impl RoleCatalog {
         self.read().roles.iter().find(|r| r.name == name).cloned()
     }
 
-    /// The role a connection authenticating as `name` runs as.
+    /// Whether any role in the cluster has a password stored.
     ///
-    /// PostgreSQL answers a name it does not have with a FATAL `28000`. This
-    /// server has no authentication yet — every connection is trusted whatever
-    /// it sent — so refusing here would only mean refusing clients that work
-    /// today. Instead the name gets a synthetic superuser role that the catalog
-    /// relations show alongside the stored ones (see [`TRUST_SESSION_ROLE_OID`]),
-    /// and the caller logs that it did.
+    /// The one question the trust fallback in [`RoleCatalog::login`] turns on:
+    /// as long as the answer is no, nothing here can be authenticated against
+    /// and refusing an unknown name would only refuse clients that work today.
+    /// Once it is yes, that fallback would hand a superuser session to anybody
+    /// who connects under a name the catalog does not have — which is every
+    /// password in it bypassed by a typo.
+    pub fn any_password_set(&self) -> bool {
+        self.read().roles.iter().any(|r| r.password.is_some())
+    }
+
+    /// The role a connection authenticating as `name` runs as, and what the
+    /// caller has to do about it.
     ///
-    /// TODO: return `Err(28000)` once startup authenticates, so a role that does
-    /// not exist cannot log in.
-    pub fn login(&self, name: &str) -> Result<Role, Role> {
-        match self.lookup(name) {
-            Some(role) => Ok(role),
-            None => Err(Role {
+    /// PostgreSQL answers a name it does not have with a FATAL `28000`, decided
+    /// by `pg_hba.conf`. There is no such file here, so the answer is read off
+    /// the catalog instead: see [`RoleCatalog::any_password_set`] for why a
+    /// cluster with no passwords keeps trusting an unknown name and one with a
+    /// password stops.
+    pub fn login(&self, name: &str) -> Login {
+        let store = self.read();
+        match store.roles.iter().find(|r| r.name == name) {
+            Some(role) => Login::Known(role.clone()),
+            None if store.roles.iter().any(|r| r.password.is_some()) => Login::NoSuchRole,
+            // A synthetic superuser the catalog relations show alongside the
+            // stored roles (see [`TRUST_SESSION_ROLE_OID`]), so `current_user`
+            // and `pg_stat_activity` still name something that exists.
+            None => Login::Trusted(Role {
                 oid: TRUST_SESSION_ROLE_OID,
                 ..Role::bootstrap(name)
             }),
@@ -717,6 +749,23 @@ fn bootstrap_store(superuser: &str) -> RoleStore {
     }
 }
 
+/// Write the role catalog a fresh cluster starts with: one superuser, and
+/// nothing else. What `initdb` puts on disk before it stamps `PG_VERSION`.
+///
+/// `password` is plaintext and is hashed into a SCRAM verifier here — the
+/// cleartext is never written anywhere. A file that already exists is left
+/// alone: the roles in it are the cluster's, and `initdb` adopting a directory
+/// written before this existed must not replace them.
+pub fn write_bootstrap(data_dir: &Path, superuser: &str, password: Option<&str>) -> io::Result<()> {
+    let path = data_dir.join(ROLE_FILE);
+    if path.exists() {
+        return Ok(());
+    }
+    let mut store = bootstrap_store(superuser);
+    store.roles[0].password = password.map(scram::encrypt);
+    write_atomically(&path, &encode(&store))
+}
+
 fn undefined_role(name: &str) -> PgError {
     PgError::new(
         sqlstate::UNDEFINED_OBJECT,
@@ -761,8 +810,6 @@ fn add_membership(
         .iter()
         .any(|m| m.role == role && m.member == member)
     {
-        // Re-granting is not an error: PostgreSQL says so in a NOTICE and folds
-        // the new options into the existing row.
         let notice = CatalogNotice::new(format!(
             "role \"{}\" has already been granted membership in role \"{}\" by role \"{}\"",
             store.name_of(member),
@@ -978,10 +1025,14 @@ impl<'a> Reader<'a> {
 /// Write `bytes` to `path` so a crash leaves either the old file or the new one:
 /// a temporary file is written and fsynced, renamed over the target, and the
 /// directory fsynced so the rename itself is durable.
+///
+/// The temporary file is owner-only from the moment it exists, and the rename
+/// carries that mode to the target: this file holds password verifiers, and a
+/// verifier is offline-attackable by anyone who can read it.
 fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = crate::initdb::create_private(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -1003,14 +1054,52 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`, base64 as
 /// RFC 5802 defines it.
 ///
-/// Nothing authenticates against this yet — it is stored so `pg_authid` shows
-/// what PostgreSQL shows, and so SASL has the verifier it will need.
+/// This is what `pg_authid.rolpassword` shows, and what [`crate::auth`] checks
+/// a client's SASL exchange against — the crypto lives here, the protocol lives
+/// there.
 pub mod scram {
     use sha2::{Digest, Sha256};
 
     /// PostgreSQL's default `password_encryption` iteration count.
     const ITERATIONS: u32 = 4096;
     const SALT_LEN: usize = 16;
+    pub const PREFIX: &str = "SCRAM-SHA-256$";
+
+    /// A stored verifier taken apart: everything the server side of SCRAM
+    /// needs, and nothing that would let it compute a password.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Verifier {
+        pub iterations: u32,
+        pub salt: Vec<u8>,
+        /// `SHA256(ClientKey)`. What a client's proof is checked against.
+        pub stored_key: Vec<u8>,
+        /// Signs the server's half of the exchange, proving to the client that
+        /// we hold the verifier.
+        pub server_key: Vec<u8>,
+    }
+
+    impl Verifier {
+        /// Read `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`.
+        /// `None` for anything that is not one — an `md5…` password, or a
+        /// verifier this build cannot read.
+        pub fn parse(stored: &str) -> Option<Verifier> {
+            let rest = stored.strip_prefix(PREFIX)?;
+            let (params, keys) = rest.split_once('$')?;
+            let (iterations, salt) = params.split_once(':')?;
+            let (stored_key, server_key) = keys.split_once(':')?;
+            let b64 = |s: &str| crabgresql_types::text::decode(s, "base64").ok();
+            Some(Verifier {
+                iterations: iterations.parse().ok()?,
+                salt: b64(salt)?,
+                // A key of the wrong length would make `verify` compare against
+                // a truncated digest, which is a weaker check rather than a
+                // failing one — so it is refused here, where it is still a
+                // parse question.
+                stored_key: b64(stored_key).filter(|k| k.len() == 32)?,
+                server_key: b64(server_key).filter(|k| k.len() == 32)?,
+            })
+        }
+    }
 
     /// Hash `password` into a verifier, unless it already is one: a client may
     /// send a pre-computed `SCRAM-SHA-256$…` or legacy `md5…` string, and
@@ -1025,17 +1114,28 @@ pub mod scram {
     }
 
     /// Whether the string is already a stored verifier rather than a plaintext
-    /// password. `md5` needs the length check: it is a 32-hex-digit digest, and
-    /// a plaintext password may well start with those three letters.
+    /// password.
+    ///
+    /// A SCRAM verifier has to *parse*, not merely start with the right
+    /// letters. Storing an unparseable `SCRAM-SHA-256$…` verbatim would leave a
+    /// role whose password can never be checked — [`Verifier::parse`] returns
+    /// `None` at login and the connection is refused forever, including for the
+    /// bootstrap superuser. PostgreSQL parses it here too, and hashes what does
+    /// not parse as the plaintext it evidently is.
     fn is_verifier(password: &str) -> bool {
-        password.starts_with("SCRAM-SHA-256$")
-            || (password.len() == 35
-                && password.starts_with("md5")
-                && password[3..].bytes().all(|b| b.is_ascii_hexdigit()))
+        Verifier::parse(password).is_some() || is_md5(password)
+    }
+
+    /// A legacy `md5<32 hex digits>` hash. The length check is what tells it
+    /// from a plaintext password that merely starts with those three letters.
+    fn is_md5(password: &str) -> bool {
+        password.len() == 35
+            && password.starts_with("md5")
+            && password[3..].bytes().all(|b| b.is_ascii_hexdigit())
     }
 
     fn build(password: &str, salt: &[u8], iterations: u32) -> String {
-        let salted = pbkdf2_sha256(password.as_bytes(), salt, iterations);
+        let salted = pbkdf2_sha256(&prepare(password), salt, iterations);
         let client_key = hmac_sha256(&salted, b"Client Key");
         let stored_key = Sha256::digest(client_key).to_vec();
         let server_key = hmac_sha256(&salted, b"Server Key");
@@ -1045,6 +1145,25 @@ pub mod scram {
             base64(&stored_key),
             base64(&server_key),
         )
+    }
+
+    /// The bytes a password is hashed as: SASLprep (RFC 4013), which RFC 7677
+    /// requires of both sides of the exchange.
+    ///
+    /// Not an optional nicety — the *client* preps the password before it
+    /// computes its proof, so a server that skipped this would produce a
+    /// verifier no client could ever match. With `--pwfile` that locks the only
+    /// role a fresh cluster has out of it.
+    ///
+    /// A password SASLprep refuses (invalid UTF-8, a prohibited character) is
+    /// hashed as it arrived rather than rejected. That is what PostgreSQL does,
+    /// and what the drivers do, so the two halves still agree; refusing would
+    /// instead make a password unusable that a client is perfectly able to send.
+    pub fn prepare(password: &str) -> Vec<u8> {
+        match stringprep::saslprep(password) {
+            Ok(prepared) => prepared.into_owned().into_bytes(),
+            Err(_) => password.as_bytes().to_vec(),
+        }
     }
 
     /// PBKDF2 with HMAC-SHA-256 and a 32-byte output, which is exactly one
@@ -1065,7 +1184,7 @@ pub mod scram {
     }
 
     /// HMAC-SHA-256 (RFC 2104). SHA-256's block size is 64 bytes.
-    fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
         const BLOCK: usize = 64;
         let mut padded = [0u8; BLOCK];
         if key.len() > BLOCK {
@@ -1086,7 +1205,7 @@ pub mod scram {
     /// Unwrapped base64. `crabgresql_types`' own encoder is `encode(bytea,
     /// 'base64')`, which wraps at 76 columns because PostgreSQL's does — a
     /// verifier must not carry newlines.
-    fn base64(bytes: &[u8]) -> String {
+    pub fn base64(bytes: &[u8]) -> String {
         const ALPHABET: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -1154,6 +1273,34 @@ pub mod scram {
             let scram = build("secret", b"0123456789abcdef", 4096);
             assert_eq!(encrypt(&scram), scram);
             assert!(encrypt("md5secret").starts_with("SCRAM-SHA-256$"));
+        }
+
+        /// A password that *looks* like a verifier but is not one is a
+        /// password, and gets hashed.
+        ///
+        /// Storing it verbatim would leave a role nothing can authenticate:
+        /// the login path parses the stored string, gets `None`, and refuses
+        /// the connection — every time, forever, with no way back in if it is
+        /// the only superuser. PostgreSQL parses it here for the same reason.
+        #[test]
+        fn a_scram_shaped_string_that_does_not_parse_is_a_password() {
+            for impostor in [
+                "SCRAM-SHA-256$",
+                "SCRAM-SHA-256$4096:not-base64",
+                // Parses as far as its shape goes, but the keys are the wrong
+                // length — a truncated digest is a weaker check, not a failing
+                // one, so `Verifier::parse` refuses it and so must this.
+                "SCRAM-SHA-256$4096:c2FsdA==$c2hvcnQ=:c2hvcnQ=",
+                // A plausible password that happens to start this way.
+                "SCRAM-SHA-256$ecret",
+            ] {
+                let stored = encrypt(impostor);
+                assert_ne!(stored, impostor, "{impostor:?} should have been hashed");
+                assert!(
+                    Verifier::parse(&stored).is_some(),
+                    "{impostor:?} produced a verifier that does not parse: {stored}"
+                );
+            }
         }
     }
 }

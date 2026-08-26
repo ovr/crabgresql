@@ -874,6 +874,7 @@ contents serve the same purpose:
 <PGDATA>/
   PG_VERSION           # major version that wrote this directory
   postmaster.pid       # the running server's PID; absent when none is running
+  crabgresql_authid    # the cluster's roles (pg_authid), owner-only
   base/                # one file per heap/index relfilenode
   global/
     pg_control         # redo point, XID floor, clean-shutdown flag
@@ -888,6 +889,13 @@ Creation is a single operation (`crabgresql_server::initdb`), reached either
 from `crabgresql initdb -D <dir>` or from the server itself when it is started
 on an absent or empty directory. The two differ in one answer: `initdb` refuses
 a directory that already holds a cluster, and the server expects one.
+
+Roles are a cluster object, so the role catalog is created there too — before
+`PG_VERSION`, like everything the stamp vouches for. `--superuser` names the
+bootstrap role and `--pwfile` gives it a password, hashed into a SCRAM verifier
+on the way to disk. Only `initdb` takes a password: the server creating a
+cluster in passing has nowhere to have got one from, so a role it bootstraps
+has none and is therefore trusted (§3.5).
 
 `PG_VERSION` is written **last** and fsynced, which is what makes it a marker
 rather than a field: everything it vouches for is on disk before it is. It
@@ -919,6 +927,41 @@ write, so unlinking it is how two servers end up in one cluster. Two servers
 replaying one WAL into one set of relation files is the failure all of this
 rules out, and the `initdb` subcommand takes the same lock, since rewriting the
 skeleton of a live cluster is that failure with a different command line.
+
+### 3.5 Authentication
+
+SCRAM-SHA-256 (`crabgresql-server/src/auth.rs`), against the verifier stored in
+the role catalog. The exchange is a pure state machine — the connection handler
+does the reading and writing, the crypto lives with the verifier format in
+`roles::scram`, and this decides only what the answers are.
+
+There is no `pg_hba.conf`, so *whether* a connection must authenticate is read
+off the catalog instead:
+
+* a role with a stored password must pass SCRAM;
+* a role without one is trusted, which is how every cluster starts and how one
+  that never sets a password keeps behaving;
+* a name the catalog does not have gets a synthetic superuser session — but
+  only while nothing in the cluster has a password. Once something does, the
+  fallback would hand a superuser session to anyone connecting under an unused
+  name, so it becomes a FATAL `28000` instead.
+
+`VALID UNTIL` is the *password's* expiry, not the role's, so it is consulted
+only on the password path: a role with no password and a date long past still
+connects on trust, as it does in PostgreSQL. An expired one is refused with
+`28P01` — naming the expiry, where PostgreSQL keeps that to the server log.
+
+A password is SASLprepped (RFC 4013) before it is hashed, because the client
+preps it before computing its proof; skipping it would make any non-ASCII
+password unmatchable. One SASLprep refuses is hashed as it arrived rather than
+rejected, which is what the drivers do too, so the two halves still agree.
+
+`SCRAM-SHA-256-PLUS` is never advertised: channel binding binds the exchange to
+a TLS session and there is no TLS. An `md5…` password — one a client supplied
+pre-hashed — is refused with a message saying so, rather than answered with a
+method this server does not implement. A password that merely *looks* like a
+stored verifier but does not parse is a password, and is hashed: keeping it
+verbatim would leave a role nothing could ever authenticate.
 
 ## 4. Workspace layout (crates)
 

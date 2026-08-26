@@ -127,3 +127,9 @@ pub const IO_ERROR: &str = "58030";
 /// `58P01` — a file named by a statement could not be opened or read
 /// (`COPY … FROM '<file>'`).
 pub const UNDEFINED_FILE: &str = "58P01";
+/// `28000` — class 28, invalid authorization specification: the role a
+/// connection names does not exist, or cannot be authenticated the way its
+/// stored password would require.
+pub const INVALID_AUTHORIZATION_SPECIFICATION: &str = "28000";
+/// `28P01` — the password a connection offered is not the role's.
+pub const INVALID_PASSWORD: &str = "28P01";

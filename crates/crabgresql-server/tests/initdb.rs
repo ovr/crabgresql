@@ -20,6 +20,14 @@ fn assert_is_cluster(dir: &Path) {
             "{sub} should exist under the cluster"
         );
     }
+    // Roles are a cluster object, so the catalog holding them is part of what a
+    // cluster is. Before `initdb` wrote it, a stamped directory could still be
+    // missing one, and whichever server opened it first got to invent its
+    // `pg_authid`.
+    assert!(
+        dir.join("crabgresql_authid").is_file(),
+        "the role catalog should exist under the cluster"
+    );
     let version = fs::read_to_string(dir.join(PG_VERSION_FILE)).expect("a version stamp");
     assert_eq!(
         version,
@@ -153,7 +161,7 @@ fn initdb_refuses_a_directory_that_already_holds_a_cluster() -> anyhow::Result<(
 
     // The server, unlike initdb, expects to find a cluster there.
     assert_eq!(
-        initdb::ensure_initialized(dir.path())?,
+        initdb::ensure_initialized(dir.path(), crabgresql_server::DEFAULT_SUPERUSER)?,
         Outcome::AlreadyInitialized
     );
 
@@ -169,7 +177,7 @@ fn a_non_empty_foreign_directory_is_refused() -> anyhow::Result<()> {
 
     for result in [
         initdb::init_data_dir(dir.path(), &InitOptions::default()),
-        initdb::ensure_initialized(dir.path()),
+        initdb::ensure_initialized(dir.path(), crabgresql_server::DEFAULT_SUPERUSER),
     ] {
         let error = result.expect_err("a foreign directory must be refused");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -220,7 +228,7 @@ fn a_postgresql_data_directory_is_refused_intact() -> anyhow::Result<()> {
 
         for result in [
             initdb::init_data_dir(dir.path(), &InitOptions::default()),
-            initdb::ensure_initialized(dir.path()),
+            initdb::ensure_initialized(dir.path(), crabgresql_server::DEFAULT_SUPERUSER),
         ] {
             let error = result.expect_err("somebody else's cluster must be refused");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -263,7 +271,7 @@ fn our_own_corrupt_control_file_is_still_ours() -> anyhow::Result<()> {
     fs::write(&path, &bytes)?;
 
     assert_eq!(
-        initdb::ensure_initialized(dir.path())?,
+        initdb::ensure_initialized(dir.path(), crabgresql_server::DEFAULT_SUPERUSER)?,
         Outcome::AlreadyInitialized
     );
     let (engine, txnmgr) = crabgresql_server::open_pg_engine(dir.path())?;
@@ -320,13 +328,13 @@ fn a_cluster_from_before_the_version_stamp_is_adopted() -> anyhow::Result<()> {
     assert!(!dir.path().join(PG_VERSION_FILE).exists());
 
     assert_eq!(
-        initdb::ensure_initialized(dir.path())?,
+        initdb::ensure_initialized(dir.path(), crabgresql_server::DEFAULT_SUPERUSER)?,
         Outcome::AdoptedLegacy
     );
     assert_is_cluster(dir.path());
     // Stamped once: the next start is an ordinary one.
     assert_eq!(
-        initdb::ensure_initialized(dir.path())?,
+        initdb::ensure_initialized(dir.path(), crabgresql_server::DEFAULT_SUPERUSER)?,
         Outcome::AlreadyInitialized
     );
 
@@ -351,7 +359,7 @@ fn an_adopted_cluster_is_restricted_too() -> anyhow::Result<()> {
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))?;
 
     assert_eq!(
-        initdb::ensure_initialized(dir.path())?,
+        initdb::ensure_initialized(dir.path(), crabgresql_server::DEFAULT_SUPERUSER)?,
         Outcome::AdoptedLegacy
     );
     assert_eq!(mode(dir.path()), 0o700);
@@ -367,7 +375,7 @@ fn a_cluster_from_another_version_is_refused() -> anyhow::Result<()> {
     initdb::init_data_dir(dir.path(), &InitOptions::default())?;
     fs::write(dir.path().join(PG_VERSION_FILE), "12\n")?;
 
-    let error = initdb::ensure_initialized(dir.path())
+    let error = initdb::ensure_initialized(dir.path(), crabgresql_server::DEFAULT_SUPERUSER)
         .expect_err("an incompatible cluster must not be opened");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     let message = error.to_string();
@@ -385,11 +393,181 @@ fn a_cluster_from_another_version_is_refused() -> anyhow::Result<()> {
 #[test]
 fn no_sync_writes_the_same_cluster() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    initdb::init_data_dir(dir.path(), &InitOptions { sync: false })?;
+    initdb::init_data_dir(
+        dir.path(),
+        &InitOptions {
+            sync: false,
+            ..InitOptions::default()
+        },
+    )?;
     assert_is_cluster(dir.path());
 
     let (engine, txnmgr) = crabgresql_server::open_pg_engine(dir.path())?;
     drop((engine, txnmgr));
+
+    Ok(())
+}
+
+/// `--superuser` used to be readable only by the server, so `initdb` left a
+/// cluster owned by `postgres` whatever it was given. The name now reaches the
+/// catalog `initdb` writes, which is the only place it can still be honored —
+/// the server refuses to rename a superuser it finds already stored.
+#[test]
+fn the_bootstrap_superuser_is_the_one_initdb_was_given() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    initdb::init_data_dir(
+        dir.path(),
+        &InitOptions {
+            superuser: "bob".into(),
+            ..InitOptions::default()
+        },
+    )?;
+
+    // Opened with a *different* name, so a catalog that ignored `initdb` and
+    // bootstrapped itself here would show `carol` and fail.
+    let roles = crabgresql_server::RoleCatalog::open(dir.path(), "carol")?;
+    let bob = roles.lookup("bob").expect("initdb's superuser");
+    assert!(bob.superuser && bob.canlogin);
+    assert!(roles.lookup("carol").is_none());
+    assert!(roles.lookup("postgres").is_none());
+
+    Ok(())
+}
+
+/// Without `--pwfile` the superuser has no password, and a role with no
+/// password is trusted rather than authenticated. That is the shape every
+/// cluster had before `--pwfile` existed.
+#[test]
+fn a_cluster_without_a_password_file_has_no_password() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    initdb::init_data_dir(dir.path(), &InitOptions::default())?;
+
+    let roles = crabgresql_server::RoleCatalog::open(dir.path(), "ignored")?;
+    let superuser = roles
+        .lookup(crabgresql_server::DEFAULT_SUPERUSER)
+        .expect("the bootstrap superuser");
+    assert_eq!(superuser.password, None);
+    assert!(!roles.any_password_set());
+
+    Ok(())
+}
+
+/// `--pwfile` stores a SCRAM verifier, never the password: the file on disk
+/// must not contain the cleartext anywhere.
+#[test]
+fn a_password_file_becomes_a_scram_verifier() -> anyhow::Result<()> {
+    let parent = tempfile::tempdir()?;
+    let pwfile = parent.path().join("pw");
+    // A trailing newline is what `printf 'secret\n' > pw` leaves, and it is not
+    // part of the password.
+    fs::write(&pwfile, "secret\nignored second line\n")?;
+    let dir = parent.path().join("pgdata");
+
+    initdb::init_data_dir(
+        &dir,
+        &InitOptions {
+            password: Some(initdb::password_from_file(&pwfile)?),
+            ..InitOptions::default()
+        },
+    )?;
+
+    let roles = crabgresql_server::RoleCatalog::open(&dir, "ignored")?;
+    let stored = roles
+        .lookup(crabgresql_server::DEFAULT_SUPERUSER)
+        .expect("the bootstrap superuser")
+        .password
+        .expect("a password");
+    assert!(stored.starts_with("SCRAM-SHA-256$4096:"), "{stored}");
+    assert!(roles.any_password_set());
+
+    let raw = fs::read(dir.join("crabgresql_authid"))?;
+    assert!(
+        !raw.windows(6).any(|w| w == b"secret"),
+        "the cleartext password must not reach the disk"
+    );
+
+    Ok(())
+}
+
+/// An empty `--pwfile` is a mistake, not a request for no password: somebody
+/// who passed the flag asked for one, and creating a trusted superuser instead
+/// would be the opposite of what they asked for.
+#[test]
+fn an_empty_password_file_is_refused() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pwfile = dir.path().join("pw");
+    fs::write(&pwfile, "\n")?;
+
+    let error = initdb::password_from_file(&pwfile).expect_err("an empty password file");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        error.to_string().contains(&pwfile.display().to_string()),
+        "the complaint should name the file: {error}"
+    );
+
+    let missing = initdb::password_from_file(&dir.path().join("nope"))
+        .expect_err("a password file that does not exist");
+    assert!(missing.to_string().contains("nope"), "{missing}");
+
+    Ok(())
+}
+
+/// A cluster from before `initdb` wrote the role catalog has roles of its own,
+/// stored by the server that created them. Adoption must not replace them.
+#[test]
+fn adoption_keeps_the_roles_a_legacy_cluster_already_had() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (engine, txnmgr) = crabgresql_server::open_pg_engine(dir.path())?;
+    drop((engine, txnmgr));
+    // The role catalog such a cluster grew on its first start.
+    drop(crabgresql_server::RoleCatalog::open(dir.path(), "bob")?);
+
+    assert_eq!(
+        initdb::ensure_initialized(dir.path(), "carol")?,
+        Outcome::AdoptedLegacy
+    );
+
+    let roles = crabgresql_server::RoleCatalog::open(dir.path(), "dave")?;
+    assert!(roles.lookup("bob").is_some(), "the stored role survives");
+    assert!(roles.lookup("carol").is_none());
+
+    Ok(())
+}
+
+/// The role catalog holds password verifiers, which are offline-attackable by
+/// anyone who can read them. The `0700` on the directory is the outer fence;
+/// the file's own mode is the inner one.
+#[cfg(unix)]
+#[test]
+fn the_role_catalog_is_owner_only() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir()?;
+    initdb::init_data_dir(
+        dir.path(),
+        &InitOptions {
+            password: Some("secret".into()),
+            ..InitOptions::default()
+        },
+    )?;
+    assert_eq!(mode(&dir.path().join("crabgresql_authid")), 0o600);
+
+    // And it stays that way after the catalog is rewritten, which is a whole
+    // new file every time a role changes.
+    let roles = crabgresql_server::RoleCatalog::open(dir.path(), "ignored")?;
+    roles.rename_role(crabgresql_server::DEFAULT_SUPERUSER, "bob")?;
+    assert_eq!(mode(&dir.path().join("crabgresql_authid")), 0o600);
+
+    // A rewrite goes through a temporary file that is renamed over the
+    // catalog, and a rename carries the *temporary* file's mode. One left
+    // behind by a crash — or by a build from before this file was owner-only —
+    // would otherwise publish the verifiers world-readable, because the mode on
+    // `open(2)` applies only when it creates the file.
+    let tmp = dir.path().join("crabgresql_authid.tmp");
+    fs::write(&tmp, b"leftover")?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))?;
+    roles.rename_role("bob", "carol")?;
+    assert_eq!(mode(&dir.path().join("crabgresql_authid")), 0o600);
 
     Ok(())
 }

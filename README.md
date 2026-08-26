@@ -85,11 +85,25 @@ $ crabgresql -D ./pgdata
 ```
 
 `initdb` writes the directory's skeleton (`base/`, `global/`, `pg_wal/`,
-`pg_xact/`, `stats/`, `parquet/`), its first `global/pg_control`, and a
-`PG_VERSION` stamp naming the major version that wrote it — all owner-only
-(`0700`), because everything under the directory is readable as plain bytes.
-`--no-sync` skips the fsyncs, which is fine for a throwaway cluster and unsafe
-for one you intend to keep.
+`pg_xact/`, `stats/`, `parquet/`), its first `global/pg_control`, the cluster's
+role catalog, and a `PG_VERSION` stamp naming the major version that wrote it —
+all owner-only (`0700`), because everything under the directory is readable as
+plain bytes. `--no-sync` skips the fsyncs, which is fine for a throwaway cluster
+and unsafe for one you intend to keep.
+
+The bootstrap superuser is `--superuser` (`postgres` by default), and
+`--pwfile` gives it a password, read from the first line of the named file and
+stored as a SCRAM verifier — the cleartext never reaches the disk:
+
+```console
+$ printf 'secret\n' > pw && crabgresql initdb -D ./pgdata --superuser bob --pwfile pw
+```
+
+A role with a password has to authenticate with SCRAM-SHA-256; a role without
+one is trusted. Without `--pwfile` the superuser has none, which is how every
+cluster behaved before the option existed. There is no TLS, so SCRAM keeps the
+password off the wire and nothing else does the same for the rest of the
+session.
 
 Running it is optional: the server initializes an **absent or empty** directory
 itself, so `crabgresql -D ./pgdata` on a fresh host still works, and the image
@@ -112,9 +126,9 @@ not parse falls back to its default rather than failing startup.
 | Variable | Default | Range | Controls |
 | --- | --- | --- | --- |
 | `CRABGRESQL_PORT` | `5433` | | TCP port to listen on (also `--port`) |
-| `CRABGRESQL_LISTEN_ADDRESS` | `127.0.0.1` | | address to accept connections on (also `--listen-address`). Loopback by default: authentication is trust and there is no TLS, so anything reachable on this port is a superuser |
+| `CRABGRESQL_LISTEN_ADDRESS` | `127.0.0.1` | | address to accept connections on (also `--listen-address`). Loopback by default: a cluster whose roles have no password authenticates with trust, and there is no TLS either way |
 | `PGDATA` | `./pgdata` | | data directory the durable heap engine is opened in (also `--data-dir`, and read by `crabgresql initdb`) |
-| `CRABGRESQL_SUPERUSER` | `postgres` | | name of the bootstrap superuser created when the data directory has no role catalog yet, as `initdb --username` names PostgreSQL's (also `--superuser`). Ignored afterwards: the stored roles are authoritative. Connections are still trusted whoever they claim to be — nothing authenticates yet |
+| `CRABGRESQL_SUPERUSER` | `postgres` | | name of the bootstrap superuser the cluster is created with, as `initdb --username` names PostgreSQL's (also `--superuser`). Ignored on an existing data directory: the stored roles are authoritative. Give it a password with `initdb --pwfile`, or it is trusted |
 | `CRABGRESQL_COPY_ALLOW_PATHS` | *(empty)* | | extra directories a server-side `COPY … FROM '<file>'` may read, colon-separated (also repeatable `--copy-allow-path`). The data directory is always readable and is where a relative path resolves; nothing else is, because the read runs with the server's privileges |
 | `RUST_LOG` | `info` | | tracing filter directives |
 | `CRABGRESQL_BUFFER_TABLE_SOFT_BYTES` | `32MB` | `1MB`–`2GB` | per-relation buffered bytes that make one write buffer flush-eligible |
@@ -162,11 +176,12 @@ for `linux/amd64` and `linux/arm64` on every `v*` tag, alongside tarballs of
 the binary attached to the GitHub Release (glibc builds from the CI runners —
 for an older distribution, use the image).
 
-**The image listens on `0.0.0.0`, authenticates with trust, and speaks
-cleartext.** Anything that can reach the published port is a superuser, so keep
-it on a trusted network — or set `CRABGRESQL_LISTEN_ADDRESS` back to
-`127.0.0.1` and reach it another way. Everything in the Configuration table
-above works as a `-e` flag.
+**The image listens on `0.0.0.0` and speaks cleartext**, and its cluster is
+created without a password — so anything that can reach the published port is a
+superuser. Keep it on a trusted network, set `CRABGRESQL_LISTEN_ADDRESS` back to
+`127.0.0.1` and reach it another way, or give the superuser a password with
+`ALTER ROLE … PASSWORD` on the first connection. Everything in the Configuration
+table above works as a `-e` flag.
 
 The data directory is `/var/lib/crabgresql`, owned by the `crabgresql` user
 (uid 999), which the server also runs as. The container never starts as root,

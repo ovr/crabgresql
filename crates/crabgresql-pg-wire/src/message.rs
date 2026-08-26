@@ -244,6 +244,15 @@ impl ErrorFields {
         Self::with_severity("ERROR", code, message)
     }
 
+    /// A FATAL with the mandatory severity / sqlstate / message fields.
+    ///
+    /// The severity that tells the client the connection is over: libpq stops
+    /// waiting for ReadyForQuery on one, which an ERROR during the startup
+    /// phase would leave it doing.
+    pub fn fatal(code: &str, message: &str) -> Self {
+        Self::with_severity("FATAL", code, message)
+    }
+
     /// A NOTICE with the mandatory severity / sqlstate / message fields.
     pub fn notice(code: &str, message: &str) -> Self {
         Self::with_severity("NOTICE", code, message)

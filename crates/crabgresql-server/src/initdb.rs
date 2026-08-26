@@ -9,14 +9,15 @@
 //!
 //! So a cluster now has a moment of creation, and one marker that says so:
 //! `PG_VERSION`, written **last** and fsynced. Everything above it — the
-//! subdirectories and `global/pg_control` — is created first, which makes the
-//! marker mean "this directory was initialized all the way to the end". A crash
-//! partway through leaves a directory that still looks like a cluster to
-//! [`inspect`] (a control file, or `base/`), and that is deliberate: the same
-//! shape is what every data directory written before this module looks like, and
-//! those hold real data. They are adopted — stamped with a `PG_VERSION` — rather
-//! than refused, because the on-disk format is a compatibility boundary
-//! (`AGENTS.md`) and refusing would mean losing a cluster on upgrade.
+//! subdirectories, `global/pg_control` and the role catalog — is created first,
+//! which makes the marker mean "this directory was initialized all the way to
+//! the end". A crash partway through leaves a directory that still looks like a
+//! cluster to [`inspect`] (a control file, or `base/`), and that is deliberate:
+//! the same shape is what every data directory written before this module looks
+//! like, and those hold real data. They are adopted — stamped with a
+//! `PG_VERSION` — rather than refused, because the on-disk format is a
+//! compatibility boundary (`AGENTS.md`) and refusing would mean losing a
+//! cluster on upgrade.
 //!
 //! Two entry points, differing in one answer only: [`init_data_dir`] is the
 //! `initdb` subcommand, and refuses a directory that already holds a cluster;
@@ -53,8 +54,8 @@ const LOST_AND_FOUND: &str = "lost+found";
 /// killed before it wrote anything else leaves the same shape behind.
 const IGNORED_WHEN_EMPTY: [&str; 2] = [LOST_AND_FOUND, crate::lockfile::LOCK_FILE];
 
-/// How much durability the caller wants to pay for while initializing.
-#[derive(Clone, Copy, Debug)]
+/// What the caller wants the new cluster to look like.
+#[derive(Clone, Debug)]
 pub struct InitOptions {
     /// `false` is `initdb --no-sync`: fine for a throwaway cluster, and unsafe
     /// for one that will be kept, because a crash right after can leave the
@@ -64,11 +65,23 @@ pub struct InitOptions {
     /// durably — that write is an atomic-publish primitive shared with the
     /// checkpointer, and it is one file.
     pub sync: bool,
+    /// Name of the bootstrap superuser the role catalog is created with, as
+    /// `initdb --username` names PostgreSQL's.
+    pub superuser: String,
+    /// The bootstrap superuser's password, in the clear — `initdb --pwfile`.
+    /// Hashed into a SCRAM verifier on the way to disk; the cleartext is never
+    /// written. `None` leaves the role without one, which is a role that is
+    /// trusted rather than authenticated (see [`crate::auth`]).
+    pub password: Option<String>,
 }
 
 impl Default for InitOptions {
     fn default() -> Self {
-        InitOptions { sync: true }
+        InitOptions {
+            sync: true,
+            superuser: crate::DEFAULT_SUPERUSER.to_string(),
+            password: None,
+        }
     }
 }
 
@@ -118,8 +131,40 @@ pub fn init_data_dir(dir: &Path, opts: &InitOptions) -> io::Result<Outcome> {
 ///
 /// Unlike [`init_data_dir`], an existing cluster is the expected case and is
 /// left alone.
-pub fn ensure_initialized(dir: &Path) -> io::Result<Outcome> {
-    bootstrap(dir, &InitOptions::default(), false)
+///
+/// `superuser` names the bootstrap role should a cluster have to be created
+/// here. There is no password on this path: a password is something a person
+/// hands to `initdb`, and a server that created one for itself in passing would
+/// have nowhere to have got it from.
+pub fn ensure_initialized(dir: &Path, superuser: &str) -> io::Result<Outcome> {
+    let opts = InitOptions {
+        superuser: superuser.to_string(),
+        ..InitOptions::default()
+    };
+    bootstrap(dir, &opts, false)
+}
+
+/// The password in `path`, as `initdb --pwfile` reads one: the first line, with
+/// its line ending removed.
+///
+/// An empty file is refused rather than taken as "no password": somebody who
+/// passed `--pwfile` asked for one, and silently creating a superuser with none
+/// would be the opposite of what they asked for.
+pub fn password_from_file(path: &Path) -> io::Result<String> {
+    let raw = fs::read_to_string(path).map_err(|error| at(path, "reading", error))?;
+    let password = raw
+        .split('\n')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('\r')
+        .to_string();
+    if password.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("password file \"{}\" is empty", path.display()),
+        ));
+    }
+    Ok(password)
 }
 
 /// The shared body of both entry points: `refuse_existing` is the only thing
@@ -278,7 +323,26 @@ fn create(dir: &Path, opts: &InitOptions) -> io::Result<()> {
     )
     .map_err(io::Error::other)?;
 
+    write_roles(dir, opts)?;
     stamp_version(dir, opts)
+}
+
+/// Create the cluster's role catalog.
+///
+/// Before `PG_VERSION`, like everything else the stamp vouches for. Roles are a
+/// cluster object, so this file is as much a part of a cluster as `pg_control`
+/// is — a directory stamped without one would be a cluster whose `pg_authid`
+/// the first server to open it gets to invent.
+fn write_roles(dir: &Path, opts: &InitOptions) -> io::Result<()> {
+    crate::roles::write_bootstrap(dir, &opts.superuser, opts.password.as_deref()).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "creating the role catalog in \"{}\": {error}",
+                dir.display()
+            ),
+        )
+    })
 }
 
 /// Stamp a data directory written before `PG_VERSION` existed, leaving its data
@@ -293,6 +357,9 @@ fn adopt(dir: &Path, opts: &InitOptions) -> io::Result<()> {
         make_dir(&sub)?;
     }
     make_dir(&dir.join(PARQUET_SUBDIR))?;
+    // Only if there is none: a directory this old has roles of its own, and
+    // `write_bootstrap` leaves an existing file alone.
+    write_roles(dir, opts)?;
     stamp_version(dir, opts)
 }
 
@@ -398,17 +465,31 @@ pub(crate) fn at(path: &Path, what: &str, error: io::Error) -> io::Error {
     )
 }
 
-/// Create (or truncate) `path` owner-only, in one step — a `create` followed by
-/// a `chmod` would leave a window where the file is readable, and everything in
-/// a data directory is readable as plain bytes.
-fn create_private(path: &Path) -> io::Result<fs::File> {
-    private().truncate(true).open(path)
+/// Open `path` for writing, owner-only, empty of anything a reader could want.
+///
+/// A file that has to be *created* is created `0600` outright: a `create`
+/// followed by a `chmod` would leave a window where it is readable, and
+/// everything in a data directory is readable as plain bytes.
+///
+/// The mode on `open(2)` applies only to that creation, though, so a file that
+/// already exists keeps whatever mode it had — and the caller that renames
+/// `crabgresql_authid.tmp` over the role catalog would carry that mode onto a
+/// file full of password verifiers. So an existing file is corrected too,
+/// through the handle rather than the path (`fchmod`, which a symlink swapped
+/// in underneath cannot redirect) and while it is still truncated to nothing.
+pub(crate) fn create_private(path: &Path) -> io::Result<fs::File> {
+    let file = private().truncate(true).open(path)?;
+    restrict_file(&file)?;
+    Ok(file)
 }
 
 /// The same, but failing with `AlreadyExists` rather than truncating what is
 /// there. This is the create half of the lock file's interlock
 /// ([`crate::lockfile`]), so the exclusion has to be the filesystem's — a
 /// `exists()` check followed by a create is two racing servers' happy path.
+///
+/// No mode to correct here: this one always creates the file, so `open(2)` set
+/// it.
 pub(crate) fn create_new_private(path: &Path) -> io::Result<fs::File> {
     private().create_new(true).open(path)
 }
@@ -426,6 +507,17 @@ fn private() -> fs::OpenOptions {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true);
     opts
+}
+
+#[cfg(unix)]
+fn restrict_file(file: &fs::File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_file: &fs::File) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]

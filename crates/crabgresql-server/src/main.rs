@@ -16,8 +16,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Address to accept connections on. Loopback by default: authentication is
-    /// trust and there is no TLS, so exposing the port is opt-in.
+    /// Address to accept connections on. Loopback by default: a cluster whose
+    /// roles have no password authenticates with trust, and there is no TLS
+    /// either way, so exposing the port is opt-in.
     #[arg(
         long = "listen-address",
         short = 'l',
@@ -40,11 +41,17 @@ struct Cli {
     #[arg(long = "data-dir", short = 'D', global = true, env = config::DATA_DIR, default_value = config::DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
 
-    /// Name of the bootstrap superuser created when the data directory has no
-    /// role catalog yet, as `initdb --username` names PostgreSQL's. Ignored on
-    /// an existing data directory, whose stored roles are authoritative.
+    /// Name of the bootstrap superuser the cluster is created with, as
+    /// `initdb --username` names PostgreSQL's. Ignored on an existing data
+    /// directory, whose stored roles are authoritative.
+    ///
+    /// `global` for the same reason `--data-dir` is: it used to be readable
+    /// only *before* the subcommand, where `initdb` never looked at it — so
+    /// `crabgresql --superuser bob initdb` created a cluster owned by
+    /// `postgres` and said nothing.
     #[arg(
         long = "superuser",
+        global = true,
         env = config::SUPERUSER,
         default_value = crabgresql_server::DEFAULT_SUPERUSER
     )]
@@ -74,13 +81,25 @@ enum Command {
     /// under the account the server will run as, and with an error rather than
     /// a new cluster when the directory turns out to hold something already.
     ///
-    /// The directory is `--data-dir`, which is shared with the server rather
-    /// than redeclared here.
+    /// The directory is `--data-dir` and the bootstrap superuser's name is
+    /// `--superuser`; both are shared with the server rather than redeclared
+    /// here.
     Initdb {
         /// Skip the fsyncs. Faster, and unsafe for a cluster you intend to keep:
         /// a crash soon after can leave the directory half-durable.
         #[arg(long = "no-sync")]
         no_sync: bool,
+
+        /// Read the bootstrap superuser's password from the first line of this
+        /// file, as `initdb --pwfile` does. Without it the superuser has no
+        /// password, and a role with no password is trusted rather than
+        /// authenticated.
+        ///
+        /// Only on `initdb`, and for the same reason PostgreSQL puts it there:
+        /// a password is set when the cluster is created, and afterwards it is
+        /// `ALTER ROLE … PASSWORD` that changes it.
+        #[arg(long = "pwfile", value_name = "PATH")]
+        pwfile: Option<PathBuf>,
     },
 }
 
@@ -112,7 +131,13 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(cli: Cli) -> std::io::Result<()> {
-    if let Some(Command::Initdb { no_sync }) = &cli.command {
+    if let Some(Command::Initdb { no_sync, pwfile }) = &cli.command {
+        // Read before the directory is so much as created: a `--pwfile` that is
+        // not there should leave nothing behind at all.
+        let password = pwfile
+            .as_deref()
+            .map(initdb::password_from_file)
+            .transpose()?;
         // Held across the whole of `initdb`, so it cannot write into a cluster a
         // server has open. The directory has to exist for the lock file to be
         // created in it, and creating it is `initdb`'s first act anyway.
@@ -121,8 +146,24 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             &cli.data_dir,
             &lockfile::LockInfo::for_initdb(start_epoch_secs()),
         )?;
-        let opts = initdb::InitOptions { sync: !no_sync };
-        report(initdb::init_data_dir(&cli.data_dir, &opts)?, &cli.data_dir);
+        let opts = initdb::InitOptions {
+            sync: !no_sync,
+            superuser: cli.superuser.clone(),
+            password,
+        };
+        let outcome = initdb::init_data_dir(&cli.data_dir, &opts)?;
+        report(outcome, &cli.data_dir);
+        if outcome == initdb::Outcome::Created {
+            tracing::info!(
+                "the bootstrap superuser is \"{}\"{}",
+                opts.superuser,
+                if opts.password.is_some() {
+                    ", and it must authenticate with a password"
+                } else {
+                    "; it has no password, so it is trusted (see --pwfile)"
+                }
+            );
+        }
         return Ok(());
     }
 
@@ -160,7 +201,10 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         // The cluster first: an empty directory becomes one, and a directory
         // that is not one is refused here rather than silently filled in piece
         // by piece by whichever component ran first.
-        report(initdb::ensure_initialized(&data_dir)?, &data_dir);
+        report(
+            initdb::ensure_initialized(&data_dir, &superuser)?,
+            &data_dir,
+        );
         let (engine, txnmgr) = crabgresql_server::open_pg_engine(&data_dir)?;
         // Roles are a cluster object: one catalog for the whole data directory,
         // rather than one per database as the relation catalog is.
@@ -187,13 +231,25 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     // control file dirty and reset them).
     let engine_for_shutdown = engine.clone();
 
-    // Anything but loopback hands every reachable client a superuser session.
+    // Without a password anywhere in the catalog, anything but loopback hands
+    // every reachable client a superuser session. With one, the connection is
+    // authenticated but still in the clear — SCRAM keeps the password off the
+    // wire, and nothing else.
     if !cli.listen_address.is_loopback() {
-        tracing::warn!(
-            "listening on {} — connections are unauthenticated (trust) and \
-             unencrypted; expose this only on a trusted network",
-            cli.listen_address
-        );
+        if roles.any_password_set() {
+            tracing::warn!(
+                "listening on {} — there is no TLS, so everything but the \
+                 password itself travels in the clear",
+                cli.listen_address
+            );
+        } else {
+            tracing::warn!(
+                "listening on {} — no role has a password, so connections are \
+                 unauthenticated (trust) and unencrypted; expose this only on a \
+                 trusted network",
+                cli.listen_address
+            );
+        }
     }
 
     let listener = TcpListener::bind((cli.listen_address, cli.port)).await?;
@@ -435,9 +491,36 @@ mod tests {
         let cli = Cli::try_parse_from(["crabgresql", "initdb", "--no-sync"]).expect("--no-sync");
         assert!(matches!(
             cli.command,
-            Some(Command::Initdb { no_sync: true })
+            Some(Command::Initdb { no_sync: true, .. })
         ));
         // And nowhere else: the server has no fsyncs of its own to skip.
         assert!(Cli::try_parse_from(["crabgresql", "--no-sync"]).is_err());
+    }
+
+    /// `--superuser` used to be readable only before the subcommand, where
+    /// `initdb` never consulted it — so it parsed, meant nothing, and the
+    /// cluster came out owned by `postgres` regardless. Both spellings now
+    /// reach the same field, which `initdb` reads.
+    #[test]
+    fn the_superuser_name_survives_the_subcommand_boundary() {
+        let before = Cli::try_parse_from(["crabgresql", "--superuser", "bob", "initdb"])
+            .expect("--superuser before the subcommand");
+        let after = Cli::try_parse_from(["crabgresql", "initdb", "--superuser", "bob"])
+            .expect("--superuser after the subcommand");
+        assert_eq!(before.superuser, "bob");
+        assert_eq!(before.superuser, after.superuser);
+    }
+
+    /// `--pwfile` belongs to `initdb` alone: the server has no cluster to
+    /// create, so a password on its command line would name nothing.
+    #[test]
+    fn pwfile_belongs_to_initdb() {
+        let cli =
+            Cli::try_parse_from(["crabgresql", "initdb", "--pwfile", "/tmp/pw"]).expect("--pwfile");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Initdb { ref pwfile, .. }) if pwfile.as_deref() == Some(std::path::Path::new("/tmp/pw"))
+        ));
+        assert!(Cli::try_parse_from(["crabgresql", "--pwfile", "/tmp/pw"]).is_err());
     }
 }
