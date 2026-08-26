@@ -52,10 +52,8 @@ pub(crate) struct CatalogRelDef {
     pub(crate) name: &'static str,
     /// PostgreSQL's own OID for the relation, probed from 18.4.
     ///
-    /// TODO: none of these relations is reflected into `pg_class`, so the OID
-    /// answers a cast and nothing more — no row joins to it. That is equally
-    /// true of `pg_catalog`'s own relations, and closing it is one change for
-    /// both.
+    /// TODO: reflect served relations in `pg_class` so their fixed OIDs join to
+    /// catalog rows.
     pub(crate) oid: u32,
     pub(crate) namespace: CatalogNamespace,
     pub(crate) schema: fn() -> TableSchema,
@@ -1247,8 +1245,6 @@ pub fn builtin_relation_name(oid: u32) -> Option<&'static str> {
         .map(|(_, name)| name)
 }
 
-/// The [`CatalogNamespace`] the SQL schema name `namespace` spells, or `None`
-/// for a schema this build serves nothing in.
 fn catalog_namespace(namespace: &str) -> Option<CatalogNamespace> {
     match namespace {
         "pg_catalog" => Some(CatalogNamespace::PgCatalog),
@@ -1257,8 +1253,8 @@ fn catalog_namespace(namespace: &str) -> Option<CatalogNamespace> {
     }
 }
 
-/// [`builtin_relation_oid`] for a caller that knows which schema it is asking
-/// about — the two are *not* interchangeable.
+/// Kept separate from [`builtin_relation_oid`] because the lookups are not
+/// interchangeable.
 ///
 /// `builtin_relation_oid` answers for `pg_catalog` alone because its callers ask
 /// a second question with it: whether an unqualified name reaches a catalog
@@ -1270,9 +1266,6 @@ pub fn builtin_relation_oid_in(namespace: &str, name: &str) -> Option<u32> {
     lookup(catalog_namespace(namespace)?, name).map(|def| def.oid)
 }
 
-/// The `(namespace, name)` of the served relation `oid` identifies, across both
-/// schemas. What renders `13916` back as `information_schema.tables`.
-///
 /// `InvalidOid` is never an object to ask about, so 0 answers nothing even
 /// though no entry claims it.
 pub fn builtin_relation_ref(oid: u32) -> Option<(&'static str, &'static str)> {

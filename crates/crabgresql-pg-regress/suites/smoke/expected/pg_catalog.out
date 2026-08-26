@@ -57,8 +57,6 @@ SELECT oid, nspname
  13699 | information_schema
 (4 rows)
 
--- information_schema is a schema like any other: it resolves both ways and
--- carries initdb's USAGE grant to PUBLIC
 SELECT 'information_schema'::regnamespace AS by_name,
        13699::regnamespace AS by_oid,
        has_schema_privilege('information_schema', 'USAGE') AS usage;
@@ -67,8 +65,6 @@ SELECT 'information_schema'::regnamespace AS by_name,
  information_schema | information_schema | t
 (1 row)
 
--- its views answer to their own OIDs, and print schema-qualified because the
--- schema is off the search path
 SELECT 'information_schema.tables'::regclass AS by_name,
        13916::regclass AS by_oid,
        pg_table_is_visible('information_schema.tables'::regclass) AS visible,

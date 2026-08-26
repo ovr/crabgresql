@@ -269,8 +269,6 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let (indexes, toasts, namespace_oids) =
         (cat.index_oids(), cat.toast_oids(), cat.namespace_oids());
     let parents = parent_names(relations);
-    // Resolve a relation's namespace OID, defaulting to `public` for any
-    // namespace not in the map (should not happen for a live relation).
     let nsp_oid = |namespace: &str| {
         namespace_oids
             .get(namespace)

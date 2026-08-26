@@ -818,9 +818,9 @@ impl CatalogOps for SessionCatalogOps {
     /// The `pg_catalog` step goes through the fixed OID table rather than the
     /// `pg_class` rows: catalog relations are not reflected into `pg_class`, so
     /// they have no positional OID to find there. A qualified
-    /// `information_schema` name reads the same table — nothing else can live in
-    /// that schema, since `CREATE SCHEMA information_schema` is refused — but it
-    /// is never reached unqualified, which is why it is not one of the steps.
+    /// `information_schema` name reads the same table. That schema is reserved
+    /// as a DDL target and is never reached unqualified, so it is not one of the
+    /// search-path steps.
     fn rel_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
         let in_catalog = |name: &str| {
             self.system

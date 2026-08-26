@@ -128,9 +128,8 @@ fn lock_row(cat: &SystemCatalog, lock: &CatalogLock) -> Option<Vec<Value>> {
     ])
 }
 
-/// The OID a `relation` row reports. A served relation carries PostgreSQL's own
-/// fixed OID from the registry; everything else is numbered by this snapshot,
-/// which is why the lock travels as a name.
+/// Served relations use PostgreSQL's fixed OIDs; user relations are numbered by
+/// the snapshot, which is why the lock travels as a name.
 fn relation_oid(cat: &SystemCatalog, namespace: &str, name: &str) -> Option<u32> {
     builtin_relation_oid_in(namespace, name).or_else(|| cat.relation_oid_in(namespace, name))
 }

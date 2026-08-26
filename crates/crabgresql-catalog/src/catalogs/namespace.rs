@@ -22,17 +22,11 @@ pub(crate) fn pg_namespace_schema() -> TableSchema {
     )
 }
 
-/// The reserved schemas this build publishes, as `(oid, nspname)`. Three of the
-/// OIDs match PostgreSQL's stable `.dat` assignments (`pg_catalog` = 11,
-/// `pg_toast` = 99, `public` = 2200); `information_schema` comes from `initdb`
-/// instead — see [`INFORMATION_SCHEMA_NAMESPACE_OID`].
+/// Shared by row publication and name/OID resolution so neither can expose a
+/// schema the other does not recognize.
 ///
-/// A list rather than a literal inside [`pg_namespace_rows`] because two other
-/// readers need the same set: [`crate::SystemCatalog::namespace_oids`] resolves
-/// names against it, and [`crate::catalogs::description`] filters
-/// `pg_namespace.dat`'s descriptions against it — that file also describes the
-/// subscription conflict-log schema, which this build does not have (and says
-/// nothing about `information_schema`, which PostgreSQL leaves uncommented).
+/// `information_schema` gets its OID from `initdb`; the other three have stable
+/// `.dat` assignments.
 pub(crate) const BUILTIN_NAMESPACES: &[(u32, &str)] = &[
     (PG_CATALOG_NAMESPACE_OID, "pg_catalog"),
     (TOAST_NAMESPACE_OID, crate::TOAST_NAMESPACE),
@@ -40,8 +34,8 @@ pub(crate) const BUILTIN_NAMESPACES: &[(u32, &str)] = &[
     (INFORMATION_SCHEMA_NAMESPACE_OID, "information_schema"),
 ];
 
-/// The reserved schemas, then every schema `CREATE SCHEMA` made. Owners are the
-/// bootstrap superuser — see `BOOTSTRAP_ROLE_OID` for why there is only the one.
+/// All schemas report the bootstrap owner because this build exposes a single
+/// owning role.
 pub(crate) fn pg_namespace_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let user_schemas = cat.user_schemas();
     let row = |oid: u32, name: &str| {

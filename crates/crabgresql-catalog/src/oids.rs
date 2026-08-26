@@ -64,16 +64,11 @@ pub(crate) const PUBLIC_NAMESPACE_OID: u32 = 2200;
 /// more than the one relation that emits the row.
 pub(crate) const PG_CATALOG_NAMESPACE_OID: u32 = 11;
 
-/// `pg_namespace.oid` of `pg_toast`, PostgreSQL's fixed value. Every TOAST
-/// relation reports it as its namespace.
+/// PostgreSQL's fixed `pg_namespace.oid` for `pg_toast`.
 pub(crate) const TOAST_NAMESPACE_OID: u32 = 99;
 
-/// `pg_namespace.oid` of `information_schema`. Unlike the three above it is not
-/// a `.dat` assignment: `initdb` creates the schema by running
-/// `information_schema.sql`, so the number is deterministic for a major version
-/// rather than fixed forever — the same footing as [`PLPGSQL_EXTENSION_OID`],
-/// and reusing 18.4's value still beats inventing one, because a client that
-/// hard-codes an OID hard-codes this.
+/// PostgreSQL 18.4's `initdb`-assigned OID. Unlike the `.dat` assignments above,
+/// this can change between major versions.
 pub(crate) const INFORMATION_SCHEMA_NAMESPACE_OID: u32 = 13699;
 
 /// OID of the one database a crabgresql server serves. PostgreSQL assigns a

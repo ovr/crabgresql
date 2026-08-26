@@ -2487,14 +2487,12 @@ fn catalog_oids_are_unique_and_outside_every_synthetic_band() {
             CatalogNamespace::InformationSchema => "information_schema",
         };
         assert_ne!(def.oid, 0, "{} has no OID", def.name);
-        // Uniqueness spans both schemas: an OID identifies a relation
-        // cluster-wide, so `information_schema.tables` reusing a `pg_catalog`
-        // number would make one cast answer for two relations.
+        // One OID must not make a cast resolve to relations in both schemas.
         assert!(seen.insert(def.oid), "OID {} is claimed twice", def.oid);
         assert_eq!(builtin_relation_oid_in(namespace, def.name), Some(def.oid));
         assert_eq!(builtin_relation_ref(def.oid), Some((namespace, def.name)));
-        // The `pg_catalog`-only readers stay silent about the rest — the
-        // distinction that keeps a user table named `tables` unshadowed.
+        // The pg_catalog-only lookup must not let an off-path
+        // information_schema view shadow an unqualified user relation.
         let in_pg_catalog = def.namespace == CatalogNamespace::PgCatalog;
         assert_eq!(
             builtin_relation_name(def.oid),
@@ -2848,11 +2846,6 @@ fn catalog_lookups_agree_with_pg_class_rows() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `information_schema` is a schema like any other here: a `pg_namespace` row,
-/// an OID that resolves both ways, and a USAGE grant to PUBLIC. It used to be
-/// served only as a name the resolver special-cased, which made every question
-/// asked *about* the schema — `regnamespace`, `has_schema_privilege` — report
-/// that it did not exist.
 #[test]
 fn information_schema_is_a_published_namespace() -> anyhow::Result<()> {
     let cat = SystemCatalog::new();
@@ -2883,15 +2876,14 @@ fn information_schema_is_a_published_namespace() -> anyhow::Result<()> {
             .as_deref(),
         Some("information_schema")
     );
-    // `initdb` opens it to PUBLIC for USAGE, as it does `pg_catalog`.
+    // PostgreSQL's initdb grants PUBLIC USAGE on information_schema.
     let acl = required(
         cat.namespace_acl(oids::INFORMATION_SCHEMA_NAMESPACE_OID),
         "information_schema has no ACL",
     )?;
     assert!(acl.granted_to_public);
 
-    // Its views answer to their own OIDs, and PUBLIC may read every one — the
-    // `RESTRICTED_CATALOGS` exception list covers `pg_catalog` alone.
+    // The restricted-catalog exception list applies only to pg_catalog.
     for name in ["tables", "columns", "schemata", "domains"] {
         let view = required(
             builtin_relation_oid_in("information_schema", name),
