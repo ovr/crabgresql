@@ -81,7 +81,7 @@ fn parse_test_list(text: &str) -> Vec<String> {
         .collect()
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
 
