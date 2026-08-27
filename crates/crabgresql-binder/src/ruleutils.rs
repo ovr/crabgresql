@@ -751,6 +751,8 @@ fn precedence(e: &ast::Expr) -> u8 {
         | ast::Expr::IsNotFalse(_)
         | ast::Expr::IsNull(_)
         | ast::Expr::IsNotNull(_) => 4,
+        // A quantified comparison binds like the comparison it is built from.
+        ast::Expr::AnyOp { .. } | ast::Expr::AllOp { .. } => 4,
         ast::Expr::AtTimeZone { .. } | ast::Expr::AtLocal { .. } => 9,
         // Anything atomic (literal, column, function call, parenthesised group)
         // never needs wrapping.
@@ -795,6 +797,33 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
         ),
         // PG puts a space after a unary operator: `- a`, not `-a`.
         ast::Expr::UnaryOp { op, expr: inner } => format!("{op} {}", expr(inner, cx, prec)),
+        // `a = ANY (b)`: a space before the group, and the right operand always
+        // in one, subquery or array alike. The parser's own `Display` writes
+        // `ANY(b)` and upper-cases the type names inside, so this arm is what
+        // keeps a stored `yes_or_no_check` rendering byte-for-byte as PG's.
+        //
+        // `SOME` is a synonym PostgreSQL does not preserve — it deparses back
+        // as `ANY`, which is why `is_some` is not read here.
+        ast::Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => format!(
+            "{} {compare_op} ANY ({})",
+            expr(left, cx, prec),
+            top_expr(right, cx)
+        ),
+        ast::Expr::AllOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => format!(
+            "{} {compare_op} ALL ({})",
+            expr(left, cx, prec),
+            top_expr(right, cx)
+        ),
         // A redundant group in the source is dropped; precedence alone decides
         // where parentheses land in the output.
         ast::Expr::Nested(inner) => return expr(inner, cx, parent),

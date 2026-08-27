@@ -1,0 +1,206 @@
+-- INFORMATION_SCHEMA DOMAINS
+-- The five domains initdb creates in information_schema, the array type each
+-- one carries, and the two CHECK constraints two of them have. Their OIDs are
+-- initdb's own, so they are pinned here against a real 18.4.
+SELECT t.oid, t.typname, t.typtype, t.typbasetype::regtype AS base, t.typtypmod,
+       t.typnotnull, t.typcollation, t.typdefault, t.typarray, t.typelem
+  FROM pg_type t
+  JOIN pg_namespace n ON n.oid = t.typnamespace
+ WHERE n.nspname = 'information_schema'
+   AND t.typtype = 'd'
+ ORDER BY t.oid;
+  oid  |     typname     | typtype |           base           | typtypmod | typnotnull | typcollation |      typdefault      | typarray | typelem 
+-------+-----------------+---------+--------------------------+-----------+------------+--------------+----------------------+----------+---------
+ 13713 | cardinal_number | d       | integer                  |        -1 | f          |            0 |                      |    13712 |       0
+ 13716 | character_data  | d       | character varying        |        -1 | f          |          950 |                      |    13715 |       0
+ 13718 | sql_identifier  | d       | name                     |        -1 | f          |          950 |                      |    13717 |       0
+ 13724 | time_stamp      | d       | timestamp with time zone |         2 | f          |            0 | CURRENT_TIMESTAMP(2) |    13723 |       0
+ 13726 | yes_or_no       | d       | character varying        |         7 | f          |          950 |                      |    13725 |       0
+(5 rows)
+
+-- A domain borrows its physical shape and its output side from the base type,
+-- and reads values in through domain_in, where the constraints run.
+SELECT t.typname, t.typlen, t.typbyval, t.typcategory, t.typalign, t.typstorage,
+       t.typinput, t.typoutput, t.typreceive, t.typsend
+  FROM pg_type t
+  JOIN pg_namespace n ON n.oid = t.typnamespace
+ WHERE n.nspname = 'information_schema'
+   AND t.typtype = 'd'
+ ORDER BY t.oid;
+     typname     | typlen | typbyval | typcategory | typalign | typstorage | typinput  |    typoutput    | typreceive  |     typsend      
+-----------------+--------+----------+-------------+----------+------------+-----------+-----------------+-------------+------------------
+ cardinal_number |      4 | t        | N           | i        | p          | domain_in | int4out         | domain_recv | int4send
+ character_data  |     -1 | f        | S           | i        | x          | domain_in | varcharout      | domain_recv | varcharsend
+ sql_identifier  |     64 | f        | S           | c        | p          | domain_in | nameout         | domain_recv | namesend
+ time_stamp      |      8 | t        | D           | d        | p          | domain_in | timestamptz_out | domain_recv | timestamptz_send
+ yes_or_no       |     -1 | f        | S           | i        | x          | domain_in | varcharout      | domain_recv | varcharsend
+(5 rows)
+
+-- The array types: ordinary base rows pointing back at their element. An array
+-- aligns like its element but never looser than int, so _sql_identifier over
+-- char-aligned `name` is still `i` while _time_stamp keeps `d`.
+SELECT t.oid, t.typname, t.typtype, t.typcategory, t.typlen, t.typalign,
+       t.typstorage, t.typcollation, t.typelem::regtype AS elem, t.typarray
+  FROM pg_type t
+  JOIN pg_type e ON e.oid = t.typelem AND e.typtype = 'd'
+  JOIN pg_namespace n ON n.oid = t.typnamespace
+ WHERE n.nspname = 'information_schema'
+ ORDER BY t.oid;
+  oid  |     typname      | typtype | typcategory | typlen | typalign | typstorage | typcollation |                elem                | typarray 
+-------+------------------+---------+-------------+--------+----------+------------+--------------+------------------------------------+----------
+ 13712 | _cardinal_number | b       | A           |     -1 | i        | x          |            0 | information_schema.cardinal_number |        0
+ 13715 | _character_data  | b       | A           |     -1 | i        | x          |          950 | information_schema.character_data  |        0
+ 13717 | _sql_identifier  | b       | A           |     -1 | i        | x          |          950 | information_schema.sql_identifier  |        0
+ 13723 | _time_stamp      | b       | A           |     -1 | d        | x          |            0 | information_schema.time_stamp      |        0
+ 13725 | _yes_or_no       | b       | A           |     -1 | i        | x          |          950 | information_schema.yes_or_no       |        0
+(5 rows)
+
+-- Both CHECKs constrain a type rather than a relation: conrelid is 0 and
+-- contypid names the domain.
+SELECT c.oid, c.conname, c.contype, c.conrelid, c.contypid::regtype AS domain,
+       c.convalidated, c.conkey, pg_get_constraintdef(c.oid)
+  FROM pg_constraint c
+  JOIN pg_namespace n ON n.oid = c.connamespace
+ WHERE n.nspname = 'information_schema'
+ ORDER BY c.oid;
+  oid  |           conname            | contype | conrelid |               domain               | convalidated | conkey |                                        pg_get_constraintdef                                        
+-------+------------------------------+---------+----------+------------------------------------+--------------+--------+----------------------------------------------------------------------------------------------------
+ 13714 | cardinal_number_domain_check | c       |        0 | information_schema.cardinal_number | t            |        | CHECK ((VALUE >= 0))
+ 13727 | yes_or_no_check              | c       |        0 | information_schema.yes_or_no       | t            |        | CHECK (((VALUE)::text = ANY ((ARRAY['YES'::character varying, 'NO'::character varying])::text[])))
+(2 rows)
+
+-- Each domain belongs to its schema; its array type is internal to it; its
+-- CHECK is auto-dependent on it. No edge to the base type -- int4, varchar,
+-- name and timestamptz are all pinned.
+-- Named from pg_type rather than through ::regtype: an array over a
+-- non-built-in element is one rendering crabgresql does not do yet, and the
+-- edges are what this pins.
+SELECT d.classid::regclass AS class, t.typname AS obj,
+       d.refclassid::regclass AS refclass, d.refobjid, d.deptype
+  FROM pg_depend d
+  JOIN pg_type t ON t.oid = d.objid
+ WHERE d.classid = 'pg_type'::regclass
+   AND d.objid IN (13712, 13713, 13715, 13716, 13717, 13718, 13723, 13724, 13725, 13726)
+ ORDER BY d.objid;
+  class  |       obj        |   refclass   | refobjid | deptype 
+---------+------------------+--------------+----------+---------
+ pg_type | _cardinal_number | pg_type      |    13713 | i
+ pg_type | cardinal_number  | pg_namespace |    13699 | n
+ pg_type | _character_data  | pg_type      |    13716 | i
+ pg_type | character_data   | pg_namespace |    13699 | n
+ pg_type | _sql_identifier  | pg_type      |    13718 | i
+ pg_type | sql_identifier   | pg_namespace |    13699 | n
+ pg_type | _time_stamp      | pg_type      |    13724 | i
+ pg_type | time_stamp       | pg_namespace |    13699 | n
+ pg_type | _yes_or_no       | pg_type      |    13726 | i
+ pg_type | yes_or_no        | pg_namespace |    13699 | n
+(10 rows)
+
+SELECT d.classid::regclass AS class, d.objid, d.refclassid::regclass AS refclass,
+       d.refobjid::regtype AS refobj, d.deptype
+  FROM pg_depend d
+ WHERE d.classid = 'pg_constraint'::regclass
+   AND d.objid IN (13714, 13727)
+ ORDER BY d.objid;
+     class     | objid | refclass |               refobj               | deptype 
+---------------+-------+----------+------------------------------------+---------
+ pg_constraint | 13714 | pg_type  | information_schema.cardinal_number | a
+ pg_constraint | 13727 | pg_type  | information_schema.yes_or_no       | a
+(2 rows)
+
+-- They show up in information_schema.domains like any other domain.
+SELECT domain_schema, domain_name, data_type, character_maximum_length,
+       datetime_precision, domain_default, udt_schema, udt_name
+  FROM information_schema.domains
+ WHERE domain_schema = 'information_schema'
+ ORDER BY domain_name;
+   domain_schema    |   domain_name   |        data_type         | character_maximum_length | datetime_precision |    domain_default    | udt_schema |  udt_name   
+--------------------+-----------------+--------------------------+--------------------------+--------------------+----------------------+------------+-------------
+ information_schema | cardinal_number | integer                  |                          |                    |                      | pg_catalog | int4
+ information_schema | character_data  | character varying        |                          |                    |                      | pg_catalog | varchar
+ information_schema | sql_identifier  | name                     |                          |                    |                      | pg_catalog | name
+ information_schema | time_stamp      | timestamp with time zone |                          |                  2 | CURRENT_TIMESTAMP(2) | pg_catalog | timestamptz
+ information_schema | yes_or_no       | character varying        |                        3 |                    |                      | pg_catalog | varchar
+(5 rows)
+
+-- information_schema is not on the search path, so every rendering of one of
+-- these names qualifies it.
+SELECT 'information_schema.yes_or_no'::regtype AS by_name,
+       13718::regtype AS by_oid,
+       format_type(13713, NULL) AS formatted,
+       pg_typeof('YES'::information_schema.yes_or_no) AS typeof;
+           by_name            |              by_oid               |             formatted              |            typeof            
+------------------------------+-----------------------------------+------------------------------------+------------------------------
+ information_schema.yes_or_no | information_schema.sql_identifier | information_schema.cardinal_number | information_schema.yes_or_no
+(1 row)
+
+-- The constraints really run, and the 23514 names the type the qualified way.
+SELECT 'NO'::information_schema.yes_or_no;
+ yes_or_no 
+-----------
+ NO
+(1 row)
+
+SELECT 'MAYBE'::information_schema.yes_or_no;
+ERROR:  value for domain information_schema.yes_or_no violates check constraint "yes_or_no_check"
+SELECT 5::information_schema.cardinal_number;
+ cardinal_number 
+-----------------
+               5
+(1 row)
+
+SELECT (-1)::information_schema.cardinal_number;
+ERROR:  value for domain information_schema.cardinal_number violates check constraint "cardinal_number_domain_check"
+-- The modifier lives on the domain, and an explicit cast applies it before the
+-- CHECK runs: yes_or_no is varchar(3), so 'YESSIR' truncates to 'YES' and
+-- passes. character_data takes no modifier and keeps the whole string.
+SELECT 'YESSIR'::information_schema.yes_or_no AS truncated,
+       'YESSIR'::information_schema.character_data AS unbounded;
+ truncated | unbounded 
+-----------+-----------
+ YES       | YESSIR
+(1 row)
+
+-- The views are typed in these domains, not in their base types.
+SELECT pg_typeof(schema_name) AS schema_name, pg_typeof(sql_path) AS sql_path
+  FROM information_schema.schemata
+ WHERE schema_name = 'public';
+            schema_name            |             sql_path              
+-----------------------------------+-----------------------------------
+ information_schema.sql_identifier | information_schema.character_data
+(1 row)
+
+CREATE TABLE isd_demo (a int4, b varchar(10));
+SELECT pg_typeof(table_name) AS table_name, pg_typeof(ordinal_position) AS ordinal_position,
+       pg_typeof(is_nullable) AS is_nullable, pg_typeof(data_type) AS data_type
+  FROM information_schema.columns
+ WHERE table_name = 'isd_demo' AND ordinal_position = 1;
+            table_name             |          ordinal_position          |         is_nullable          |             data_type             
+-----------------------------------+------------------------------------+------------------------------+-----------------------------------
+ information_schema.sql_identifier | information_schema.cardinal_number | information_schema.yes_or_no | information_schema.character_data
+(1 row)
+
+SELECT pg_typeof(table_type) AS table_type, pg_typeof(is_insertable_into) AS is_insertable_into
+  FROM information_schema.tables
+ WHERE table_name = 'isd_demo';
+            table_type             |      is_insertable_into      
+-----------------------------------+------------------------------
+ information_schema.character_data | information_schema.yes_or_no
+(1 row)
+
+-- A column of a domain reports the base type's shape and names the domain
+-- through the domain_* triple -- so a view over one of these columns does too.
+CREATE VIEW isd_view AS SELECT is_nullable, table_name FROM information_schema.columns;
+SELECT column_name, data_type, character_maximum_length,
+       domain_schema, domain_name, udt_schema, udt_name
+  FROM information_schema.columns
+ WHERE table_name = 'isd_view'
+ ORDER BY ordinal_position;
+ column_name |     data_type     | character_maximum_length |   domain_schema    |  domain_name   | udt_schema | udt_name 
+-------------+-------------------+--------------------------+--------------------+----------------+------------+----------
+ is_nullable | character varying |                        3 | information_schema | yes_or_no      | pg_catalog | varchar
+ table_name  | name              |                          | information_schema | sql_identifier | pg_catalog | name
+(2 rows)
+
+DROP VIEW isd_view;
+DROP TABLE isd_demo;

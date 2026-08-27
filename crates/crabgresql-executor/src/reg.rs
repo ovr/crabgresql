@@ -114,7 +114,27 @@ fn type_name(oid: u32, ops: &dyn CatalogOps) -> Option<String> {
         // user-OID floor, so the order is belt-and-braces.
         None => crabgresql_types::pseudo_type_name(oid)
             .map(str::to_string)
-            .or_else(|| ops.user_type_name(oid).map(|(_, name)| quote_ident(&name))),
+            .or_else(|| ops.user_type_name(oid).map(qualified_type_name)),
+    }
+}
+
+/// A non-built-in type's name, qualified when the bare one would not find it.
+///
+/// `format_type_be` schema-qualifies a type that is not visible on the search
+/// path, and `information_schema` never is — so its domains print as
+/// `information_schema.sql_identifier` in `regtype`, `pg_typeof`, `format_type`
+/// and the 23514 a failed domain `CHECK` raises. A type in `public` prints
+/// bare, which is what a `CREATE DOMAIN` gets.
+///
+/// TODO: render an *array over* a non-built-in element. `PgType::Array` covers
+/// the built-in arrays, but `13712::regtype` — the `information_schema`
+/// `cardinal_number[]` row — falls through to the digits, where PostgreSQL
+/// prints `information_schema.cardinal_number[]`. Reaching it means resolving
+/// `typelem` through the catalog, which this seam cannot do.
+pub(crate) fn qualified_type_name((namespace, name): (String, String)) -> String {
+    match namespace.as_str() {
+        "public" => quote_ident(&name),
+        other => format!("{}.{}", quote_ident(other), quote_ident(&name)),
     }
 }
 

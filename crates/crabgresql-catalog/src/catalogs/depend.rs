@@ -470,6 +470,38 @@ fn toast_deps(cat: &SystemCatalog, out: &mut Vec<Dep>) {
 /// User-defined types and routines depend on the schema they were created in.
 fn type_and_routine_deps(cat: &SystemCatalog, out: &mut Vec<Dep>) {
     let namespaces = cat.namespace_oids();
+    for domain in crate::info_schema::DOMAINS {
+        out.push(dep(
+            PG_TYPE_CLASS_OID,
+            domain.oid,
+            PG_NAMESPACE_CLASS_OID,
+            crate::info_schema::NAMESPACE_OID,
+            'n',
+        ));
+        // The array type is *internal* to its domain: dropping the domain takes
+        // it, and it cannot be dropped on its own.
+        out.push(dep(
+            PG_TYPE_CLASS_OID,
+            domain.array_oid,
+            PG_TYPE_CLASS_OID,
+            domain.oid,
+            'i',
+        ));
+        // A domain constraint is auto-dependent on the domain, exactly as a
+        // table's is on the table.
+        if let Some(check) = &domain.check {
+            out.push(dep(
+                PG_CONSTRAINT_CLASS_OID,
+                check.oid,
+                PG_TYPE_CLASS_OID,
+                domain.oid,
+                'a',
+            ));
+        }
+        // No edge to the base type: `int4`, `varchar`, `name` and `timestamptz`
+        // are all pinned, and PostgreSQL records no dependency on a pinned
+        // object (probed on 18.4).
+    }
     for ty in cat.user_types() {
         out.push(dep(
             PG_TYPE_CLASS_OID,

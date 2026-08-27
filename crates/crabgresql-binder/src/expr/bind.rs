@@ -1273,7 +1273,17 @@ fn bind_in_list(
         // `x IN (NULL)` settles the untyped elements on the tested expression's
         // type (`text` when it too is untyped), so `1 IN (NULL)` compares in int
         // and `NULL IN (NULL)` in text — never the two-unknown ambiguity error.
-        ListType::AllUnknown => Some(binding_typed_ty(&left).unwrap_or(PgType::Text)),
+        //
+        // Un-domained first: the list is a *separate* array whose element type
+        // the domain does not reach — PG builds `x = ANY (ARRAY[...])` and the
+        // array is of the base type. Without this, `table_name IN ('v')` over an
+        // `information_schema.sql_identifier` column tries to read `'v'` as the
+        // domain and fails with `invalid input syntax for type user-defined`.
+        ListType::AllUnknown => Some(
+            binding_typed_ty(&left)
+                .map(|ty| scope.catalog().base_type(ty))
+                .unwrap_or(PgType::Text),
+        ),
         // An incompatible list leaves each element as-is so the pair resolves on
         // its own — PG's OR fallback and its `operator does not exist` error.
         ListType::Incompatible => None,
