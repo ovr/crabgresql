@@ -835,7 +835,7 @@ async fn write_result(
             emit_notices(writer, &notices, Some(sql));
             let fields: Vec<FieldDescription> = columns
                 .iter()
-                .map(|c| FieldDescription::new(c.name.clone(), c.ty.oid(), c.ty.typlen()))
+                .map(|c| field_description(c, Format::Text))
                 .collect();
             writer.row_description(&fields);
             let mut count = 0usize;
@@ -948,25 +948,37 @@ fn check_format_count(len: usize, count: usize, kind: &str) -> Result<(), PgErro
     }
 }
 
-/// Build a `RowDescription`'s fields from a statement's output columns, applying
-/// the requested per-column result `formats`.
+/// One `RowDescription` field for a result column. The single builder both
+/// paths use: the simple-query one describes the same statement the extended
+/// one does, and a field they disagreed about would be a client-visible
+/// difference between `Query` and `Describe`.
 ///
 /// TODO: report the source table OID and attribute number for result columns
-/// that are plain table column references, and the type modifier of any type
-/// that carries one; these fields are held at 0/0/-1 here, as they are by
-/// `FieldDescription::new` on the simple-query path.
+/// that are plain table column references; those two are held at 0 here.
+fn field_description(c: &OutputColumn, format: Format) -> FieldDescription {
+    FieldDescription {
+        name: c.name.clone(),
+        table_oid: 0,
+        column_id: 0,
+        type_oid: c.ty.oid(),
+        type_len: c.ty.typlen(),
+        // PostgreSQL sends the modifier in its `atttypmod` encoding, where a
+        // `varchar(3)` result is 7 — the conversion belongs at a catalog or
+        // wire boundary, which is exactly what `pg_typmod` is for. The column
+        // has already had any domain stripped by `undomain_columns`, so what
+        // arrives here is the base type and the modifier that travelled with
+        // it: a `yes_or_no` column describes itself as `character varying(3)`.
+        type_modifier: crabgresql_storage_api::pg_typmod(c.ty, c.typmod),
+        format,
+    }
+}
+
+/// Build a `RowDescription`'s fields from a statement's output columns, applying
+/// the requested per-column result `formats`.
 fn field_descriptions(cols: &[OutputColumn], formats: &[Format]) -> Vec<FieldDescription> {
     cols.iter()
         .enumerate()
-        .map(|(i, c)| FieldDescription {
-            name: c.name.clone(),
-            table_oid: 0,
-            column_id: 0,
-            type_oid: c.ty.oid(),
-            type_len: c.ty.typlen(),
-            type_modifier: -1,
-            format: format_at(formats, i),
-        })
+        .map(|(i, c)| field_description(c, format_at(formats, i)))
         .collect()
 }
 

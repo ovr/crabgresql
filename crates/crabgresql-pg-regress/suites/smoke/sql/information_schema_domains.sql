@@ -61,6 +61,16 @@ SELECT domain_schema, domain_name, data_type, character_maximum_length,
   FROM information_schema.domains
  WHERE domain_schema = 'information_schema'
  ORDER BY domain_name;
+-- information_schema is not on the search path, so the bare name reaches
+-- nothing: only the qualified spelling names one of these types.
+--
+-- The wording is this build's own gap, not the domains': a cast to any name it
+-- does not know reports "is not supported yet" where PostgreSQL raises 42704
+-- with a caret. What is pinned here is that the bare and foreign-qualified
+-- spellings resolve to nothing at all.
+SELECT 'x'::sql_identifier;
+SELECT 'x'::information_schema.sql_identifier;
+SELECT 'x'::nosuchschema.sql_identifier;
 -- information_schema is not on the search path, so every rendering of one of
 -- these names qualifies it.
 SELECT 'information_schema.yes_or_no'::regtype AS by_name,
@@ -81,7 +91,27 @@ SELECT 'YESSIR'::information_schema.yes_or_no AS truncated,
 SELECT pg_typeof(schema_name) AS schema_name, pg_typeof(sql_path) AS sql_path
   FROM information_schema.schemata
  WHERE schema_name = 'public';
+-- A column may be declared of one of these domains, as in PostgreSQL, and the
+-- domain's modifier and CHECK both apply on the way in.
+CREATE TABLE isd_col (c information_schema.yes_or_no);
+INSERT INTO isd_col VALUES ('YES');
+INSERT INTO isd_col VALUES ('NOPE');
+INSERT INTO isd_col VALUES ('NAH');
+SELECT column_name, data_type, character_maximum_length, domain_schema, domain_name
+  FROM information_schema.columns WHERE table_name = 'isd_col';
+DROP TABLE isd_col;
 CREATE TABLE isd_demo (a int4, b varchar(10));
+-- A literal that takes its type from the set is an untyped input, so the set
+-- resolves on the base rather than trying to read the literal as the domain.
+-- These are the shapes every introspecting client writes.
+SELECT coalesce(table_name, 'z') AS coalesced, greatest(table_name, 'z') AS greatest
+  FROM information_schema.tables WHERE table_name = 'isd_demo';
+SELECT pg_typeof(coalesce(table_name, 'z')) AS coalesced,
+       pg_typeof(coalesce(table_name, NULL)) AS with_null,
+       pg_typeof(coalesce(table_name)) AS alone,
+       pg_typeof(greatest(table_name, 'z')) AS greatest,
+       pg_typeof(CASE WHEN true THEN table_name ELSE 'z' END) AS branched
+  FROM information_schema.tables WHERE table_name = 'isd_demo';
 SELECT pg_typeof(table_name) AS table_name, pg_typeof(ordinal_position) AS ordinal_position,
        pg_typeof(is_nullable) AS is_nullable, pg_typeof(data_type) AS data_type
   FROM information_schema.columns

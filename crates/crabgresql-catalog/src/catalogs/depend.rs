@@ -305,9 +305,29 @@ fn index_deps(cat: &SystemCatalog, out: &mut Vec<Dep>) {
 /// A constraint depends on the columns it constrains (`a`), and a `CHECK`
 /// additionally on each column its expression reads (`n`) — the two rows per
 /// column PostgreSQL was observed to store. A constraint over no column depends
-/// on the relation as a whole.
+/// on the relation as a whole, and a *domain* constraint on the domain.
+///
+/// The `information_schema` domain checks are chained in for the same reason
+/// [`crate::catalogs::constraint::pg_constraint_rows`] chains them: their OIDs
+/// are `initdb`'s and sit outside the positional band, so they are never in
+/// [`SystemCatalog::constraint_oids`], but the rule for what a domain
+/// constraint depends on has to have one home.
 fn constraint_deps(cat: &SystemCatalog, out: &mut Vec<Dep>) {
-    for constraint in cat.constraint_oids() {
+    let bootstrap = crate::info_schema::constraints();
+    for constraint in cat.constraint_oids().iter().chain(bootstrap.iter()) {
+        // A domain constraint constrains a *type*, so it is auto-dependent on
+        // the domain and on no relation — `conrelid` is 0 on one, and reading
+        // that 0 as a `pg_class` OID is what used to leave a dangling edge.
+        if constraint.type_oid != 0 {
+            out.push(dep(
+                PG_CONSTRAINT_CLASS_OID,
+                constraint.oid,
+                PG_TYPE_CLASS_OID,
+                constraint.type_oid,
+                'a',
+            ));
+            continue;
+        }
         if constraint.columns.is_empty() {
             out.push(dep(
                 PG_CONSTRAINT_CLASS_OID,
@@ -487,17 +507,10 @@ fn type_and_routine_deps(cat: &SystemCatalog, out: &mut Vec<Dep>) {
             domain.oid,
             'i',
         ));
-        // A domain constraint is auto-dependent on the domain, exactly as a
-        // table's is on the table.
-        if let Some(check) = &domain.check {
-            out.push(dep(
-                PG_CONSTRAINT_CLASS_OID,
-                check.oid,
-                PG_TYPE_CLASS_OID,
-                domain.oid,
-                'a',
-            ));
-        }
+        // The domain's `CHECK` is auto-dependent on it, but that edge is
+        // [`constraint_deps`]'s to draw — one rule, one home, whether `initdb`
+        // or `CREATE DOMAIN` made the constraint.
+        //
         // No edge to the base type: `int4`, `varchar`, `name` and `timestamptz`
         // are all pinned, and PostgreSQL records no dependency on a pinned
         // object (probed on 18.4).

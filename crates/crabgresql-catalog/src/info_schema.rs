@@ -153,14 +153,20 @@ pub(crate) fn by_oid(oid: u32) -> Option<&'static BootstrapDomain> {
     DOMAINS.iter().find(|d| d.oid == oid)
 }
 
-/// The binder's view of one of these domains, by unqualified name.
+/// The binder's view of one of these domains, by its **qualified** name.
 ///
-/// Unqualified because that is how a cast target reaches the type catalog: the
-/// binder resolves a type name by its **last part**, as it does a function's.
-/// A `CREATE DOMAIN sql_identifier` in `public` therefore has to be consulted
-/// first — see the [`crate::SystemCatalog::user_type_oid`] note.
-pub fn domain_info_by_name(name: &str) -> Option<DomainInfo> {
-    by_name(name).map(BootstrapDomain::domain_info)
+/// Qualified is the whole point: `information_schema` is not on the search
+/// path, so PostgreSQL answers a bare `::sql_identifier` with 42704 and only
+/// `::information_schema.sql_identifier` reaches the domain. The binder hands
+/// this seam the same key [`crabgresql_binder::custom_type_key`] builds, which
+/// keeps a non-search-path qualifier attached to the name; a `CREATE DOMAIN
+/// sql_identifier` in `public` therefore keeps the bare spelling to itself.
+///
+/// [`BootstrapDomain::domain_info`] already spells `name` that way — for the
+/// 23514 a failed `CHECK` raises — so one comparison serves both.
+pub fn domain_info_by_qualified_name(name: &str) -> Option<DomainInfo> {
+    let bare = name.strip_prefix(NAMESPACE)?.strip_prefix('.')?;
+    by_name(bare).map(BootstrapDomain::domain_info)
 }
 
 /// The binder's view of one of these domains, by OID.

@@ -471,16 +471,24 @@ pub(crate) fn unify_value_column(
     label: &str,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(PgType, Vec<BoundExpr>), BindError> {
-    // A domain survives only when every typed branch is the *same* domain;
-    // as soon as one branch differs, the set resolves on the base. Probed on
-    // 18.4: `CASE WHEN … THEN a ELSE a END` over a `posint` column is `posint`,
-    // while `… THEN a ELSE 0 END` is `integer`.
-    let mut typed = bindings.iter().filter_map(|b| match b {
+    // A domain survives only on PG's fast path through `select_common_type`,
+    // which asks whether *every* input already has the same type; anything else
+    // falls into the full algorithm, and that one opens with
+    // `ptype = getBaseType(ptype)`.
+    //
+    // An unknown literal is not "the same type" — it has none yet — so a single
+    // `NULL` or `'z'` in the set is enough to send it to the base. Probed on
+    // 18.4 over an `information_schema.sql_identifier` column:
+    // `coalesce(a)` and `CASE WHEN … THEN a ELSE a END` are the domain, while
+    // `coalesce(a, NULL)`, `coalesce(a, 'z')` and `… THEN a ELSE 0 END` are
+    // `name` / `integer`. Counting only the typed bindings here is what used to
+    // leave `coalesce(a, 'z')` trying to read `'z'` as the domain.
+    let mut types = bindings.iter().map(|b| match b {
         Binding::Typed(e) => Some(e.ty()),
         _ => None,
     });
-    let first = typed.next();
-    let uniform = typed.all(|ty| Some(ty) == first);
+    let first = types.next().flatten();
+    let uniform = first.is_some() && types.all(|ty| ty == first);
     let bindings: Vec<Binding> = match uniform {
         true => bindings,
         false => bindings

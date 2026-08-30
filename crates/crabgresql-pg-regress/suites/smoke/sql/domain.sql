@@ -95,6 +95,21 @@ SELECT pg_typeof(CASE WHEN true THEN x ELSE x END) FROM u LIMIT 1;
 SELECT pg_typeof(CASE WHEN true THEN x ELSE 0 END) FROM u LIMIT 1;
 SELECT pg_typeof(coalesce(x, x)), pg_typeof(greatest(x, x)) FROM u LIMIT 1;
 SELECT pg_typeof(coalesce(x, 0)), pg_typeof(greatest(x, 0)) FROM u LIMIT 1;
+-- An *untyped* branch counts as a different type: PG's `select_common_type`
+-- takes its "every input is already this type" fast path only when it really
+-- is, and the full algorithm it falls into opens with `getBaseType`. So a bare
+-- NULL, or a literal that has to take its type from the set, resolves the whole
+-- thing on the base — where reading the literal as the domain would have failed
+-- outright for a text domain.
+SELECT pg_typeof(coalesce(x, NULL)), pg_typeof(greatest(x, NULL)) FROM u LIMIT 1;
+SELECT pg_typeof(CASE WHEN true THEN x ELSE NULL END) FROM u LIMIT 1;
+CREATE DOMAIN sident AS name;
+CREATE TABLE us (x sident);
+INSERT INTO us VALUES ('a');
+SELECT coalesce(x, 'z'), greatest(x, 'z'), CASE WHEN false THEN x ELSE 'z' END FROM us;
+SELECT pg_typeof(coalesce(x, 'z')) FROM us;
+DROP TABLE us;
+DROP DOMAIN sident;
 SELECT pg_typeof(y) FROM (SELECT x AS y FROM u UNION SELECT x FROM u) s LIMIT 1;
 SELECT pg_typeof(y) FROM (SELECT x AS y FROM u UNION SELECT 9) s LIMIT 1;
 DROP TABLE u;
@@ -191,8 +206,18 @@ SELECT conname, contype, contypid::regtype, conrelid, conkey, convalidated, pg_g
   FROM pg_constraint c WHERE contypid <> 0
    AND (SELECT typnamespace FROM pg_type WHERE oid = c.contypid) = 'public'::regnamespace
  ORDER BY conname;
--- Scoped to `public`: PostgreSQL's own information_schema is itself built on
--- domains (sql_identifier, cardinal_number, …), which this build has none of.
+-- A domain constraint constrains a *type*, so its dependency lands on the
+-- domain and not on a relation it does not have. Scoped to `public` to keep
+-- information_schema's own two out of the picture, which the same rule covers.
+SELECT c.conname, d.refclassid::regclass AS refclass, d.refobjid::regtype AS refobj, d.deptype
+  FROM pg_depend d
+  JOIN pg_constraint c ON c.oid = d.objid
+ WHERE d.classid = 'pg_constraint'::regclass
+   AND c.contypid <> 0
+   AND (SELECT typnamespace FROM pg_type WHERE oid = c.contypid) = 'public'::regnamespace
+ ORDER BY c.conname;
+-- Scoped to `public`: PostgreSQL's own information_schema is built on five
+-- domains of its own, which `information_schema_domains` covers.
 SELECT domain_name, data_type, character_maximum_length, numeric_precision, domain_default, udt_schema, udt_name, dtd_identifier
   FROM information_schema.domains WHERE domain_schema = 'public' ORDER BY domain_name;
 SELECT column_name, data_type, character_maximum_length, domain_schema, domain_name, udt_name

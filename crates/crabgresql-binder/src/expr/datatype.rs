@@ -281,11 +281,46 @@ fn precision_of(info: &ast::ExactNumberInfo) -> Option<u64> {
     }
 }
 
+/// The *last* part of a non-built-in type name — what the column a cast to it
+/// produces is called, since PostgreSQL's `FigureColname` never qualifies:
+/// `'YES'::information_schema.yes_or_no` heads its column `yes_or_no`.
+/// Distinct from [`custom_type_key`], which is what the catalog is asked.
 pub(super) fn custom_type_name(dt: &ast::DataType) -> Option<String> {
     match dt {
         ast::DataType::Custom(obj, mods) if mods.is_empty() => {
             obj.0.last().and_then(|p| p.as_ident()).map(normalize_ident)
         }
+        _ => None,
+    }
+}
+
+/// The key a written non-built-in type name is looked up by, or `None` for a
+/// `DataType` that is not one.
+///
+/// A qualifier that is *not* a search path — anything but `public`, where every
+/// `CREATE TYPE` lands, and `pg_catalog`, which [`builtin_custom_type`] has
+/// already had its chance at — travels with the name, because such a type
+/// answers only to its qualified spelling. That is what PostgreSQL does:
+/// `information_schema` is not on the search path, so `'x'::sql_identifier`
+/// raises 42704 there while `'x'::information_schema.sql_identifier` resolves.
+/// [`crabgresql_catalog::SystemCatalog::user_type_oid`] draws the same line, and
+/// dropping the qualifier here is what used to let the two disagree.
+pub fn custom_type_key(dt: &ast::DataType) -> Option<String> {
+    let ast::DataType::Custom(obj, mods) = dt else {
+        return None;
+    };
+    if !mods.is_empty() {
+        return None;
+    }
+    let parts = obj
+        .0
+        .iter()
+        .map(|p| p.as_ident().map(normalize_ident))
+        .collect::<Option<Vec<_>>>()?;
+    match parts.as_slice() {
+        [name] => Some(name.clone()),
+        [schema, name] if schema == "public" || schema == "pg_catalog" => Some(name.clone()),
+        [schema, name] => Some(format!("{schema}.{name}")),
         _ => None,
     }
 }
@@ -303,7 +338,7 @@ pub fn resolve_data_type(
         Ok(t) => Ok(t),
         // Not a builtin type name — it may be a `CREATE TYPE` name; resolve it
         // against the catalog, else surface the original "not supported" error.
-        Err(e) => match custom_type_name(data_type).and_then(|n| catalog.resolve_type(&n)) {
+        Err(e) => match custom_type_key(data_type).and_then(|n| catalog.resolve_type(&n)) {
             Some(ut) => Ok(PgType::User(ut.oid)),
             None => Err(e),
         },

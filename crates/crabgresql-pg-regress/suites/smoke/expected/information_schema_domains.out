@@ -123,6 +123,23 @@ SELECT domain_schema, domain_name, data_type, character_maximum_length,
  information_schema | yes_or_no       | character varying        |                        3 |                    |                      | pg_catalog | varchar
 (5 rows)
 
+-- information_schema is not on the search path, so the bare name reaches
+-- nothing: only the qualified spelling names one of these types.
+--
+-- The wording is this build's own gap, not the domains': a cast to any name it
+-- does not know reports "is not supported yet" where PostgreSQL raises 42704
+-- with a caret. What is pinned here is that the bare and foreign-qualified
+-- spellings resolve to nothing at all.
+SELECT 'x'::sql_identifier;
+ERROR:  type "sql_identifier" is not supported yet
+SELECT 'x'::information_schema.sql_identifier;
+ sql_identifier 
+----------------
+ x
+(1 row)
+
+SELECT 'x'::nosuchschema.sql_identifier;
+ERROR:  type "nosuchschema.sql_identifier" is not supported yet
 -- information_schema is not on the search path, so every rendering of one of
 -- these names qualifies it.
 SELECT 'information_schema.yes_or_no'::regtype AS by_name,
@@ -170,7 +187,44 @@ SELECT pg_typeof(schema_name) AS schema_name, pg_typeof(sql_path) AS sql_path
  information_schema.sql_identifier | information_schema.character_data
 (1 row)
 
+-- A column may be declared of one of these domains, as in PostgreSQL, and the
+-- domain's modifier and CHECK both apply on the way in.
+CREATE TABLE isd_col (c information_schema.yes_or_no);
+INSERT INTO isd_col VALUES ('YES');
+INSERT INTO isd_col VALUES ('NOPE');
+ERROR:  value too long for type character varying(3)
+INSERT INTO isd_col VALUES ('NAH');
+ERROR:  value for domain information_schema.yes_or_no violates check constraint "yes_or_no_check"
+SELECT column_name, data_type, character_maximum_length, domain_schema, domain_name
+  FROM information_schema.columns WHERE table_name = 'isd_col';
+ column_name |     data_type     | character_maximum_length |   domain_schema    | domain_name 
+-------------+-------------------+--------------------------+--------------------+-------------
+ c           | character varying |                        3 | information_schema | yes_or_no
+(1 row)
+
+DROP TABLE isd_col;
 CREATE TABLE isd_demo (a int4, b varchar(10));
+-- A literal that takes its type from the set is an untyped input, so the set
+-- resolves on the base rather than trying to read the literal as the domain.
+-- These are the shapes every introspecting client writes.
+SELECT coalesce(table_name, 'z') AS coalesced, greatest(table_name, 'z') AS greatest
+  FROM information_schema.tables WHERE table_name = 'isd_demo';
+ coalesced | greatest 
+-----------+----------
+ isd_demo  | z
+(1 row)
+
+SELECT pg_typeof(coalesce(table_name, 'z')) AS coalesced,
+       pg_typeof(coalesce(table_name, NULL)) AS with_null,
+       pg_typeof(coalesce(table_name)) AS alone,
+       pg_typeof(greatest(table_name, 'z')) AS greatest,
+       pg_typeof(CASE WHEN true THEN table_name ELSE 'z' END) AS branched
+  FROM information_schema.tables WHERE table_name = 'isd_demo';
+ coalesced | with_null |               alone               | greatest | branched 
+-----------+-----------+-----------------------------------+----------+----------
+ name      | name      | information_schema.sql_identifier | name     | name
+(1 row)
+
 SELECT pg_typeof(table_name) AS table_name, pg_typeof(ordinal_position) AS ordinal_position,
        pg_typeof(is_nullable) AS is_nullable, pg_typeof(data_type) AS data_type
   FROM information_schema.columns
