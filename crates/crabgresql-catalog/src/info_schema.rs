@@ -56,8 +56,6 @@ pub(crate) struct BootstrapCheck {
     pub(crate) expr: &'static str,
 }
 
-/// `pg_collation.oid` of `C`, which is what every text-family
-/// `information_schema` domain sorts under.
 const C_COLLATION: u32 = crabgresql_types::collation::C_COLLATION_OID;
 
 /// The four domains the views this build serves are typed in, plus
@@ -141,7 +139,6 @@ pub(crate) const NAMESPACE_OID: u32 = INFORMATION_SCHEMA_NAMESPACE_OID;
 
 pub(crate) const NAMESPACE: &str = "information_schema";
 
-/// Case-sensitive: all five are lower-case, and so is every reference to them.
 pub(crate) fn by_name(name: &str) -> Option<&'static BootstrapDomain> {
     DOMAINS.iter().find(|d| d.name == name)
 }
@@ -153,14 +150,9 @@ pub(crate) fn by_oid(oid: u32) -> Option<&'static BootstrapDomain> {
 /// The binder's view of one of these domains, by its **qualified** name.
 ///
 /// Qualified is the whole point: `information_schema` is not on the search
-/// path, so PostgreSQL answers a bare `::sql_identifier` with 42704 and only
-/// `::information_schema.sql_identifier` reaches the domain. The binder hands
-/// this seam the same key [`crabgresql_binder::custom_type_key`] builds, which
-/// keeps a non-search-path qualifier attached to the name; a `CREATE DOMAIN
-/// sql_identifier` in `public` therefore keeps the bare spelling to itself.
-///
-/// [`BootstrapDomain::domain_info`] already spells `name` that way — for the
-/// 23514 a failed `CHECK` raises — so one comparison serves both.
+/// path, so PostgreSQL answers a bare `::sql_identifier` with 42704, and a
+/// `CREATE DOMAIN sql_identifier` in `public` keeps the bare spelling to
+/// itself. `name` is the key `crabgresql_binder::custom_type_key` builds.
 pub fn domain_info_by_qualified_name(name: &str) -> Option<DomainInfo> {
     let bare = name.strip_prefix(NAMESPACE)?.strip_prefix('.')?;
     by_name(bare).map(BootstrapDomain::domain_info)
@@ -229,8 +221,7 @@ impl BootstrapDomain {
         }
     }
 
-    /// This domain in the shape the shared `pg_type` row builder takes, so a
-    /// bootstrap domain and a `CREATE DOMAIN` go through exactly one code path.
+    /// This domain in the shape the shared `pg_type` row builder takes.
     ///
     /// `basetype` and `resolved_basetype` are the same OID because no bootstrap
     /// domain is over another domain — PostgreSQL's own chain is one link long

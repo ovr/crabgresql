@@ -1724,13 +1724,9 @@ pub struct ResolvedRoutine {
 ///
 /// The `information_schema` domains are answered here too, as a **fallback**
 /// after this catalog's own types: they are types no `CREATE TYPE` made, but
-/// the binder has only this one seam to find a non-built-in type through.
-///
-/// `name` is the key [`crabgresql_binder::custom_type_key`] builds, which keeps
-/// a qualifier that is not a search path attached — so a bootstrap domain
-/// answers to `information_schema.sql_identifier` and to nothing else, and a
-/// bare `::sql_identifier` gets PostgreSQL's 42704. A user's `CREATE DOMAIN
-/// sql_identifier` in `public` owns the bare spelling outright.
+/// the binder has only this one seam to find a non-built-in type through. They
+/// answer to the qualified spelling alone — see
+/// [`crabgresql_catalog::info_schema::domain_info_by_qualified_name`].
 impl TypeCatalog for GlobalCatalog {
     fn resolve_type(&self, name: &str) -> Option<UserType> {
         let cat = self

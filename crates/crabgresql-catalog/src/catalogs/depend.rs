@@ -507,13 +507,9 @@ fn type_and_routine_deps(cat: &SystemCatalog, out: &mut Vec<Dep>) {
             domain.oid,
             'i',
         ));
-        // The domain's `CHECK` is auto-dependent on it, but that edge is
-        // [`constraint_deps`]'s to draw — one rule, one home, whether `initdb`
-        // or `CREATE DOMAIN` made the constraint.
-        //
         // No edge to the base type: `int4`, `varchar`, `name` and `timestamptz`
         // are all pinned, and PostgreSQL records no dependency on a pinned
-        // object (probed on 18.4).
+        // object (probed on 18.4). The `CHECK` edge is [`constraint_deps`]'s.
     }
     for ty in cat.user_types() {
         out.push(dep(
