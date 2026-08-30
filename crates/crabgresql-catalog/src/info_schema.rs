@@ -137,18 +137,15 @@ pub(crate) static DOMAINS: &[BootstrapDomain] = &[
     },
 ];
 
-/// The namespace all five live in.
 pub(crate) const NAMESPACE_OID: u32 = INFORMATION_SCHEMA_NAMESPACE_OID;
 
 pub(crate) const NAMESPACE: &str = "information_schema";
 
-/// The domain `name` identifies, or `None` for a name none of them has.
 /// Case-sensitive: all five are lower-case, and so is every reference to them.
 pub(crate) fn by_name(name: &str) -> Option<&'static BootstrapDomain> {
     DOMAINS.iter().find(|d| d.name == name)
 }
 
-/// The domain `oid` identifies, or `None` for an OID none of them has.
 pub(crate) fn by_oid(oid: u32) -> Option<&'static BootstrapDomain> {
     DOMAINS.iter().find(|d| d.oid == oid)
 }
@@ -169,7 +166,6 @@ pub fn domain_info_by_qualified_name(name: &str) -> Option<DomainInfo> {
     by_name(bare).map(BootstrapDomain::domain_info)
 }
 
-/// The binder's view of one of these domains, by OID.
 pub fn domain_info_by_oid(oid: u32) -> Option<DomainInfo> {
     by_oid(oid).map(BootstrapDomain::domain_info)
 }

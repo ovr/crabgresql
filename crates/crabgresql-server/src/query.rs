@@ -1488,11 +1488,12 @@ fn undomain_columns(
     columns
         .into_iter()
         .map(|mut column| {
-            // The domain's modifier travels with its base type, so a column of
-            // `yes_or_no` describes itself as `character varying(3)` — a column
-            // of a domain carries `atttypmod = -1` of its own, and the chain is
-            // the only place the modifier lives. A non-domain keeps the modifier
-            // it already had; `base_type_and_typmod` reports `-1` for one.
+            // The modifier travels down with the type: a column of a domain
+            // carries `atttypmod = -1` of its own, and the `typbasetype` chain
+            // is the only place the 3 in `yes_or_no` lives. Guarded on the
+            // column really having been a domain, because
+            // `base_type_and_typmod` answers `-1` for everything else and would
+            // erase a modifier the column already had.
             let (base, typmod) = type_catalog.base_type_and_typmod(column.ty);
             if column.ty != base {
                 column.typmod = typmod;

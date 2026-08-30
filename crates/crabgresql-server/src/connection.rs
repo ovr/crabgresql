@@ -962,19 +962,15 @@ fn field_description(c: &OutputColumn, format: Format) -> FieldDescription {
         column_id: 0,
         type_oid: c.ty.oid(),
         type_len: c.ty.typlen(),
-        // PostgreSQL sends the modifier in its `atttypmod` encoding, where a
-        // `varchar(3)` result is 7 — the conversion belongs at a catalog or
-        // wire boundary, which is exactly what `pg_typmod` is for. The column
-        // has already had any domain stripped by `undomain_columns`, so what
-        // arrives here is the base type and the modifier that travelled with
-        // it: a `yes_or_no` column describes itself as `character varying(3)`.
+        // The wire wants PostgreSQL's `atttypmod` encoding, where a `varchar(3)`
+        // result is 7, while everything upstream of here keeps the declared 3.
+        // A domain is already off the column by now — `undomain_columns` left
+        // the base type and the modifier that travelled with it.
         type_modifier: crabgresql_storage_api::pg_typmod(c.ty, c.typmod),
         format,
     }
 }
 
-/// Build a `RowDescription`'s fields from a statement's output columns, applying
-/// the requested per-column result `formats`.
 fn field_descriptions(cols: &[OutputColumn], formats: &[Format]) -> Vec<FieldDescription> {
     cols.iter()
         .enumerate()

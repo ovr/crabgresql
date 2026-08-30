@@ -797,8 +797,7 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
         ),
         // PG puts a space after a unary operator: `- a`, not `-a`.
         ast::Expr::UnaryOp { op, expr: inner } => format!("{op} {}", expr(inner, cx, prec)),
-        // `a = ANY (b)`: a space before the group, and the right operand always
-        // in one, subquery or array alike. The parser's own `Display` writes
+        // Deparsed rather than echoed: the parser's own `Display` writes
         // `ANY(b)` and upper-cases the type names inside, so this arm is what
         // keeps a stored `yes_or_no_check` rendering byte-for-byte as PG's.
         //
