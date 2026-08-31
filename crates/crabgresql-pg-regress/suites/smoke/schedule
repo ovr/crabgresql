@@ -38,6 +38,7 @@ test: transactions
 test: numeric
 test: math
 test: join
+test: join_nested
 test: join_pushdown
 test: generate_series
 test: generate_subscripts

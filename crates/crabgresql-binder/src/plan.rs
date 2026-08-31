@@ -3652,8 +3652,11 @@ fn bind_from_clause(
             ctes,
             outer_scope,
             windows,
-            &relations,
-            visible.as_deref(),
+            &Preceding {
+                reachable: &relations,
+                visible: visible.as_deref(),
+                ..Preceding::none()
+            },
             demand,
         )?;
         for rel in &group_relations {
@@ -3700,6 +3703,70 @@ fn shift_visible(mut col: VisibleColumn, delta: usize) -> VisibleColumn {
     col
 }
 
+/// One FROM factor as a whole [`BoundFrom`] — a single relation for most of
+/// them, a subtree for a **parenthesised join**.
+///
+/// The SQL standard lets a join expression be nested in parentheses, and
+/// `pg_get_viewdef` prints every join that way, so `information_schema.columns`
+/// arrives as six levels of `((((((a LEFT JOIN … ) JOIN (c JOIN nc ON …) ON …)`.
+/// Returning a `BoundFrom` rather than a single [`BoundFromItem`] is what makes
+/// the nesting cost nothing: an inner group's relations and join tree join the
+/// enclosing chain exactly as one relation's do.
+///
+/// The inner group's own join predicates index its own combined row, base 0 —
+/// which is right, because the enclosing chain puts that whole subtree in as one
+/// join input. Only the *enclosing* chain's predicates count across the boundary,
+/// and those are bound against `bound.relations` after the subtree is folded in.
+#[allow(clippy::too_many_arguments)]
+fn bind_from_factor(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
+    factor: &ast::TableFactor,
+    ctes: &CteEnv,
+    preceding: &Preceding<'_>,
+    outer_scope: &[OuterLevel],
+    windows: &NamedWindows,
+    demand: &SystemDemand,
+) -> Result<BoundFrom, BindError> {
+    let ast::TableFactor::NestedJoin {
+        table_with_joins,
+        alias,
+    } = factor
+    else {
+        return Ok(bind_from_item(
+            engine,
+            catalog,
+            params,
+            factor,
+            ctes,
+            preceding,
+            outer_scope,
+            demand,
+        )?
+        .into_bound_from());
+    };
+    // TODO: `FROM (a JOIN b USING (c)) AS x` — PostgreSQL collapses the subtree
+    // into one relation named `x`, hiding the inner qualifiers. Nothing here
+    // renames a whole join tree yet, and no system view definition writes one.
+    if alias.is_some() {
+        return Err(BindError::feature_not_supported(
+            "an alias on a parenthesised join is not supported yet",
+        ));
+    }
+    bind_table_with_joins(
+        engine,
+        catalog,
+        params,
+        table_with_joins,
+        ctes,
+        outer_scope,
+        windows,
+        preceding,
+        demand,
+    )
+}
+
 /// Bind one left-associative explicit join chain. Each ON/USING clause sees the
 /// accumulated left side and the newly-added right factor, but no relations
 /// from other comma-delimited FROM groups. A `USING`/`NATURAL` join also builds
@@ -3714,34 +3781,40 @@ fn bind_table_with_joins(
     ctes: &CteEnv,
     outer_scope: &[OuterLevel],
     windows: &NamedWindows,
-    siblings: &[ScopeItem],
-    // The merged `USING`/`NATURAL` view accumulated over `siblings`, so a
-    // `LATERAL` leading item resolves such a join column the way PostgreSQL
-    // does — once, rather than ambiguously across both physical sides.
-    siblings_visible: Option<&[VisibleColumn]>,
+    // What precedes this whole group: the other comma groups at the top level,
+    // or the accumulated left side when this group is a *parenthesised* factor
+    // inside an enclosing chain. Its merged `USING`/`NATURAL` view travels with
+    // it, so a `LATERAL` leading item resolves such a join column the way
+    // PostgreSQL does — once, rather than ambiguously across both sides.
+    outer: &Preceding<'_>,
     demand: &SystemDemand,
 ) -> Result<BoundFrom, BindError> {
-    // Whether the preceding comma groups are in the row this group's *leading*
-    // item is fed.
+    // Everything outside this group, reachable or not. A chain puts its leading
+    // item at the bottom left, with any join to the outside spliced in *above*
+    // it, so from inside the chain none of it is in reach.
+    let outside: Vec<ScopeItem> = outer.items().collect();
+    // Whether what precedes this group is in the row its *leading* item is fed.
     //
-    // With no joins, the group *is* that item, and `bind_from_clause` makes it
-    // the right child of the cross join with those groups — their columns are
-    // exactly its left row. With a chain, the item becomes the chain's
-    // bottom-left leaf and the cross join is spliced in *above* it, so there is
-    // no left row under it at all: marking it lateral would leave `level: 1`
-    // references no join node can fill.
+    // With no joins, the group *is* that item, and the caller makes it the right
+    // child of the join with what precedes — those columns are exactly its left
+    // row. With a chain, the item becomes the chain's bottom-left leaf and the
+    // join is spliced in *above* it, so there is no left row under it at all:
+    // marking it lateral would leave `level: 1` references no join node can
+    // fill.
     let leading = match table.joins.is_empty() {
         true => Preceding {
-            reachable: siblings,
-            visible: siblings_visible,
-            ..Preceding::none()
+            reachable: outer.reachable,
+            visible: outer.visible,
+            out_of_reach: outer.out_of_reach,
+            right_of_outer_join: outer.right_of_outer_join,
         },
         false => Preceding {
-            out_of_reach: siblings,
+            out_of_reach: &outside,
+            right_of_outer_join: outer.right_of_outer_join,
             ..Preceding::none()
         },
     };
-    let mut bound = bind_from_item(
+    let mut bound = bind_from_factor(
         engine,
         catalog,
         params,
@@ -3749,9 +3822,9 @@ fn bind_table_with_joins(
         ctes,
         &leading,
         outer_scope,
+        windows,
         demand,
-    )?
-    .into_bound_from();
+    )?;
     let mut seen: HashSet<String> = bound
         .relations
         .iter()
@@ -3776,7 +3849,7 @@ fn bind_table_with_joins(
         // `LATERAL` reference across a RIGHT or FULL join, where the left row
         // it would read is not guaranteed to exist.
         let binding = join_kind_and_constraint(&join.join_operator)?;
-        let right = bind_from_item(
+        let right = bind_from_factor(
             engine,
             catalog,
             params,
@@ -3784,20 +3857,21 @@ fn bind_table_with_joins(
             ctes,
             &Preceding {
                 // The accumulated left side of *this* chain, in the layout of
-                // the row this join node is fed. Items from earlier comma
-                // groups precede it too, but the tree cross-joins those above
-                // the chain, so they never reach that row.
+                // the row this join node is fed. Items from outside the group
+                // precede it too, but the tree joins those above the chain, so
+                // they never reach that row.
                 reachable: &bound.relations,
                 visible: visible.as_deref(),
-                out_of_reach: siblings,
+                out_of_reach: &outside,
                 right_of_outer_join: matches!(binding.kind(), JoinKind::Right | JoinKind::Full),
             },
             outer_scope,
+            windows,
             demand,
-        )?
-        .into_bound_from();
-        let right_qualifier = &right.relations[0].qualifier;
-        ensure_unique_qualifier(&mut seen, right_qualifier)?;
+        )?;
+        for rel in &right.relations {
+            ensure_unique_qualifier(&mut seen, &rel.qualifier)?;
+        }
         let right_width = right.source.width();
 
         let (kind, predicate) = match binding {

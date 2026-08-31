@@ -145,10 +145,11 @@ pub(crate) enum LateralBarrier {
     /// row it would reference may not exist at all.
     WrongJoinType,
     /// A `LATERAL` item *anywhere in an explicit join chain* — leading it or
-    /// inside it — referencing a FROM item from an earlier comma-separated
-    /// group. PostgreSQL answers these queries; we do not, because the join tree
-    /// cross-joins the groups *above* the chain, so that item's columns are not
-    /// in the row any node of the chain is fed.
+    /// inside it — referencing a FROM item outside that chain: an earlier
+    /// comma-separated group, or the chain a parenthesised join sits in.
+    /// PostgreSQL answers these queries; we do not, because the join tree joins
+    /// the outside *above* the chain, so that item's columns are not in the row
+    /// any node of the chain is fed.
     ///
     /// A barrier rather than a silent fall-through to the enclosing queries,
     /// which would bind a like-named outer relation and answer a different
@@ -181,7 +182,7 @@ impl LateralBarrier {
                     .to_string(),
             )),
             LateralBarrier::OtherGroup => BindError::feature_not_supported(format!(
-                "LATERAL reference to \"{qualifier}\" from another comma-separated FROM item \
+                "LATERAL reference to \"{qualifier}\" from outside this join chain \
                  is not supported yet"
             )),
         }
