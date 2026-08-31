@@ -30,6 +30,7 @@ test: case
 test: coalesce
 test: nullif
 test: greatest_least
+test: whole_row
 test: bool_test
 test: in
 test: between

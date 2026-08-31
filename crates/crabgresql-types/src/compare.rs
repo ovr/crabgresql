@@ -150,6 +150,36 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
             }
             compare_elementwise(kind.element(), la, lb)
         }
+        // A composite compares field by field, the shorter row first on a common
+        // prefix, and a NULL field last — PG's `record_cmp`, which is
+        // `array_cmp`'s rule over a heterogeneous row.
+        //
+        // Each field is compared under *its own* type, read off the value:
+        // [`PgType::Record`] names no row type, so there is no field type list
+        // to consult. Two fields of different types cannot be ordered against
+        // each other — PG raises 42883 there — and are called equal rather than
+        // given an arbitrary order, so the comparison stays total for a
+        // defensive caller.
+        PgType::Record => {
+            let (a, b) = (record_fields(l), record_fields(r));
+            for (x, y) in a.iter().zip(b) {
+                let ordering = match (x, y) {
+                    (Value::Null, Value::Null) => Ordering::Equal,
+                    (Value::Null, _) => Ordering::Greater,
+                    (_, Value::Null) => Ordering::Less,
+                    _ => match (x.pg_type(), y.pg_type()) {
+                        (Some(tx), Some(ty)) if tx == ty => {
+                            compare_values_collated(tx, x, y, collation)
+                        }
+                        _ => Ordering::Equal,
+                    },
+                };
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
         // Enums are the only user type with a query-time ordering (by
         // definition ordinal), which matches PG: a `CREATE TYPE` base type has
         // no default btree opclass, so ORDER BY on one fails with "could not
@@ -207,6 +237,13 @@ pub fn array_dims(v: &Value) -> &[crate::ArrayDim] {
     match v {
         Value::Array { dims, .. } => dims,
         other => unreachable!("expected array, got {other:?}"),
+    }
+}
+
+fn record_fields(v: &Value) -> &[Value] {
+    match v {
+        Value::Record(record) => record.fields(),
+        other => unreachable!("expected record, got {other:?}"),
     }
 }
 

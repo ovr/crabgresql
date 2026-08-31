@@ -90,6 +90,11 @@ pub(super) fn for_each_node_mut(expr: &mut BoundExpr, f: &mut dyn FnMut(&mut Bou
                 for_each_node_mut(elem, f);
             }
         }
+        BoundExpr::WholeRow { fields, .. } => {
+            for field in fields {
+                for_each_node_mut(field, f);
+            }
+        }
         BoundExpr::Subscript { base, indexes, .. } => {
             for_each_node_mut(base, f);
             for i in indexes {

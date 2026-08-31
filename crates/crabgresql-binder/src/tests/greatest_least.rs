@@ -160,10 +160,10 @@ fn a_decorated_call_is_a_syntax_error() -> anyhow::Result<()> {
 }
 
 /// In PG a bare `*` is a grammar error while `t.*` is a whole-row reference
-/// yielding a `record`, which this engine cannot represent. `COALESCE` is here
-/// because the check it exercises is shared by every special form.
+/// yielding a `record`. `COALESCE` is here because the check each exercises is
+/// shared by every special form.
 #[test]
-fn a_bare_star_is_a_syntax_error_and_a_row_wildcard_is_unsupported() -> anyhow::Result<()> {
+fn a_bare_star_is_a_syntax_error_and_a_row_wildcard_is_a_record() -> anyhow::Result<()> {
     for sql in ["SELECT GREATEST(*) FROM t", "SELECT LEAST(*) FROM t"] {
         let e = bind_err(sql)?;
         assert_eq!(e.code, sqlstate::SYNTAX_ERROR, "{sql}");
@@ -174,9 +174,8 @@ fn a_bare_star_is_a_syntax_error_and_a_row_wildcard_is_unsupported() -> anyhow::
         "SELECT LEAST(t.*, t.*) FROM t",
         "SELECT COALESCE(t.*) FROM t",
     ] {
-        let e = bind_err(sql)?;
-        assert_eq!(e.code, sqlstate::FEATURE_NOT_SUPPORTED, "{sql}");
-        assert_eq!(e.message, "whole-row references are not supported yet");
+        let QueryPlan { projections, .. } = bound_query(sql)?;
+        assert_eq!(projections[0].ty(), PgType::Record, "{sql}");
     }
     Ok(())
 }

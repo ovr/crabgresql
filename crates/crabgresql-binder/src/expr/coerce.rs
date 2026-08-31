@@ -1075,6 +1075,13 @@ pub(crate) fn parse_unknown(s: &str, ty: PgType, fmt: &FmtCtx) -> Result<Value, 
             sqlstate::INTERNAL_ERROR,
             "reg* literal reached the constant folder",
         )),
+        // `record` has no input function to reach: it is a pseudo-type, so no
+        // literal is ever resolved to it. PG says as much when asked directly —
+        // `'(1)'::record` is 42846, "cannot cast type unknown to record".
+        PgType::Record => Err(BindError::new(
+            sqlstate::CANNOT_COERCE,
+            "cannot cast type unknown to record",
+        )),
         PgType::User(_) => Err(invalid()),
     }
 }

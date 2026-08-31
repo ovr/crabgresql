@@ -77,6 +77,10 @@ pub(crate) fn is_orderable(ty: PgType, catalog: &dyn TypeCatalog) -> bool {
             // See `compare_values_collated`. Their elements are always
             // `oid`/`int2`, both orderable, so there is no element check here.
             | PgType::Vector(_)
+            // `record` has a default btree opclass (`record_ops`), which is what
+            // makes `ORDER BY t.*` and `GREATEST(t.*, u.*)` legal in PG. The
+            // ordering is field-wise; see `compare_values_collated`.
+            | PgType::Record
     ) || matches!(ty, PgType::User(oid) if catalog.enum_info(oid).is_some())
         // A domain orders exactly as its base does: the value under it *is* a
         // base value, and `compare_values` dispatches on the value. `base_type`

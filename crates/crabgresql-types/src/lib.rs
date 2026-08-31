@@ -128,6 +128,10 @@ pub mod oid {
     pub const JSONB: u32 = 3802;
     /// `jsonpath`: an SQL/JSON path expression. See [`crate::jsonpath`].
     pub const JSONPATH: u32 = 4072;
+    /// `record`: the pseudo-type of a row whose composite type has no name of
+    /// its own — what a whole-row reference `t.*` produces. See
+    /// [`crate::RecordVal`].
+    pub const RECORD: u32 = 2249;
     /// `unknown`: the type of a literal that has not yet been resolved. It has
     /// no [`crate::PgType`] of its own — the binder models it as
     /// `Binding::Unknown` — but `pg_typeof` and `705::regtype` have to name it.
@@ -419,6 +423,16 @@ pub enum PgType {
     /// `unnest` reach the element type through [`VectorKind::element`].
     /// See [`crate::vector`].
     Vector(VectorKind),
+    /// `record`: a row of named fields ([`Value::Record`]) — what a whole-row
+    /// reference `t.*` produces.
+    ///
+    /// One variant for every row shape, because the *value* carries its own
+    /// field names and types. PostgreSQL does the same at the SQL surface: a
+    /// whole-row reference has the relation's named composite type, but a
+    /// function declared over `record` accepts any of them, and `record` is the
+    /// only spelling this build needs — nothing here declares a composite type,
+    /// so there is no named row type for a value to be of.
+    Record,
     /// A user-defined type (`CREATE TYPE`); values are stored using the
     /// backing built-in representation, so this only carries the assigned OID.
     User(u32),
@@ -595,6 +609,7 @@ impl PgType {
             PgType::Json => oid::JSON,
             PgType::Jsonb => oid::JSONB,
             PgType::Jsonpath => oid::JSONPATH,
+            PgType::Record => oid::RECORD,
             PgType::Reg(kind) => kind.oid(),
             PgType::Tsvector => oid::TSVECTOR,
             PgType::Tsquery => oid::TSQUERY,
@@ -749,6 +764,7 @@ impl PgType {
             oid::JSON => PgType::Json,
             oid::JSONB => PgType::Jsonb,
             oid::JSONPATH => PgType::Jsonpath,
+            oid::RECORD => PgType::Record,
             oid::REGPROC => PgType::Reg(RegKind::Proc),
             oid::REGPROCEDURE => PgType::Reg(RegKind::Procedure),
             oid::REGOPER => PgType::Reg(RegKind::Oper),
@@ -929,6 +945,7 @@ impl PgType {
             | PgType::Jsonpath
             | PgType::Path
             | PgType::Polygon
+            | PgType::Record
             | PgType::Tsvector
             | PgType::Tsquery
             // Both vectors are varlena: PG stores them in the array layout,
@@ -1037,6 +1054,7 @@ impl PgType {
             PgType::Json => "json",
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
+            PgType::Record => "record",
             PgType::Reg(kind) => kind.typname(),
             PgType::Tsvector => "tsvector",
             PgType::Tsquery => "tsquery",
@@ -1167,6 +1185,7 @@ impl PgType {
             PgType::Json => "json",
             PgType::Jsonb => "jsonb",
             PgType::Jsonpath => "jsonpath",
+            PgType::Record => "record",
             PgType::Reg(kind) => kind.typname(),
             PgType::Tsvector => "tsvector",
             PgType::Tsquery => "tsquery",
@@ -1531,6 +1550,55 @@ pub enum Value {
         kind: VectorKind,
         elems: Vec<Value>,
     },
+    /// A composite: the row a whole-row reference `t.*` produces. See
+    /// [`RecordVal`].
+    Record(RecordVal),
+}
+
+/// A row of named fields, carrying its own shape.
+///
+/// The names travel *with* the value rather than being looked up from a row
+/// type, which is what lets `_pg_truetypid(a.*, t.*)` read `atttypid` out of a
+/// `pg_attribute` row without a catalog: [`PgType::Record`] says only "some
+/// row", so the field names are the value's job.
+///
+/// `names` and `fields` are positionally paired and always the same length;
+/// build one with [`RecordVal::new`] rather than by hand.
+#[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq)]
+pub struct RecordVal {
+    names: Vec<String>,
+    fields: Vec<Value>,
+}
+
+impl RecordVal {
+    /// # Panics
+    /// If `names` and `fields` differ in length.
+    pub fn new(names: Vec<String>, fields: Vec<Value>) -> RecordVal {
+        assert_eq!(
+            names.len(),
+            fields.len(),
+            "a record's field names and values must pair up"
+        );
+        RecordVal { names, fields }
+    }
+
+    /// The field called `name`, or `None` if the row has no such field.
+    ///
+    /// A row this build produces comes from one relation, so a duplicate name
+    /// cannot occur; if one ever did, the first would win, as an unqualified
+    /// column reference does.
+    pub fn field(&self, name: &str) -> Option<&Value> {
+        let at = self.names.iter().position(|n| n == name)?;
+        Some(&self.fields[at])
+    }
+
+    pub fn fields(&self) -> &[Value] {
+        &self.fields
+    }
+
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
 }
 
 impl Value {
@@ -1593,6 +1661,7 @@ impl Value {
             Value::Enum { type_oid, .. } => Some(PgType::User(*type_oid)),
             Value::Array { elem, .. } => Some(PgType::Array(elem.oid())),
             Value::Vector { kind, .. } => Some(PgType::Vector(*kind)),
+            Value::Record(_) => Some(PgType::Record),
         }
     }
 
@@ -1672,8 +1741,61 @@ impl Value {
             // A vector prints space-separated and unbraced (`oidvectorout`).
             // Zone-independent: its elements are `oid`/`int2`.
             Value::Vector { elems, .. } => Some(vector::format(elems)),
+            // A composite prints in PG's `(...)` form (`record_out`).
+            Value::Record(record) => Some(record_out(record, fmt)),
         }
     }
+}
+
+/// PG's `record_out`: the fields comma-separated inside parentheses, each in
+/// its own output form — `(1,"x y")`.
+///
+/// A NULL field prints as *nothing at all*, which is why the quoting rules
+/// below have to quote an empty string: `("")` is an empty text field and `()`
+/// is a NULL one, and the two must not collide.
+fn record_out(record: &RecordVal, fmt: &FmtCtx) -> String {
+    let mut out = String::from("(");
+    for (i, field) in record.fields().iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // `encode_text_with` returns `None` for NULL, which contributes the
+        // empty string unquoted.
+        if let Some(text) = field.encode_text_with(fmt) {
+            out.push_str(&record_field_out(&text));
+        }
+    }
+    out.push(')');
+    out
+}
+
+/// One field of [`record_out`], quoted if its text would otherwise be
+/// ambiguous. PG quotes on the separators and parentheses of the record syntax,
+/// on any whitespace (a leading or trailing space would be eaten on input), and
+/// on the empty string.
+///
+/// Inside the quotes, `"` and `\` are **doubled** — `q"r\s` prints as
+/// `"q""r\\s"`. That is `record_out`'s own rule and not `array_out`'s, which
+/// backslash-escapes the same two characters; the input functions differ to
+/// match, so the two must not be shared.
+fn record_field_out(text: &str) -> String {
+    let needs_quotes = text.is_empty()
+        || text
+            .chars()
+            .any(|c| matches!(c, '(' | ')' | ',' | '"' | '\\') || c.is_whitespace());
+    if !needs_quotes {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if matches!(c, '"' | '\\') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 macro_rules! impl_message_error {
@@ -2125,5 +2247,93 @@ mod tests {
             let rendered = value.encode_text_with(&fmt).expect("not null");
             assert_eq!(cast::byteain(&rendered).expect("re-reads"), bytes);
         }
+    }
+
+    /// `record_out` on the shapes whose quoting rules differ: a plain field, a
+    /// NULL (nothing at all), an empty string (which must still quote, or it
+    /// would read back as the NULL), and the separators/whitespace/escapes.
+    #[test]
+    fn a_composite_prints_the_way_record_out_does() {
+        let record = |fields: Vec<Value>| {
+            let names = (0..fields.len()).map(|i| format!("f{i}")).collect();
+            Value::Record(RecordVal::new(names, fields))
+        };
+        let out = |fields: Vec<Value>| {
+            record(fields)
+                .encode_text_with(&FmtCtx::utc_default())
+                .expect("a composite is never NULL")
+        };
+        assert_eq!(out(vec![Value::Int4(1), Value::Text("x".into())]), "(1,x)");
+        // A NULL field contributes nothing; an empty string quotes so the two
+        // stay distinguishable.
+        assert_eq!(
+            out(vec![Value::Null, Value::Text(String::new())]),
+            "(,\"\")"
+        );
+        assert_eq!(out(vec![Value::Text("x y".into())]), "(\"x y\")");
+        assert_eq!(out(vec![Value::Text("a,b".into())]), "(\"a,b\")");
+        assert_eq!(out(vec![Value::Text("(p)".into())]), "(\"(p)\")");
+        // `"` and `\` are **doubled** inside the quotes — `record_out`'s rule,
+        // not `array_out`'s backslash escape. Probed on 18.4: `q"r\s` prints as
+        // `"q""r\\s"`.
+        assert_eq!(
+            out(vec![Value::Text("q\"r\\s".into())]),
+            "(\"q\"\"r\\\\s\")"
+        );
+        // Any whitespace forces quoting, not just a space: a tab would be eaten
+        // on the way back in too.
+        assert_eq!(out(vec![Value::Text("a\tb".into())]), "(\"a\tb\")");
+        assert_eq!(out(Vec::new()), "()");
+    }
+
+    /// A composite orders field by field, NULLs last, the shorter row first on a
+    /// common prefix — `record_cmp`.
+    #[test]
+    fn composites_compare_field_by_field() {
+        let record = |fields: Vec<Value>| {
+            let names = (0..fields.len()).map(|i| format!("f{i}")).collect();
+            Value::Record(RecordVal::new(names, fields))
+        };
+        let cmp = |a: Vec<Value>, b: Vec<Value>| {
+            crate::compare::compare_values(PgType::Record, &record(a), &record(b))
+        };
+        use std::cmp::Ordering;
+        assert_eq!(
+            cmp(
+                vec![Value::Int4(1), Value::Text("a".into())],
+                vec![Value::Int4(1), Value::Text("b".into())]
+            ),
+            Ordering::Less
+        );
+        // The first field decides, whatever the second says.
+        assert_eq!(
+            cmp(
+                vec![Value::Int4(2), Value::Text("a".into())],
+                vec![Value::Int4(1), Value::Text("z".into())]
+            ),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp(vec![Value::Null], vec![Value::Int4(1)]),
+            Ordering::Greater
+        );
+        assert_eq!(cmp(vec![Value::Null], vec![Value::Null]), Ordering::Equal);
+        assert_eq!(
+            cmp(vec![Value::Int4(1)], vec![Value::Int4(1), Value::Int4(0)]),
+            Ordering::Less
+        );
+    }
+
+    /// A field is read by name, which is the whole reason the names travel with
+    /// the value: `PgType::Record` names no row type to look one up in.
+    #[test]
+    fn a_composite_field_is_read_by_name() {
+        let record = RecordVal::new(
+            vec!["atttypid".into(), "atttypmod".into()],
+            vec![Value::Oid(1043), Value::Int4(14)],
+        );
+        assert_eq!(record.field("atttypid"), Some(&Value::Oid(1043)));
+        assert_eq!(record.field("atttypmod"), Some(&Value::Int4(14)));
+        assert_eq!(record.field("nope"), None);
     }
 }

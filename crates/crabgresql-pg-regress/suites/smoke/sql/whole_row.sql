@@ -1,0 +1,32 @@
+--
+-- Whole-row references
+-- `t.*` is a composite value where a larger expression consumes it, and an
+-- *expansion* where the select list holds nothing else.
+--
+CREATE TABLE wr (a int4, b text, c bool);
+INSERT INTO wr VALUES (1, 'x y', true), (2, NULL, false), (3, '', NULL), (4, 'q"r\s', true);
+-- record_out: a NULL field prints as nothing, an empty string has to quote so
+-- the two stay apart, and the separators/whitespace/backslashes escape.
+SELECT greatest(wr.*) FROM wr ORDER BY a;
+SELECT coalesce(wr.*) AS whole FROM wr ORDER BY a LIMIT 1;
+-- A select-list item that *is* the star expands, however many parentheses it
+-- wears and whatever it is aliased to.
+SELECT wr.* FROM wr ORDER BY a LIMIT 1;
+SELECT wr.* AS ignored FROM wr ORDER BY a LIMIT 1;
+SELECT (wr.*) FROM wr ORDER BY a LIMIT 1;
+SELECT ((wr.*)) AS ignored FROM wr ORDER BY a LIMIT 1;
+SELECT (wr.*), 1 FROM wr ORDER BY a LIMIT 1;
+-- The star names a FROM item by its alias, so an alias renames it.
+SELECT greatest(w.*) FROM wr w ORDER BY a LIMIT 1;
+-- A qualifier no FROM item declares is 42P01, as it is for a qualified column.
+SELECT greatest(nope.*) FROM wr;
+-- A system column is not part of the row, exactly as it is not part of `t.*`.
+CREATE TABLE wr_sys (a int4);
+INSERT INTO wr_sys VALUES (7);
+SELECT greatest(wr_sys.*) FROM wr_sys;
+DROP TABLE wr_sys;
+-- Field-wise ordering (`record_cmp`): the first differing field decides, a NULL
+-- field sorts last.
+SELECT greatest(wr.*) FROM wr ORDER BY 1 DESC LIMIT 1;
+SELECT DISTINCT greatest(wr.*) AS rows FROM wr ORDER BY 1;
+DROP TABLE wr;

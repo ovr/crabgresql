@@ -13,7 +13,7 @@ use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{ProcInfo, SqlBody};
 use crabgresql_txn::{TxnContext, XactStatus};
 use crabgresql_types::text::quote_ident;
-use crabgresql_types::{Interval, PgType, Value, arith, cast};
+use crabgresql_types::{Interval, PgType, RecordVal, Value, arith, cast};
 
 // The comparator and the `Value` accessors it is built from live in
 // `crabgresql-types`, where the engine (column statistics) and the planner
@@ -282,6 +282,17 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             } else {
                 Ok(Value::array_1d(*elem, values))
             }
+        }
+        // `t.*`: the row as one composite. The field names travel with the value
+        // (see `RecordVal`) because `PgType::Record` names no row type — a
+        // function reading `atttypid` out of a `pg_attribute` row has nothing
+        // else to read it by.
+        BoundExpr::WholeRow { names, fields } => {
+            let values = fields
+                .iter()
+                .map(|f| eval(f, row, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Record(RecordVal::new(names.clone(), values)))
         }
         // `a[i]` / `a[i][j]`: element access. A NULL base or NULL/out-of-range
         // subscript yields NULL (PG semantics), never an error.

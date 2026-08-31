@@ -1433,6 +1433,7 @@ fn resolve_expr(
             resolve_exprs(args, ctx, txn)?;
         }
         BoundExpr::ArrayCtor { elems, .. } => resolve_exprs(elems, ctx, txn)?,
+        BoundExpr::WholeRow { fields, .. } => resolve_exprs(fields, ctx, txn)?,
         BoundExpr::Subscript { base, indexes, .. } => {
             resolve_expr(base, ctx, txn)?;
             resolve_exprs(indexes, ctx, txn)?;

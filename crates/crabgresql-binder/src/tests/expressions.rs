@@ -862,3 +862,69 @@ fn size_pretty_is_ambiguous_for_an_integer() -> anyhow::Result<()> {
     assert_eq!(e.code, "42883");
     Ok(())
 }
+
+/// A whole-row reference is a composite only where a *larger expression*
+/// consumes it. A select-list item that is itself `t.*` still expands into one
+/// output column per column, however many parentheses it wears and whatever it
+/// is aliased to — which is what PostgreSQL does, and the rule most easily lost
+/// by accident, so both positions are checked together.
+#[test]
+fn whole_row_is_a_composite_in_expression_position() -> anyhow::Result<()> {
+    let QueryPlan { projections, .. } = bound_query("SELECT greatest(t.*) FROM t")?;
+    let [BoundExpr::MinMax { args, .. }] = projections.as_slice() else {
+        bail!("expected a GREATEST call, got {projections:?}");
+    };
+    let [BoundExpr::WholeRow { names, fields }] = args.as_slice() else {
+        bail!("expected a whole-row argument, got {args:?}");
+    };
+    assert_eq!(names, &["id", "big", "name", "flag"]);
+    assert_eq!(
+        fields,
+        &[
+            BoundExpr::ColumnRef {
+                index: 0,
+                ty: PgType::Int4
+            },
+            BoundExpr::ColumnRef {
+                index: 1,
+                ty: PgType::Int8
+            },
+            BoundExpr::ColumnRef {
+                index: 2,
+                ty: PgType::Text
+            },
+            BoundExpr::ColumnRef {
+                index: 3,
+                ty: PgType::Bool
+            },
+        ]
+    );
+    assert_eq!(args[0].ty(), PgType::Record);
+
+    // Every select-list spelling of the star itself still expands.
+    for sql in [
+        "SELECT t.* FROM t",
+        "SELECT t.* AS ignored FROM t",
+        "SELECT (t.*) FROM t",
+        "SELECT ((t.*)) AS ignored FROM t",
+    ] {
+        let QueryPlan { projections, .. } = bound_query(sql)?;
+        assert_eq!(projections.len(), 4, "for `{sql}`");
+        assert!(
+            projections
+                .iter()
+                .all(|e| matches!(e, BoundExpr::ColumnRef { .. })),
+            "for `{sql}`: {projections:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A qualifier no FROM item declares is the same 42P01 a qualified column gets.
+#[test]
+fn whole_row_reports_a_missing_relation() -> anyhow::Result<()> {
+    let e = bind_err("SELECT greatest(nope.*) FROM t")?;
+    assert_eq!(e.code, sqlstate::UNDEFINED_TABLE);
+    assert_eq!(e.message, "missing FROM-clause entry for table \"nope\"");
+    Ok(())
+}

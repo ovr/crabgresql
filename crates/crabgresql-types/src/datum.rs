@@ -373,6 +373,13 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
                 }
             }
         }
+        // A composite has no tag because nothing can store one: `record` is a
+        // pseudo-type, so no column is of it, and a whole-row reference only
+        // ever exists inside one query's expression evaluation. Claiming a tag
+        // for a value no page can hold would reserve it against nothing.
+        Value::Record(_) => {
+            unreachable!("a composite is a query-time value and is never stored")
+        }
     }
 }
 

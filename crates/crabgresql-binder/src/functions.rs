@@ -4281,14 +4281,9 @@ fn bind_special_form(
                 }
                 // `t.*` is no syntax error in PG: it is a whole-row reference, and
                 // `greatest(t.*)` over `(1,2)` hands back the `record` `(1,2)`.
-                //
-                // TODO: whole-row references, which need a composite/`record` type
-                // in `PgType` before an expression can carry one.
-                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::QualifiedWildcard(_)) => {
-                    return Err(BindError::feature_not_supported(
-                        "whole-row references are not supported yet",
-                    ));
-                }
+                // `positional_args` below restates it as one, so it needs no
+                // rejection here.
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::QualifiedWildcard(_)) => {}
             }
         }
     }
@@ -6097,6 +6092,18 @@ pub(crate) fn positional_arg_exprs(args: &[ast::FunctionArg]) -> Result<Vec<ast:
         match arg {
             ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
             | ast::FunctionArg::Variadic(ast::FunctionArgExpr::Expr(e)) => out.push(e.clone()),
+            // `f(t.*)` is a whole-row reference, not a wildcard: the parser
+            // gives an argument list its own node for it, so it is restated as
+            // the expression the binder already knows how to bind. The token is
+            // only a span carrier and this rewrite invents no text, so an empty
+            // one is honest — the diagnostic falls back to the call's own span.
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::QualifiedWildcard(name))
+            | ast::FunctionArg::Variadic(ast::FunctionArgExpr::QualifiedWildcard(name)) => {
+                out.push(ast::Expr::QualifiedWildcard(
+                    name.clone(),
+                    ast::helpers::attached_token::AttachedToken::empty(),
+                ));
+            }
             _ => {
                 return Err(BindError::feature_not_supported(
                     "named or wildcard function arguments are not supported yet",

@@ -625,6 +625,7 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         | BoundExpr::Coalesce { args, .. }
         | BoundExpr::MinMax { args, .. } => subst_exprs(args, params),
         BoundExpr::ArrayCtor { elems, .. } => subst_exprs(elems, params),
+        BoundExpr::WholeRow { fields, .. } => subst_exprs(fields, params),
         BoundExpr::Subscript { base, indexes, .. } => {
             subst_expr(base, params);
             for i in indexes {
@@ -986,6 +987,11 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         BoundExpr::ArrayCtor { elems, .. } => {
             for a in elems.iter_mut() {
                 subst_outer_expr(a, outer, depth);
+            }
+        }
+        BoundExpr::WholeRow { fields, .. } => {
+            for f in fields.iter_mut() {
+                subst_outer_expr(f, outer, depth);
             }
         }
         BoundExpr::Subscript { base, indexes, .. } => {
@@ -1428,6 +1434,9 @@ pub(crate) fn for_each_subexpr(
         }
         BoundExpr::ArrayCtor { elems, .. } => {
             elems.iter().for_each(|e| for_each_subexpr(e, depth, f));
+        }
+        BoundExpr::WholeRow { fields, .. } => {
+            fields.iter().for_each(|e| for_each_subexpr(e, depth, f));
         }
         BoundExpr::Subscript { base, indexes, .. } => {
             for_each_subexpr(base, depth, f);
@@ -5537,6 +5546,10 @@ fn rewrite_over_window(
             ty,
             elems: rewrite_all_over_window(elems, input_width, groups)?,
         }),
+        BoundExpr::WholeRow { names, fields } => Ok(BoundExpr::WholeRow {
+            names,
+            fields: rewrite_all_over_window(fields, input_width, groups)?,
+        }),
         BoundExpr::Coalesce { args, ty } => Ok(BoundExpr::Coalesce {
             args: rewrite_all_over_window(args, input_width, groups)?,
             ty,
@@ -5966,6 +5979,18 @@ fn rewrite_over_aggregate(
                 elems,
             })
         }
+        // Under GROUP BY, a whole-row reference is legal only as a whole group
+        // key, which the equality check above already answered. Reaching here
+        // means it was not one, so each field is rewritten on its own and the
+        // bare `ColumnRef` inside raises "must appear in the GROUP BY clause" —
+        // naming a column of the row, which is what PostgreSQL blames too.
+        BoundExpr::WholeRow { names, fields } => {
+            let fields = fields
+                .into_iter()
+                .map(|f| rewrite_over_aggregate(f, group_exprs, aggregates, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::WholeRow { names, fields })
+        }
         BoundExpr::Coalesce { args, ty } => {
             let args = args
                 .into_iter()
@@ -6109,8 +6134,32 @@ enum SelectField<'a> {
 }
 
 fn classify_select_item(item: &ast::SelectItem) -> Result<SelectField<'_>, BindError> {
+    // A select-list item that *is* `q.*`, however many parentheses it wears and
+    // whatever it is aliased to, expands into that relation's columns — PG
+    // strips the parentheses before it decides, so `SELECT (q.*) AS x` is the
+    // same three columns as `SELECT q.*`. Only a `q.*` some larger expression
+    // consumes (a function argument, a cast, `IS NULL`) is the composite
+    // `bind_whole_row` builds.
+    fn star_of(expr: &ast::Expr) -> Option<&ast::ObjectName> {
+        let mut expr = expr;
+        while let ast::Expr::Nested(inner) = expr {
+            expr = inner;
+        }
+        match expr {
+            ast::Expr::QualifiedWildcard(name, _) => Some(name),
+            _ => None,
+        }
+    }
     match item {
         ast::SelectItem::Wildcard(_) => Ok(SelectField::Wildcard),
+        ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. }
+            if star_of(expr).is_some() =>
+        {
+            let name = star_of(expr).expect("just matched");
+            Ok(SelectField::QualifiedWildcard(object_name_to_table_name(
+                name,
+            )?))
+        }
         ast::SelectItem::UnnamedExpr(expr) => Ok(SelectField::Expr(expr, None)),
         ast::SelectItem::ExprWithAlias { expr, alias } => {
             Ok(SelectField::Expr(expr, Some(normalize_ident(alias))))

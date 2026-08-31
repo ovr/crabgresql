@@ -589,6 +589,13 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             ty: *ty,
             elems: elems.iter().map(|a| outerize_columns(a, level)).collect(),
         },
+        // A whole-row reference outerizes field by field, because its fields are
+        // the plain `ColumnRef`s the first arm already handles — this is the
+        // whole reason it holds expressions rather than a list of row indices.
+        BoundExpr::WholeRow { names, fields } => BoundExpr::WholeRow {
+            names: names.clone(),
+            fields: fields.iter().map(|f| outerize_columns(f, level)).collect(),
+        },
         BoundExpr::Subscript { base, indexes, ty } => BoundExpr::Subscript {
             base: Box::new(outerize_columns(base, level)),
             indexes: indexes.iter().map(|i| outerize_columns(i, level)).collect(),
@@ -1226,6 +1233,26 @@ impl Scope {
         let mut out = Vec::new();
         self.expand_rel(rel, &mut out)?;
         Ok(out)
+    }
+
+    /// `qualifier.*` in **expression** position: the relation's row as one
+    /// composite value.
+    ///
+    /// The same columns `q.*` expands to in a select list, gathered into one
+    /// value instead of spread across the output — including the rule that a
+    /// system column is not among them, so `t.*` never carries `ctid`.
+    ///
+    /// TODO: only this query level. PostgreSQL resolves `o.*` inside a subquery
+    /// against an enclosing FROM as a correlated whole-row reference; here that
+    /// is "missing FROM-clause entry", because [`Scope::relation`] does not walk
+    /// the outer levels the way [`Scope::resolve_qualified`] does.
+    pub(crate) fn whole_row(&self, qualifier: &str) -> Result<BoundExpr, BindError> {
+        let columns = self.expand_qualified(qualifier)?;
+        let (names, fields) = columns
+            .into_iter()
+            .map(|(col, expr)| (col.name, expr))
+            .unzip();
+        Ok(BoundExpr::WholeRow { names, fields })
     }
 
     /// Append every *declared* column of `rel` as an `(output column,

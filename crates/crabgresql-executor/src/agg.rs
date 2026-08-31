@@ -177,6 +177,7 @@ pub(crate) fn key_encoding(ty: PgType) -> KeyEncoding {
         | PgType::Tsquery
         | PgType::Vector(_)
         | PgType::User(_)
+        | PgType::Record
         | PgType::Array(_) => KeyEncoding::Generic,
     }
 }
