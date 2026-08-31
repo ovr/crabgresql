@@ -3008,6 +3008,43 @@ impl Drop for ViewExpansionGuard {
     }
 }
 
+/// Parsed view bodies, keyed on the **SQL text**.
+///
+/// Keyed on the text rather than on the view's name so `CREATE OR REPLACE VIEW`
+/// invalidates the entry by construction: a replaced body is a different key,
+/// and the stale one is simply never looked up again.
+///
+/// The cache exists because a system view is expanded on every statement that
+/// names it, and its definition is large — `information_schema.columns` is a
+/// six-way nested join over sixty projected columns. Re-parsing that per
+/// statement is the same cost the catalog's own build-per-resolve once was,
+/// which measured 2.1 s against 0.03 s.
+static PARSED_VIEW_BODIES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, Arc<Vec<ast::Statement>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// How many bodies [`PARSED_VIEW_BODIES`] keeps. A process serves a fixed
+/// handful of system views plus whatever a session creates, so this is a
+/// backstop against a generator producing endless one-off `CREATE OR REPLACE
+/// VIEW` texts, not a working-set estimate. Reaching it clears the map rather
+/// than evicting by age: nothing here tracks use, and a rebuild is one re-parse
+/// per view still in play.
+const MAX_PARSED_VIEW_BODIES: usize = 512;
+
+/// [`crabgresql_parser::parse`] through [`PARSED_VIEW_BODIES`].
+fn parse_view_body(sql: &str) -> Result<Arc<Vec<ast::Statement>>, crabgresql_parser::ParseError> {
+    let mut cache = PARSED_VIEW_BODIES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(parsed) = cache.get(sql) {
+        return Ok(Arc::clone(parsed));
+    }
+    let parsed = Arc::new(crabgresql_parser::parse(sql)?);
+    if cache.len() >= MAX_PARSED_VIEW_BODIES {
+        cache.clear();
+    }
+    cache.insert(sql.to_string(), Arc::clone(&parsed));
+    Ok(parsed)
+}
+
 /// Bind a stored view's query into a logical plan. The SQL text is re-parsed and
 /// bound in a fresh scope (no outer CTEs, no outer `$n` parameters — a view body
 /// references neither). A parse/shape failure is an internal invariant violation
@@ -3023,7 +3060,7 @@ fn bind_view_query(
     view: &ViewDefinition,
 ) -> Result<LogicalPlan, BindError> {
     let _guard = ViewExpansionGuard::enter(params, view)?;
-    let stmts = crabgresql_parser::parse(&view.sql).map_err(|e| {
+    let stmts = parse_view_body(&view.sql).map_err(|e| {
         BindError::new(
             sqlstate::INTERNAL_ERROR,
             format!(

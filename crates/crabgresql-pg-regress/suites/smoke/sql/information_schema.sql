@@ -115,3 +115,45 @@ SELECT domain_name, character_maximum_length, character_octet_length,
 DROP DOMAIN is_money;
 DROP DOMAIN is_code;
 DROP DOMAIN is_span;
+--
+-- Every view of this schema is served by *running* its own definition, so what
+-- follows exercises the definition text rather than a Rust row builder: each
+-- relation kind reaching `table_type`, a fresh schema reaching `schemata`, and
+-- a column of a domain reaching `columns` through `_pg_truetypid`.
+--
+CREATE TABLE is_kinds (a int4);
+CREATE VIEW is_kinds_v AS SELECT a FROM is_kinds;
+CREATE SEQUENCE is_kinds_seq;
+CREATE TABLE is_parted (a int4) PARTITION BY RANGE (a);
+CREATE TABLE is_parted_0 PARTITION OF is_parted FOR VALUES FROM (0) TO (10);
+CREATE SCHEMA is_sch;
+CREATE TABLE is_sch.inner_tbl (a int4);
+-- A sequence is not a table and is absent; a partitioned parent is a BASE
+-- TABLE, as are its leaves. Divergence: `is_insertable_into` is NO for the view
+-- where PostgreSQL says YES — see `pg_relation_is_updatable`.
+SELECT table_schema, table_name, table_type, is_insertable_into
+  FROM information_schema.tables
+ WHERE table_schema IN ('public', 'is_sch')
+   AND (table_name LIKE 'is\_%' OR table_schema = 'is_sch')
+ ORDER BY table_schema, table_name;
+SELECT schema_name, catalog_name = current_database() AS own_catalog
+  FROM information_schema.schemata
+ WHERE schema_name = 'is_sch';
+DROP TABLE is_sch.inner_tbl;
+DROP SCHEMA is_sch;
+DROP TABLE is_parted;
+DROP SEQUENCE is_kinds_seq;
+DROP VIEW is_kinds_v;
+DROP TABLE is_kinds;
+-- A column of a domain reports the domain in the `domain_*` columns and the
+-- domain's *base* shape in the type columns — which is `_pg_truetypid(a.*, t.*)`
+-- doing its work through a whole-row reference.
+CREATE DOMAIN is_code AS varchar(8);
+CREATE TABLE is_domcol (a is_code, b varchar(8));
+SELECT column_name, data_type, domain_schema, domain_name, udt_name,
+       character_maximum_length
+  FROM information_schema.columns
+ WHERE table_name = 'is_domcol'
+ ORDER BY ordinal_position;
+DROP TABLE is_domcol;
+DROP DOMAIN is_code;

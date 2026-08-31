@@ -827,18 +827,23 @@ one whose columns are all fixed-width — raises `54000 program_limit_exceeded`,
   `pg_attribute` carries neither system columns nor `attislocal`/`attinhcount`
   (per-column inheritance provenance is not recorded — the parent↔child
   correspondence is recomputed by name).
-- `information_schema` — views over pg_catalog, as in PG. Its seven `_pg_*`
-  type-shape helpers (`_pg_char_max_length`, `_pg_char_octet_length`, the three
-  `_pg_numeric_*`, `_pg_datetime_precision`, `_pg_interval_type`) are callable
-  functions, and the `columns`/`domains` row builders answer through the same
-  `crabgresql_types::info_schema` module rather than a second copy of the rules
-  — PostgreSQL *defines* those views in terms of those functions, so a view
-  column and a direct call cannot drift apart. No `pg_proc` row is published for
-  them, so `\df` does not list them and `::regprocedure` will not resolve one.
-- Which relations are served is one table: `registry::CATALOG_RELATIONS` in
-  `crabgresql-catalog`, pairing each name and OID with the two `fn` pointers
-  that build it (`fn() -> TableSchema` and `fn(&SystemCatalog) -> rows`). The
-  served set and the OID table are therefore the same set by construction, so
+- `information_schema` — views over pg_catalog, and **real views**: each is
+  served by binding and running its own definition text, which is upstream's
+  verbatim as `pg_get_viewdef` prints it, so its answer cannot drift from the
+  catalogs it reads. Its `_pg_*` helpers (`_pg_char_max_length`,
+  `_pg_char_octet_length`, the three `_pg_numeric_*`, `_pg_datetime_precision`,
+  `_pg_interval_type`, and the composite-taking `_pg_truetypid`/`_pg_truetypmod`)
+  are callable functions answering through `crabgresql_types::info_schema`, so a
+  view column and a direct call cannot disagree. No `pg_proc` row is published
+  for them, so `\df` does not list them and `::regprocedure` will not resolve one.
+  The `pg_catalog` views are still Rust row builders; what blocks switching them
+  the same way is that `pg_class` does not reflect the served relations, so a
+  view over it would answer only about user objects.
+- Which relations are served is one table: `registry::CATALOG_RELATIONS` and
+  `CATALOG_VIEWS` in `crabgresql-catalog`, pairing each name and OID with the
+  `fn` pointers that build it (`fn() -> TableSchema`, and
+  `fn(&SystemCatalog) -> rows` — or none, for a view served by running its SQL).
+  The served set and the OID table are therefore the same set by construction, so
   `'pg_class'::regclass` cannot resolve for a relation nothing serves. Adding a
   catalog is a module under `src/catalogs/` plus one registry line; the single
   `rows` signature means a relation with unusual inputs adds no argument to any

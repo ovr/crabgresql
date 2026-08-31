@@ -2712,12 +2712,18 @@ fn wide_fixture() -> SystemCatalog {
 /// check used to be spot-applied to the two relations whose row builders had
 /// several paths; run across the registry it also fails for a relation added
 /// with a column in the schema and not in the rows.
+///
+/// A view served by running its own definition has no builder to check; the
+/// binder is what makes its row match its projection, and
+/// `every_view_definition_parses_and_names_our_columns` is what ties that
+/// projection to the schema here.
 #[test]
 fn every_relation_builds_rows_as_wide_as_its_schema() {
     let cat = wide_fixture();
     for def in registry::all() {
         let schema = (def.schema)();
-        let rows = (def.rows)(&cat);
+        let Some(build) = def.rows else { continue };
+        let rows = build(&cat);
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(
                 row.len(),
@@ -2766,11 +2772,8 @@ fn the_wide_fixture_populates_every_derived_relation() {
         "pg_rewrite",
     ] {
         let def = registry::lookup(CatalogNamespace::PgCatalog, name).expect(name);
-        assert!(!(def.rows)(&cat).is_empty(), "{name} built no rows");
-    }
-    for name in ["schemata", "tables", "columns"] {
-        let def = registry::lookup(CatalogNamespace::InformationSchema, name).expect(name);
-        assert!(!(def.rows)(&cat).is_empty(), "{name} built no rows");
+        let build = def.rows.expect("a bootstrap catalog has a row builder");
+        assert!(!build(&cat).is_empty(), "{name} built no rows");
     }
 }
 
@@ -2948,128 +2951,56 @@ fn unknown_relation_is_not_found() {
     ));
 }
 
+/// The switch that makes a view be served *as a view*: with no row builder,
+/// `open` reports the name as absent, which is the arm the binder falls through
+/// to view resolution on. `system_view` is the other half — it answers for
+/// exactly the entries `open` refuses, and for no relation a builder still
+/// serves, so the binder never has two ways to read one name.
 #[test]
-fn information_schema_reflects_relation_metadata() -> anyhow::Result<()> {
-    use crabgresql_storage_api::{Column, TableSchema};
-    use crabgresql_types::PgType;
-
-    let cat = SystemCatalog::with_catalog_relations("appdb", "appuser", {
-        vec![
-            CatalogRelation::permanent(TableSchema::new(
-                "widgets",
-                vec![
-                    Column::new("id", PgType::Int4),
-                    Column::with_typmod("label", PgType::Varchar, 12),
-                ],
-            )),
-            CatalogRelation::temporary(
-                TableSchema::in_namespace(
-                    "scratch",
-                    "pg_temp_42",
-                    vec![Column::new("created_at", PgType::TimestampTz)],
-                ),
-                "pg_temp_42",
+fn a_view_without_a_row_builder_is_served_as_a_view() {
+    let cat = SystemCatalog::new();
+    for name in ["tables", "columns", "domains", "schemata"] {
+        assert!(
+            matches!(
+                cat.resolve(Some("information_schema"), name),
+                Err(StorageError::TableNotFound(_))
             ),
-        ]
-    });
+            "{name} still opens as a relation"
+        );
+        let view = system_view("information_schema", name)
+            .unwrap_or_else(|| panic!("{name} is not served as a view"));
+        assert_eq!(view.name, name);
+        assert_eq!(view.namespace, "information_schema");
+        assert_eq!(
+            view.columns,
+            column_names(&(registry::lookup(
+                CatalogNamespace::InformationSchema,
+                name
+            )
+            .expect(name)
+            .schema)())
+        );
+    }
+    // Every `pg_catalog` relation and view still has a builder, so none of them
+    // is served this way — including the ones whose definition text is here.
+    for def in registry::all() {
+        let namespace = match def.namespace {
+            CatalogNamespace::PgCatalog => "pg_catalog",
+            CatalogNamespace::InformationSchema => continue,
+        };
+        assert!(
+            system_view(namespace, def.name).is_none(),
+            "{}.{} answers as a view while it still has a row builder",
+            namespace,
+            def.name
+        );
+    }
+    assert!(system_view("information_schema", "no_such_view").is_none());
+    assert!(system_view("app", "tables").is_none());
+}
 
-    let (tables_schema, tables) = required(
-        cat.build_information_schema("tables"),
-        "information_schema.tables is missing",
-    )?;
-    assert_eq!(tables_schema.columns.len(), 12);
-    let catalog = required(
-        tables_schema.column_index("table_catalog"),
-        "table_catalog column is missing",
-    )?;
-    let namespace = required(
-        tables_schema.column_index("table_schema"),
-        "table_schema column is missing",
-    )?;
-    let name = required(
-        tables_schema.column_index("table_name"),
-        "table_name column is missing",
-    )?;
-    let kind = required(
-        tables_schema.column_index("table_type"),
-        "table_type column is missing",
-    )?;
-    assert!(tables.iter().any(|row| {
-        row[catalog] == Value::Text("appdb".to_string())
-            && row[namespace] == Value::Text("public".to_string())
-            && row[name] == Value::Text("widgets".to_string())
-            && row[kind] == Value::Text("BASE TABLE".to_string())
-    }));
-    assert!(tables.iter().any(|row| {
-        row[namespace] == Value::Text("pg_temp_42".to_string())
-            && row[name] == Value::Text("scratch".to_string())
-            && row[kind] == Value::Text("LOCAL TEMPORARY".to_string())
-    }));
-
-    let (columns_schema, columns) = required(
-        cat.build_information_schema("columns"),
-        "information_schema.columns is missing",
-    )?;
-    assert_eq!(columns_schema.columns.len(), 44);
-    assert!(
-        columns
-            .iter()
-            .all(|row| row.len() == columns_schema.columns.len())
-    );
-    let table_name = required(
-        columns_schema.column_index("table_name"),
-        "table_name column is missing",
-    )?;
-    let column_name = required(
-        columns_schema.column_index("column_name"),
-        "column_name column is missing",
-    )?;
-    let ordinal = required(
-        columns_schema.column_index("ordinal_position"),
-        "ordinal column is missing",
-    )?;
-    let data_type = required(
-        columns_schema.column_index("data_type"),
-        "data_type column is missing",
-    )?;
-    let char_length = required(
-        columns_schema.column_index("character_maximum_length"),
-        "character_maximum_length column is missing",
-    )?;
-    let udt_schema = required(
-        columns_schema.column_index("udt_schema"),
-        "udt_schema column is missing",
-    )?;
-    let is_generated = required(
-        columns_schema.column_index("is_generated"),
-        "is_generated column is missing",
-    )?;
-    let label = required(
-        columns.iter().find(|row| {
-            row[table_name] == Value::Text("widgets".to_string())
-                && row[column_name] == Value::Text("label".to_string())
-        }),
-        "label column row is missing",
-    )?;
-    assert_eq!(label[ordinal], Value::Int4(2));
-    assert_eq!(
-        label[data_type],
-        Value::Text("character varying".to_string())
-    );
-    assert_eq!(label[char_length], Value::Int4(12));
-    assert_eq!(label[udt_schema], Value::Text("pg_catalog".to_string()));
-    assert_eq!(label[is_generated], Value::Text("NEVER".to_string()));
-
-    let (_, schemata) = required(
-        cat.build_information_schema("schemata"),
-        "information_schema.schemata is missing",
-    )?;
-    assert!(schemata.iter().any(|row| {
-        row[1] == Value::Text("pg_temp_42".to_string())
-            && row[2] == Value::Text("appuser".to_string())
-    }));
-
-    Ok(())
+fn column_names(schema: &TableSchema) -> Vec<String> {
+    schema.columns.iter().map(|c| c.name.clone()).collect()
 }
 
 /// `relpages`/`reltuples` follow PostgreSQL's rule that they are written only

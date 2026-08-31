@@ -32,6 +32,33 @@ use crate::query::{catalog_routine, partition_session_relations};
 use crate::roles::{RoleCatalog, RoleSnapshot};
 use crate::session::Session;
 
+/// The system view `namespace.name` is served as, in the shape the binder
+/// consumes a view: its definition text and the columns a reference to it
+/// exposes.
+///
+/// `None` both for a name this build does not serve and for a catalog relation
+/// whose rows a Rust builder still produces — those resolve as relations and
+/// never reach view expansion.
+///
+/// The columns carry no types: a system view's are whatever binding its query
+/// produces, and the registry's schema is only where the *names* come from.
+/// `depends_on` is empty for the reason it is meaningless here — nothing can
+/// drop `pg_class` out from under a view over it.
+fn system_view_definition(namespace: &str, name: &str) -> Option<ViewDefinition> {
+    let view = crabgresql_catalog::system_view(namespace, name)?;
+    Some(ViewDefinition {
+        name: view.name.to_string(),
+        namespace: view.namespace.to_string(),
+        sql: view.sql.to_string(),
+        columns: view
+            .columns
+            .into_iter()
+            .map(|name| crabgresql_storage_api::Column::new(name, crabgresql_types::PgType::Text))
+            .collect(),
+        depends_on: Vec::new(),
+    })
+}
+
 /// The relations one statement resolved, and the write it is going to perform.
 ///
 /// PostgreSQL answers `pg_locks` from a cluster-wide lock table. There is none
@@ -1358,16 +1385,24 @@ impl TableEngine for SessionCatalog {
     }
 
     /// Search-path-aware view resolution, mirroring [`SessionCatalog::resolve`].
-    /// Views live only in the permanent catalog (see the temp-view `TODO` on
-    /// [`SessionCatalog::create_view`]), so an unqualified or
-    /// `public.`-qualified name reaches `global`; other namespaces (temp,
-    /// `pg_catalog`) hold no user views.
+    /// User views live only in the permanent catalog (see the temp-view `TODO`
+    /// on [`SessionCatalog::create_view`]), so an unqualified or
+    /// `public.`-qualified name reaches `global`; the temp namespaces hold none.
+    ///
+    /// The two system schemas answer from the registry instead — that is where
+    /// a view this build serves *as a view* comes from. An unqualified name
+    /// tries `public` first and then `pg_catalog`, the order the search path
+    /// puts them in for a read; `information_schema` is off the path entirely
+    /// and answers only to its qualified name.
     fn resolve_view(&self, schema: Option<&str>, name: &str) -> Option<ViewDefinition> {
         match schema {
-            None | Some("public") => self.global.resolve_view(None, name),
-            // Temp and system namespaces hold no user views; any other qualifier
-            // is a user schema, resolved against the global engine.
-            Some("pg_temp") | Some("pg_catalog") | Some("information_schema") => None,
+            None => self
+                .global
+                .resolve_view(None, name)
+                .or_else(|| system_view_definition("pg_catalog", name)),
+            Some("public") => self.global.resolve_view(None, name),
+            Some(ns @ ("pg_catalog" | "information_schema")) => system_view_definition(ns, name),
+            Some("pg_temp") => None,
             Some(namespace) if namespace == self.temp_schema => None,
             // A foreign session's temp namespace holds no views we may see.
             Some(namespace) if self.is_foreign_temp(namespace) => None,
@@ -1375,7 +1410,23 @@ impl TableEngine for SessionCatalog {
         }
     }
 
+    /// A system view is not a droppable object here: `initdb` made it and this
+    /// build has nowhere to record its absence, so the honest answer is 0A000.
+    /// A deliberate divergence — PostgreSQL lets the schema's owner drop
+    /// `information_schema.tables` outright, which needs a catalog that can
+    /// remember the view is gone.
+    ///
+    /// TODO: unreachable today. `DROP VIEW` refuses a *qualified* name in the
+    /// parser, and an unqualified one never resolves to a system view (a bare
+    /// name searches `public`, then `pg_catalog`, where every view still has a
+    /// row builder and so is not served as a view at all). This is the guard for
+    /// when either changes.
     fn drop_view(&self, namespace: &str, name: &str) -> Result<(), StorageError> {
+        if crabgresql_catalog::system_view(namespace, name).is_some() {
+            return Err(StorageError::UnsupportedOperation(format!(
+                "\"{namespace}.{name}\" is a system view and cannot be dropped"
+            )));
+        }
         self.global.drop_view(namespace, name)
     }
 

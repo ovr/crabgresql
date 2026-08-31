@@ -51,8 +51,8 @@ pub use catalogs::extension::{AvailableExtension, available_extensions};
 pub use catalogs::namespace::{is_builtin_namespace, is_system_namespace};
 pub use oids::{BOOTSTRAP_ROLE_OID, PLPGSQL_LANG_OID};
 pub use registry::{
-    builtin_relation_name, builtin_relation_oid, builtin_relation_oid_in, builtin_relation_ref,
-    builtin_view_definition,
+    SystemView, builtin_relation_name, builtin_relation_oid, builtin_relation_oid_in,
+    builtin_relation_ref, builtin_view_definition, system_view,
 };
 pub use source::{
     CatalogBackend, CatalogCursor, CatalogDomain, CatalogDomainCheck, CatalogLock,
@@ -2183,13 +2183,10 @@ impl SystemCatalog {
         self.build(CatalogNamespace::PgCatalog, name)
     }
 
-    /// The `information_schema` counterpart of [`SystemCatalog::build_pg_catalog`].
-    #[cfg(test)]
-    fn build_information_schema(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
-        self.build(CatalogNamespace::InformationSchema, name)
-    }
-
-    /// Materialize `namespace.name` from the registry.
+    /// Materialize `namespace.name` from the registry, or `None` when the name
+    /// is not served *or* is a view served by running its own definition — those
+    /// have no builder to call, and their rows come from binding SQL, which is
+    /// two layers above this one.
     ///
     /// TODO(perf): nothing is cached, so `pg_class a, pg_class b` builds the
     /// relation twice and every scan of `pg_proc` rebuilds ~500 rows. The cache
@@ -2205,7 +2202,7 @@ impl SystemCatalog {
         name: &str,
     ) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         let def = registry::lookup(namespace, name)?;
-        Some(((def.schema)(), (def.rows)(self)))
+        Some(((def.schema)(), (def.rows?)(self)))
     }
 
     /// Open a served relation as a [`StaticTable`].
@@ -2217,14 +2214,20 @@ impl SystemCatalog {
     /// cannot outlive — and it costs one relation enumeration on a relation
     /// nothing scans in a hot path. Both snapshots read the same source, so they
     /// assign the same OIDs.
+    ///
+    /// A registry entry with **no** row builder is a view this build serves by
+    /// running its own definition, and is reported here as absent. That is the
+    /// switch: the binder's `TableNotFound` arm is what falls through to view
+    /// resolution, so while this returned a `StaticTable` the name never reached
+    /// it. See [`registry::view_sql`].
     fn open(
         &self,
         namespace: CatalogNamespace,
         name: &str,
     ) -> Result<Arc<dyn TableAm>, StorageError> {
-        let Some(def) = registry::lookup(namespace, name) else {
-            return Err(StorageError::TableNotFound(name.to_string()));
-        };
+        let not_found = || StorageError::TableNotFound(name.to_string());
+        let def = registry::lookup(namespace, name).ok_or_else(not_found)?;
+        let build = def.rows.ok_or_else(not_found)?;
         let schema = (def.schema)();
         let xmin = Xid(self.source.catalog_xmin());
         if !def.deferred {
@@ -2233,11 +2236,10 @@ impl SystemCatalog {
             // A named column the schema does not have degrades to the latter
             // rather than failing the scan — `xmin_columns_exist` is the test
             // that keeps the registry honest.
-            let table = StaticTable::new(schema, (def.rows)(self));
+            let table = StaticTable::new(schema, build(self));
             return Ok(Arc::new(self.with_catalog_xmin(table, def, xmin)));
         }
         let source = Arc::clone(&self.source);
-        let build = def.rows;
         let deferred = StaticTable::deferred(schema, move || {
             build(&SystemCatalog::from_source(Arc::clone(&source)))
         });

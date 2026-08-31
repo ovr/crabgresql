@@ -36,6 +36,9 @@ use crate::catalogs::{
 use crate::cols::no_rows;
 use crate::views::{definitions, information_schema};
 
+/// How one served relation's rows are produced from a catalog snapshot.
+pub(crate) type RowBuilder = fn(&SystemCatalog) -> Vec<Vec<Value>>;
+
 /// Which schema a served relation lives in. Ordered as declared, because both
 /// registry tables are sorted on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -57,7 +60,14 @@ pub(crate) struct CatalogRelDef {
     pub(crate) oid: u32,
     pub(crate) namespace: CatalogNamespace,
     pub(crate) schema: fn() -> TableSchema,
-    pub(crate) rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+    /// How the rows are produced, or `None` for a view this build serves by
+    /// **running its own definition** — see [`view_sql`].
+    ///
+    /// A bootstrap catalog always has a builder; only a view can be `None`, and
+    /// for one that is, [`crate::SystemCatalog::open`] reports the name as
+    /// absent so the binder falls through to view resolution and expands the
+    /// SQL instead.
+    pub(crate) rows: Option<RowBuilder>,
     /// Whether the rows are built when the relation is first *read* rather than
     /// when the binder resolves its name. True for `pg_locks` and `pg_depend`,
     /// for two different reasons; see
@@ -83,14 +93,14 @@ const fn rel(
     oid: u32,
     namespace: CatalogNamespace,
     schema: fn() -> TableSchema,
-    rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+    rows: RowBuilder,
 ) -> CatalogRelDef {
     CatalogRelDef {
         name,
         oid,
         namespace,
         schema,
-        rows,
+        rows: Some(rows),
         deferred: false,
         xmin_column: None,
     }
@@ -103,7 +113,7 @@ const fn rel_of_relation(
     oid: u32,
     namespace: CatalogNamespace,
     schema: fn() -> TableSchema,
-    rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+    rows: RowBuilder,
     xmin_column: &'static str,
 ) -> CatalogRelDef {
     CatalogRelDef {
@@ -118,14 +128,14 @@ const fn rel_deferred(
     oid: u32,
     namespace: CatalogNamespace,
     schema: fn() -> TableSchema,
-    rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+    rows: RowBuilder,
 ) -> CatalogRelDef {
     CatalogRelDef {
         name,
         oid,
         namespace,
         schema,
-        rows,
+        rows: Some(rows),
         deferred: true,
         xmin_column: None,
     }
@@ -146,11 +156,40 @@ const fn view(
     oid: u32,
     namespace: CatalogNamespace,
     schema: fn() -> TableSchema,
-    rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+    rows: RowBuilder,
     definition: &'static str,
 ) -> CatalogViewDef {
     CatalogViewDef {
         rel: rel(name, oid, namespace, schema, rows),
+        definition,
+    }
+}
+
+/// A view this build serves as a **view**: its rows come from running
+/// `definition`, not from a Rust builder.
+///
+/// `schema` stays, and carries the column *names* the definition's top-level
+/// SELECT publishes — that is what a reference to the view exposes before its
+/// body is bound, and what `every_view_definition_parses_and_names_our_columns`
+/// checks the text against. The column *types* are the ones the re-bound query
+/// produces, so the ones written there are not what a client sees.
+const fn view_sql(
+    name: &'static str,
+    oid: u32,
+    namespace: CatalogNamespace,
+    schema: fn() -> TableSchema,
+    definition: &'static str,
+) -> CatalogViewDef {
+    CatalogViewDef {
+        rel: CatalogRelDef {
+            name,
+            oid,
+            namespace,
+            schema,
+            rows: None,
+            deferred: false,
+            xmin_column: None,
+        },
         definition,
     }
 }
@@ -162,7 +201,7 @@ const fn view_deferred(
     oid: u32,
     namespace: CatalogNamespace,
     schema: fn() -> TableSchema,
-    rows: fn(&SystemCatalog) -> Vec<Vec<Value>>,
+    rows: RowBuilder,
     definition: &'static str,
 ) -> CatalogViewDef {
     CatalogViewDef {
@@ -648,41 +687,37 @@ pub(crate) static CATALOG_RELATIONS: &[CatalogRelDef] = &[
 /// `template1`, where a `CREATE OR REPLACE VIEW` had renumbered `tables` into
 /// the user band.
 ///
-/// Every one is still a Rust row builder: the `definition` is not what produces
-/// the rows, it is what a later change re-parses to produce them. Until then it
-/// is checked against the row builder rather than trusted — see
-/// [`crate::views::definitions`].
+/// The four `information_schema` entries are served by **running** their
+/// definitions ([`view_sql`]); every `pg_catalog` one is still a Rust row
+/// builder, whose `definition` is checked against what the builder publishes
+/// rather than trusted — see [`crate::views::definitions`].
 pub(crate) static CATALOG_VIEWS: &[CatalogViewDef] = &[
-    view(
+    view_sql(
         "columns",
         13787,
         InformationSchema,
         information_schema::columns_schema,
-        information_schema::columns_rows,
         definitions::information_schema::COLUMNS,
     ),
-    view(
+    view_sql(
         "domains",
         13811,
         InformationSchema,
         information_schema::domains_schema,
-        information_schema::domains_rows,
         definitions::information_schema::DOMAINS,
     ),
-    view(
+    view_sql(
         "schemata",
         13873,
         InformationSchema,
         information_schema::schemata_schema,
-        information_schema::schemata_rows,
         definitions::information_schema::SCHEMATA,
     ),
-    view(
+    view_sql(
         "tables",
         13916,
         InformationSchema,
         information_schema::tables_schema,
-        information_schema::tables_rows,
         definitions::information_schema::TABLES,
     ),
     view(
@@ -1327,4 +1362,38 @@ pub(crate) fn public_reads(name: &str) -> bool {
 /// [`crate::views::definitions`] for what the text is for.
 pub fn builtin_view_definition(name: &str) -> Option<&'static str> {
     view_definition(CatalogNamespace::PgCatalog, name).map(|def| def.definition)
+}
+
+/// A system view this build serves **as a view**: the SQL the binder expands
+/// and the names a reference to it exposes.
+///
+/// `None` both for a name this build does not serve and for one whose rows a
+/// Rust builder still produces — the latter resolves as a relation and never
+/// reaches view expansion, so answering here would give the binder two ways to
+/// read the same name.
+pub fn system_view(namespace: &str, name: &str) -> Option<SystemView> {
+    let def = view_definition(catalog_namespace(namespace)?, name)?;
+    if def.rel.rows.is_some() {
+        return None;
+    }
+    Some(SystemView {
+        namespace: catalog_namespace_name(def.rel.namespace),
+        name: def.rel.name,
+        sql: def.definition,
+        columns: (def.rel.schema)()
+            .columns
+            .into_iter()
+            .map(|col| col.name)
+            .collect(),
+    })
+}
+
+/// See [`system_view`]. The columns carry **names only**: a system view's types
+/// are whatever binding its query produces, and the registry's schema is only
+/// where the names come from.
+pub struct SystemView {
+    pub namespace: &'static str,
+    pub name: &'static str,
+    pub sql: &'static str,
+    pub columns: Vec<String>,
 }
