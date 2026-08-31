@@ -1801,7 +1801,7 @@ pub(crate) fn format_type_text(
             .or_else(|| {
                 catalog
                     .and_then(|ops| ops.user_type_name(oid))
-                    .map(|(_, name)| quote_ident(&name))
+                    .map(crate::reg::qualified_type_name)
             })
             .unwrap_or_else(|| "???".to_string());
     };

@@ -38,6 +38,7 @@
 
 pub(crate) mod catalogs;
 pub(crate) mod cols;
+pub mod info_schema;
 pub(crate) mod oids;
 pub(crate) mod registry;
 mod source;
@@ -1424,6 +1425,21 @@ impl SystemCatalog {
     /// compared afterwards, so a future non-positional assignment degrades to
     /// not-found rather than to the wrong constraint (as in [`Self::relation_ref`]).
     pub fn constraint_def(&self, oid: u32) -> Option<ConstraintDefRow> {
+        // The `information_schema` domain checks are numbered by `initdb`, not
+        // by the band below, so they are matched by OID before the positional
+        // lookup — which would read their small OIDs as a wild index.
+        if let Some(domain) = info_schema::DOMAINS
+            .iter()
+            .find(|d| d.check.as_ref().is_some_and(|c| c.oid == oid))
+        {
+            let check = domain.check.as_ref()?;
+            return Some(ConstraintDefRow {
+                contype: "c".to_string(),
+                columns: Vec::new(),
+                expr: Some(check.expr.to_string()),
+                is_domain: true,
+            });
+        }
         let constraints = self.constraint_oids();
         let base = constraints.first()?.oid;
         let constraint = constraints.get(oid.checked_sub(base)? as usize)?;
@@ -2086,25 +2102,37 @@ impl SystemCatalog {
         self.namespace_oids().get(name).copied()
     }
 
-    /// The `(namespace, name)` of the user type `oid` identifies, or `None` for
-    /// an OID no `CREATE TYPE` has. Built-in types are not here — they resolve
-    /// without a catalog.
+    /// The `(namespace, name)` of the non-built-in type `oid` identifies, or
+    /// `None` for an OID nothing here has. Built-in types are not here — they
+    /// resolve without a catalog.
     ///
     /// TODO: user types carry no namespace of their own — `CREATE TYPE app.t`
     /// is rejected — so every one of them reports `public`, which is where an
-    /// unqualified name finds them.
+    /// unqualified name finds them. The `information_schema` domains are the
+    /// one set that reports anything else.
     pub fn user_type_ref(&self, oid: u32) -> Option<(&str, &str)> {
+        if let Some(domain) = info_schema::by_oid(oid) {
+            return Some((info_schema::NAMESPACE, domain.name));
+        }
         self.user_types()
             .iter()
             .find(|t| t.oid == oid)
             .map(|t| ("public", t.name.as_str()))
     }
 
-    /// The OID of the user type `namespace.name` names. A qualifier other than
-    /// `public` matches nothing, for the reason above.
+    /// The OID of the type `namespace.name` names.
+    ///
+    /// An `information_schema` domain answers **only to the qualified name**.
+    /// That schema is not on the search path, so PostgreSQL raises 42704 for a
+    /// bare `::sql_identifier` too — and a `CREATE DOMAIN sql_identifier` in
+    /// `public` has to keep winning the unqualified spelling.
     pub fn user_type_oid(&self, namespace: Option<&str>, name: &str) -> Option<u32> {
-        if matches!(namespace, Some(ns) if ns != "public") {
-            return None;
+        match namespace {
+            Some(ns) if ns == info_schema::NAMESPACE => {
+                return info_schema::by_name(name).map(|d| d.oid);
+            }
+            Some(ns) if ns != "public" => return None,
+            _ => {}
         }
         self.user_types()
             .iter()

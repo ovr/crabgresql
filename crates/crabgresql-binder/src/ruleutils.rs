@@ -751,6 +751,8 @@ fn precedence(e: &ast::Expr) -> u8 {
         | ast::Expr::IsNotFalse(_)
         | ast::Expr::IsNull(_)
         | ast::Expr::IsNotNull(_) => 4,
+        // A quantified comparison binds like the comparison it is built from.
+        ast::Expr::AnyOp { .. } | ast::Expr::AllOp { .. } => 4,
         ast::Expr::AtTimeZone { .. } | ast::Expr::AtLocal { .. } => 9,
         // Anything atomic (literal, column, function call, parenthesised group)
         // never needs wrapping.
@@ -795,6 +797,32 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
         ),
         // PG puts a space after a unary operator: `- a`, not `-a`.
         ast::Expr::UnaryOp { op, expr: inner } => format!("{op} {}", expr(inner, cx, prec)),
+        // Deparsed rather than echoed: the parser's own `Display` writes
+        // `ANY(b)` and upper-cases the type names inside, so this arm is what
+        // keeps a stored `yes_or_no_check` rendering byte-for-byte as PG's.
+        //
+        // `SOME` is a synonym PostgreSQL does not preserve — it deparses back
+        // as `ANY`, which is why `is_some` is not read here.
+        ast::Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => format!(
+            "{} {compare_op} ANY ({})",
+            expr(left, cx, prec),
+            top_expr(right, cx)
+        ),
+        ast::Expr::AllOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => format!(
+            "{} {compare_op} ALL ({})",
+            expr(left, cx, prec),
+            top_expr(right, cx)
+        ),
         // A redundant group in the source is dropped; precedence alone decides
         // where parentheses land in the output.
         ast::Expr::Nested(inner) => return expr(inner, cx, parent),
@@ -906,8 +934,17 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
     // `AT TIME ZONE` / `AT LOCAL` are the one construct PG parenthesises even
     // when pretty-printing, so they are wrapped unconditionally.
     let always = matches!(e, ast::Expr::AtTimeZone { .. } | ast::Expr::AtLocal { .. });
+    // PostgreSQL's `isSimpleNode` has no arm for a `ScalarArrayOpExpr`, so it
+    // falls to the default and a quantified comparison is never *simple*:
+    // wherever `get_rule_expr_paren` renders it — under `AND`, `OR`, `NOT`, or
+    // another operator — it takes parentheses even in pretty mode, while at a
+    // clause boundary, which goes through plain `get_rule_expr`, it takes none.
+    // Probed on 18.4: `WHERE a = ANY (ARRAY[1, 2])` bare, but
+    // `WHERE (a = ANY (ARRAY[1, 2])) AND (b <> ALL (ARRAY['x'::text]))` and
+    // `WHERE NOT (a = ANY (ARRAY[1, 2]))` wrapped.
+    let never_simple = matches!(e, ast::Expr::AnyOp { .. } | ast::Expr::AllOp { .. });
     let wrap = if cx.pretty {
-        always || prec < parent
+        always || prec < parent || (never_simple && parent > 0)
     } else {
         prec != u8::MAX
     };

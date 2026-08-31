@@ -1721,16 +1721,35 @@ pub struct ResolvedRoutine {
 /// Query-time view: lets the binder resolve a user type name in a cast target
 /// and apply a registered `WITHOUT FUNCTION` cast. Read-only (each method takes
 /// a read lock); binding never holds a write lock, so there is no re-entrancy.
+///
+/// The `information_schema` domains are answered here too, as a **fallback**
+/// after this catalog's own types: they are types no `CREATE TYPE` made, but
+/// the binder has only this one seam to find a non-built-in type through. They
+/// answer to the qualified spelling alone — see
+/// [`crabgresql_catalog::info_schema::domain_info_by_qualified_name`].
 impl TypeCatalog for GlobalCatalog {
     fn resolve_type(&self, name: &str) -> Option<UserType> {
         let cat = self
             .inner
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        cat.types.get(name).filter(|e| e.defined).map(|e| UserType {
-            oid: e.oid,
-            backing: e.backing,
-        })
+        cat.types
+            .get(name)
+            .filter(|e| e.defined)
+            .map(|e| UserType {
+                oid: e.oid,
+                backing: e.backing,
+            })
+            .or_else(|| {
+                // No `backing`: a domain's representation is its base type's,
+                // which `domain_base` answers, not a `CREATE TYPE ... LIKE` rep.
+                crabgresql_catalog::info_schema::domain_info_by_qualified_name(name).map(|d| {
+                    UserType {
+                        oid: d.oid,
+                        backing: None,
+                    }
+                })
+            })
     }
 
     fn is_shell_type(&self, name: &str) -> bool {
@@ -1748,6 +1767,7 @@ impl TypeCatalog for GlobalCatalog {
             .unwrap_or_else(|_| panic!("rwlock poisoned"))
             .type_name_by_oid(oid)
             .map(str::to_string)
+            .or_else(|| crabgresql_catalog::info_schema::domain_info_by_oid(oid).map(|d| d.name))
     }
 
     fn find_cast(&self, source: PgType, target: PgType) -> Option<UserCast> {
@@ -1799,8 +1819,10 @@ impl TypeCatalog for GlobalCatalog {
             .inner
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        let (name, entry) = cat.types.iter().find(|(_, e)| e.oid == oid)?;
-        Some(domain_info(name, oid, entry.domain.as_ref()?))
+        match cat.types.iter().find(|(_, e)| e.oid == oid) {
+            Some((name, entry)) => Some(domain_info(name, oid, entry.domain.as_ref()?)),
+            None => crabgresql_catalog::info_schema::domain_info_by_oid(oid),
+        }
     }
 
     fn domain_base(&self, oid: u32) -> Option<(PgType, i32)> {
@@ -1808,8 +1830,15 @@ impl TypeCatalog for GlobalCatalog {
             .inner
             .read()
             .unwrap_or_else(|_| panic!("rwlock poisoned"));
-        let domain = cat.types.values().find(|e| e.oid == oid)?.domain.as_ref()?;
-        Some((domain.base, domain.typmod))
+        match cat.types.values().find(|e| e.oid == oid) {
+            Some(entry) => {
+                let domain = entry.domain.as_ref()?;
+                Some((domain.base, domain.typmod))
+            }
+            None => {
+                crabgresql_catalog::info_schema::domain_info_by_oid(oid).map(|d| (d.base, d.typmod))
+            }
+        }
     }
 
     fn routines(&self, name: &str) -> Vec<RoutineSig> {

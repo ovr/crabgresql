@@ -3372,8 +3372,10 @@ async fn defaults_constraints_and_semantic_indexes() -> anyhow::Result<()> {
     // `c_pkey`, `c_u_key`, `c_n_nn`, `null_equal_a_key`, and the not-null
     // constraint PRIMARY KEY gives `c.id` — probed against 18.4, which names it
     // `c_id_not_null` and counts the same five over these four tables.
+    // `conrelid <> 0` keeps it to those: a domain constraint has no relation,
+    // and the `information_schema` domains ship two.
     let constraint_messages = client
-        .simple_query("SELECT count(*) FROM pg_constraint")
+        .simple_query("SELECT count(*) FROM pg_constraint WHERE conrelid <> 0")
         .await?;
     assert_eq!(rows(&constraint_messages)[0].get(0), Some("5"));
     let default_messages = client
@@ -7545,9 +7547,11 @@ async fn alter_table_add_check_constraint() -> anyhow::Result<()> {
         "check constraint \"vc\" of relation \"t\" is violated by some row"
     );
     assert_eq!(db.detail(), None);
-    // The refusal is total: nothing was recorded.
+    // The refusal is total: nothing was recorded. Counted over *table*
+    // constraints — `conrelid <> 0` — because the `information_schema` domains
+    // contribute two CHECKs of their own to every snapshot.
     let msgs = client
-        .simple_query("SELECT count(*) FROM pg_constraint WHERE contype = 'c'")
+        .simple_query("SELECT count(*) FROM pg_constraint WHERE contype = 'c' AND conrelid <> 0")
         .await?;
     assert_eq!(rows(&msgs)[0].get(0), Some("0"));
 
@@ -7586,7 +7590,7 @@ async fn alter_table_add_check_constraint() -> anyhow::Result<()> {
     let msgs = client
         .simple_query(
             "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint \
-             WHERE contype = 'c' ORDER BY conname",
+             WHERE contype = 'c' AND conrelid <> 0 ORDER BY conname",
         )
         .await?;
     let found = rows(&msgs);
@@ -17777,7 +17781,10 @@ async fn the_deparse_functions_are_strict_in_every_argument() -> anyhow::Result<
         "SELECT pg_get_viewdef('v'::regclass, NULL::int)",
         "SELECT pg_get_ruledef((SELECT oid FROM pg_rewrite), NULL::boolean)",
         "SELECT pg_get_triggerdef(999999, NULL::boolean)",
-        "SELECT pg_get_constraintdef((SELECT oid FROM pg_constraint WHERE contype = 'c'), \
+        // `conrelid <> 0` picks the table's CHECK: the `information_schema`
+        // domains carry two of their own, and the subquery must return one row.
+        "SELECT pg_get_constraintdef((SELECT oid FROM pg_constraint \
+                                       WHERE contype = 'c' AND conrelid <> 0), \
                                      NULL::boolean)",
         "SELECT pg_get_indexdef(999999, 1, NULL::boolean)",
         // `pg_get_expr` ignores its relation argument, but PostgreSQL still

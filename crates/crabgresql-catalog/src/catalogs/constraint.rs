@@ -71,8 +71,11 @@ pub(crate) fn pg_constraint_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             .copied()
             .unwrap_or(crate::oids::PUBLIC_NAMESPACE_OID)
     };
-    constraints
+    // The `information_schema` domain checks first: their OIDs are `initdb`'s
+    // and fixed, so they are not part of the positional band the rest occupy.
+    crate::info_schema::constraints()
         .iter()
+        .chain(constraints.iter())
         .map(|c| {
             vec![
                 Value::Oid(c.oid),

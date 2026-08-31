@@ -13,12 +13,12 @@ use crate::{CatalogDomain, CatalogUserType, PG_CAST_ROWS, PG_TYPE_ROWS};
 /// `pg_catalog.pg_type` — a curated, PG-ordered subset of the columns clients
 /// query.
 ///
-/// Every row spells the domain columns out at PostgreSQL's BKI defaults,
-/// because nothing here can be a domain: `pg_type.dat` defines none (every entry
-/// in it is a base or pseudo type, and a derived array row is not a domain
-/// either), and `CREATE DOMAIN` never reaches the catalog — the parser accepts
-/// it, the binder rejects it. The day domains land, the row builders below have
-/// to read those six off the type.
+/// The rows generated from `pg_type.dat` spell the six domain columns out at
+/// PostgreSQL's BKI defaults, because none of them is a domain: every entry in
+/// that file is a base or pseudo type, and a derived array row is not a domain
+/// either. The domains come from the other two sources below —
+/// `information_schema`'s five and every `CREATE DOMAIN` — and both read those
+/// six off the type.
 pub(crate) fn pg_type_schema() -> TableSchema {
     TableSchema::in_namespace(
         "pg_type",
@@ -60,13 +60,96 @@ pub(crate) fn pg_type_schema() -> TableSchema {
     )
 }
 
-/// The built-ins first, then this session's `CREATE TYPE`s. The order is what
-/// keeps a built-in OID at the same row index across snapshots that differ only
-/// in their user types.
+/// The built-ins, then `information_schema`'s domains, then this session's
+/// `CREATE TYPE`s. The order is what keeps a built-in OID at the same row index
+/// across snapshots that differ only in their user types — which is why the
+/// user types stay last and the fixed bootstrap set is spliced ahead of them.
 pub(crate) fn pg_type_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
     let mut rows = pg_type_builtin_rows();
+    rows.extend(pg_type_bootstrap_domain_rows());
     rows.extend(pg_type_user_rows(cat.user_types()));
     rows
+}
+
+/// The `pg_type` rows for the `information_schema` domains and their array
+/// types, in [`crate::info_schema::DOMAINS`] order — the domain first, then its
+/// array, as `initdb` created each pair.
+fn pg_type_bootstrap_domain_rows() -> Vec<Vec<Value>> {
+    crate::info_schema::DOMAINS
+        .iter()
+        .flat_map(|d| {
+            let ty = d.as_catalog_type();
+            let domain = ty.domain.as_ref().expect("bootstrap type is a domain");
+            [
+                pg_type_domain_row(
+                    &ty,
+                    domain,
+                    DomainPlacement {
+                        namespace: crate::info_schema::NAMESPACE_OID,
+                        typarray: d.array_oid,
+                    },
+                ),
+                pg_type_domain_array_row(d),
+            ]
+        })
+        .collect()
+}
+
+/// One `pg_type` row for the array type over an `information_schema` domain.
+///
+/// An array over a domain is an ordinary `typtype = 'b'` row: PostgreSQL's
+/// generic array I/O, the element's collation, and `typelem` pointing back at
+/// the domain. It carries no `typarray` of its own — nothing makes an array of
+/// an array.
+fn pg_type_domain_array_row(d: &crate::info_schema::BootstrapDomain) -> Vec<Value> {
+    // An array aligns like its element, but never looser than `int`: `name` is
+    // char-aligned and `_sql_identifier` is still `i`, while `timestamptz` is
+    // double-aligned and `_time_stamp` keeps `d`. Probed on 18.4.
+    let typalign = match PG_TYPE_ROWS
+        .iter()
+        .find(|r| r.oid == d.base.oid())
+        .map(|r| r.typalign)
+    {
+        Some("d") => "d",
+        _ => "i",
+    };
+    vec![
+        Value::Oid(d.array_oid),
+        Value::Text(d.array_name.to_string()),
+        Value::Oid(crate::info_schema::NAMESPACE_OID),
+        Value::Oid(BOOTSTRAP_ROLE_OID),
+        Value::Int2(-1),
+        Value::Bool(false),
+        chr('b'),
+        chr('A'),
+        Value::Bool(false),
+        Value::Bool(true),
+        chr(','),
+        Value::Oid(0),
+        regproc_by_name("array_subscript_handler"),
+        Value::Oid(d.oid),
+        Value::Oid(0),
+        regproc_by_name("array_in"),
+        regproc_by_name("array_out"),
+        regproc_by_name("array_recv"),
+        regproc_by_name("array_send"),
+        // typmodin / typmodout: the element's modifier is fixed on the domain.
+        Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+        Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
+        regproc_by_name("array_typanalyze"),
+        str_char(typalign),
+        chr('x'),
+        // typnotnull / typbasetype / typtypmod / typndims
+        Value::Bool(false),
+        Value::Oid(0),
+        Value::Int4(-1),
+        Value::Int4(0),
+        Value::Oid(d.collation),
+        // typdefaultbin / typdefault / typacl
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ]
 }
 
 /// The built-in `pg_type` rows generated from `pg_type.dat`.
@@ -181,12 +264,35 @@ pub(crate) fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value
         user_types
             .iter()
             .filter_map(|t| Some((t, t.domain.as_ref()?)))
-            .map(|(t, d)| pg_type_domain_row(t, d)),
+            .map(|(t, d)| {
+                pg_type_domain_row(
+                    t,
+                    d,
+                    DomainPlacement {
+                        // `public`, where CREATE DOMAIN puts a domain — see the
+                        // enum row above for why that is also what
+                        // `SystemCatalog::user_type_ref` reports.
+                        namespace: PUBLIC_NAMESPACE_OID,
+                        // This build creates no array type for a user domain,
+                        // so `ARRAY(SELECT domain_col)` raises an honest 0A000.
+                        typarray: 0,
+                    },
+                )
+            }),
     );
     rows
 }
 
-/// One `pg_type` row for a `CREATE DOMAIN`.
+/// Where a domain sits, which is the only thing the `information_schema` five
+/// and a `CREATE DOMAIN` disagree about. A struct rather than two `u32`
+/// arguments, which nothing would stop a caller from swapping.
+pub(crate) struct DomainPlacement {
+    pub(crate) namespace: u32,
+    /// The domain's array type, or `0` for a domain that has none.
+    pub(crate) typarray: u32,
+}
+
+/// One `pg_type` row for a domain, whether `initdb` or `CREATE DOMAIN` made it.
 ///
 /// A domain borrows most of its row from the base type it is over — width,
 /// pass-by-value, alignment, storage, category, and the output/send functions —
@@ -194,7 +300,11 @@ pub(crate) fn pg_type_user_rows(user_types: &[CatalogUserType]) -> Vec<Vec<Value
 /// side: PostgreSQL 18.4 shows `typinput = domain_in` and
 /// `typreceive = domain_recv` on every domain row, since reading a value in is
 /// where the constraints run.
-fn pg_type_domain_row(t: &CatalogUserType, d: &CatalogDomain) -> Vec<Value> {
+fn pg_type_domain_row(
+    t: &CatalogUserType,
+    d: &CatalogDomain,
+    placement: DomainPlacement,
+) -> Vec<Value> {
     let base = PG_TYPE_ROWS.iter().find(|r| r.oid == d.resolved_basetype);
     // A base this build has no `pg_type.dat` row for cannot contribute its
     // physical columns; the variable-length defaults are the safe answer, and
@@ -212,7 +322,7 @@ fn pg_type_domain_row(t: &CatalogUserType, d: &CatalogDomain) -> Vec<Value> {
     vec![
         Value::Oid(t.oid),
         Value::Text(t.name.clone()),
-        Value::Oid(PUBLIC_NAMESPACE_OID),
+        Value::Oid(placement.namespace),
         Value::Oid(BOOTSTRAP_ROLE_OID),
         Value::Int2(typlen),
         Value::Bool(typbyval),
@@ -221,12 +331,12 @@ fn pg_type_domain_row(t: &CatalogUserType, d: &CatalogDomain) -> Vec<Value> {
         Value::Bool(false),
         Value::Bool(true),
         chr(','),
-        // typrelid / typsubscript / typelem / typarray: a domain is not a
-        // composite, and this build creates no array type for one.
+        // typrelid / typsubscript / typelem: a domain is not a composite and is
+        // not subscriptable — an array *over* a domain is a separate row.
         Value::Oid(0),
         Value::Reg(Reg::unresolved(RegKind::Proc, 0)),
         Value::Oid(0),
-        Value::Oid(0),
+        Value::Oid(placement.typarray),
         regproc_by_name("domain_in"),
         base.map_or_else(
             || Value::Reg(Reg::unresolved(RegKind::Proc, 0)),

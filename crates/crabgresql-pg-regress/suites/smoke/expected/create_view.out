@@ -155,6 +155,42 @@ SELECT pg_get_viewdef('v_names'::regclass, true);
 
 DROP VIEW v_names;
 DROP TABLE tn;
+-- A quantified comparison is never a "simple node" to PostgreSQL's pretty
+-- printer -- `isSimpleNode` has no arm for a ScalarArrayOpExpr -- so it takes
+-- parentheses wherever something encloses it, and none at a clause boundary.
+-- Non-pretty wraps every operator node either way.
+CREATE TABLE tq (a int, b text);
+CREATE VIEW v_any AS SELECT a = ANY (ARRAY[1, 2]) AS c FROM tq
+ WHERE a = ANY (ARRAY[1, 2]) AND NOT (b <> ALL (ARRAY['x']));
+SELECT pg_get_viewdef('v_any'::regclass);
+                               pg_get_viewdef                               
+----------------------------------------------------------------------------
+  SELECT (a = ANY (ARRAY[1, 2])) AS c                                      +
+    FROM tq                                                                +
+   WHERE ((a = ANY (ARRAY[1, 2])) AND (NOT (b <> ALL (ARRAY['x'::text]))));
+(1 row)
+
+SELECT pg_get_viewdef('v_any'::regclass, true);
+                             pg_get_viewdef                             
+------------------------------------------------------------------------
+  SELECT a = ANY (ARRAY[1, 2]) AS c                                    +
+    FROM tq                                                            +
+   WHERE (a = ANY (ARRAY[1, 2])) AND NOT (b <> ALL (ARRAY['x'::text]));
+(1 row)
+
+CREATE VIEW v_any_top AS SELECT * FROM tq WHERE a = ANY (ARRAY[1, 2]);
+SELECT pg_get_viewdef('v_any_top'::regclass, true);
+         pg_get_viewdef         
+--------------------------------
+  SELECT a,                    +
+     b                         +
+    FROM tq                    +
+   WHERE a = ANY (ARRAY[1, 2]);
+(1 row)
+
+DROP VIEW v_any_top;
+DROP VIEW v_any;
+DROP TABLE tq;
 -- A function FROM item deparses as the call it is, with the alias and column
 -- list PostgreSQL synthesises for a function range table entry: a bare call is
 -- named after the function, a bare alias renames the scalar column, an alias

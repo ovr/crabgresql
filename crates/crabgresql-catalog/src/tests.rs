@@ -3996,6 +3996,22 @@ fn pg_depend_records_the_graph_postgres_records() -> anyhow::Result<()> {
         "_RETURN(v) -> v i",
         "_RETURN(v) -> t.1 n",
         "_RETURN(v) -> t.2 n",
+        // The `information_schema` domains are in every snapshot, fixture or
+        // not: each belongs to its schema, owns its array type internally, and
+        // carries its CHECK as an auto dependency. No edge to the base type —
+        // `int4`, `varchar`, `name` and `timestamptz` are pinned.
+        "cardinal_number -> information_schema n",
+        "character_data -> information_schema n",
+        "sql_identifier -> information_schema n",
+        "time_stamp -> information_schema n",
+        "yes_or_no -> information_schema n",
+        "_cardinal_number -> cardinal_number i",
+        "_character_data -> character_data i",
+        "_sql_identifier -> sql_identifier i",
+        "_time_stamp -> time_stamp i",
+        "_yes_or_no -> yes_or_no i",
+        "cardinal_number_domain_check -> cardinal_number a",
+        "yes_or_no_check -> yes_or_no a",
     ]
     .iter()
     .map(|edge| edge.replace("<toast>", &toast))

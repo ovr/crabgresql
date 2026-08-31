@@ -34,8 +34,8 @@ pub use bound::{
 };
 pub use datatype::{
     apply_typmod_value, builtin_type_from_syntax, checked_length_typmod, checked_numeric_typmod,
-    datetime_precision, declared_typmod, interval_typmod, length_typmod, map_data_type,
-    resolve_data_type, text_value,
+    custom_type_key, datetime_precision, declared_typmod, interval_typmod, length_typmod,
+    map_data_type, resolve_data_type, text_value,
 };
 pub use domain::value_shape;
 pub(crate) use domain::{bind_domain, domain_collation, domain_of, undomain_binding, wrap_domain};

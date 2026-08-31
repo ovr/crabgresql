@@ -32,9 +32,8 @@ pub const CANCEL_REQUEST_CODE: i32 = 80877102;
 /// zeroes the catalog origin and reports text format.
 ///
 /// TODO: report the source table OID and attribute number for result columns
-/// that are plain table column references, and the type modifier of any type
-/// that carries one — PG describes a `varchar(5)` result as typmod 9, where
-/// [`FieldDescription::new`] reports -1.
+/// that are plain table column references — [`FieldDescription::new`] reports 0
+/// for both. The server's own builder fills the type modifier in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldDescription {
     pub name: String,

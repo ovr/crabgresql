@@ -1488,7 +1488,17 @@ fn undomain_columns(
     columns
         .into_iter()
         .map(|mut column| {
-            column.ty = type_catalog.base_type(column.ty);
+            // The modifier travels down with the type: a column of a domain
+            // carries `atttypmod = -1` of its own, and the `typbasetype` chain
+            // is the only place the 3 in `yes_or_no` lives. Guarded on the
+            // column really having been a domain, because
+            // `base_type_and_typmod` answers `-1` for everything else and would
+            // erase a modifier the column already had.
+            let (base, typmod) = type_catalog.base_type_and_typmod(column.ty);
+            if column.ty != base {
+                column.typmod = typmod;
+            }
+            column.ty = base;
             column
         })
         .collect()
@@ -6643,17 +6653,24 @@ fn reject_stored_reg_type(ty: PgType, column: &str) -> Result<(), PgError> {
     }
 }
 
-/// Resolve a column's declared type: a built-in, or — when the name is a bare
-/// custom identifier — a `CREATE TYPE` name from the catalog (e.g. an enum),
-/// yielding `PgType::User(oid)`. A bare name that is neither is an
-/// undefined-object error (42704), matching PG (and `resolve_type_ref`).
+/// Resolve a column's declared type: a built-in, or — when the name is a custom
+/// identifier — a `CREATE TYPE` name from the catalog (e.g. an enum), yielding
+/// `PgType::User(oid)`. A name that is neither is an undefined-object error
+/// (42704), matching PG (and `resolve_type_ref`).
+///
+/// The lookup goes through `custom_type_key` rather than
+/// [`datatype_simple_name`], so a qualified name reaches the catalog: PostgreSQL
+/// takes `CREATE TABLE t (c information_schema.yes_or_no)`, and it is the same
+/// key a cast to that type resolves by. `datatype_simple_name` stays for the
+/// questions that really are about a bare name — shell types, `cstring`, and
+/// whether an unknown spelling is a built-in this build lacks.
 pub(crate) fn resolve_column_type(
     type_catalog: &Arc<dyn TypeCatalog>,
     dt: &ast::DataType,
 ) -> Result<PgType, PgError> {
     match map_data_type(dt) {
         Ok(t) => Ok(t),
-        Err(orig) => match datatype_simple_name(dt) {
+        Err(orig) => match crabgresql_binder::custom_type_key(dt) {
             Some(name) if type_catalog.is_shell_type(&name) => Err(PgError::new(
                 sqlstate::UNDEFINED_OBJECT,
                 format!("type \"{name}\" is only a shell"),
