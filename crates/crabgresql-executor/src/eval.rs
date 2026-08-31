@@ -1068,6 +1068,8 @@ fn eval_catalog_fn(
         func,
         ScalarFn::PgGetUserById
             | ScalarFn::PgTableIsVisible
+            | ScalarFn::PgRelationIsUpdatable
+            | ScalarFn::PgColumnIsUpdatable
             | ScalarFn::PgRelationSize
             | ScalarFn::PgTableSize
             | ScalarFn::PgIndexesSize
@@ -1117,6 +1119,8 @@ fn eval_catalog_fn(
             | ScalarFn::PgIndexHasProperty
             | ScalarFn::PgIndexColumnHasProperty
             | ScalarFn::PgRelationSize
+            | ScalarFn::PgRelationIsUpdatable
+            | ScalarFn::PgColumnIsUpdatable
     ) && args.iter().any(|arg| matches!(arg, Value::Null))
     {
         return Some(Ok(Value::Null));
@@ -1196,6 +1200,20 @@ fn eval_catalog_fn(
         ),
         // ... whereas an OID no relation has is NULL, not false.
         ScalarFn::PgTableIsVisible => ops.table_is_visible(oid).map_or(Value::Null, Value::Bool),
+        // The two updatability questions. An OID naming nothing is *zero* here,
+        // not NULL — unlike the size functions, which is why the catalog answers
+        // with a plain `i32`.
+        ScalarFn::PgRelationIsUpdatable => Value::Int4(ops.relation_updatable(oid)),
+        // PostgreSQL asks for both UPDATE and DELETE on the relation and, for a
+        // view, whether the column maps to a base column. A base table answers
+        // for *any* column number, including one it does not have — probed on
+        // 18.4, where `pg_column_is_updatable('t'::regclass, 9, false)` is true
+        // for a two-column `t`. So the column number is read only far enough to
+        // be strict in it.
+        ScalarFn::PgColumnIsUpdatable => {
+            const REQUIRED: i32 = 4 | 16;
+            Value::Bool(ops.relation_updatable(oid) & REQUIRED == REQUIRED)
+        }
         // The four size functions. Each sums a different part of the same
         // measurement, so they share one catalog call; an OID naming no relation
         // is NULL for all of them, which is distinct from the zero a view (no
@@ -2337,6 +2355,9 @@ mod format_type_tests {
             }
             fn has_attribute(&self, _oid: u32, _attnum: i16) -> bool {
                 false
+            }
+            fn relation_updatable(&self, _oid: u32) -> i32 {
+                0
             }
             fn table_is_visible(&self, _oid: u32) -> Option<bool> {
                 None

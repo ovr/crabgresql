@@ -1979,6 +1979,38 @@ impl SystemCatalog {
     /// A sequence is one page from creation, matching both PostgreSQL's 8192 and
     /// the `relpages = 1` this catalog already publishes for it.
     ///
+    /// Which writes the relation `oid` accepts, as `pg_relation_is_updatable`'s
+    /// bitmask: INSERT is 8, UPDATE 4 and DELETE 16, so an ordinary table is 28.
+    ///
+    /// PostgreSQL reports 0 for a relation nothing can write — a sequence, an
+    /// index, a view it cannot rewrite onto a base relation — and 0 for an OID
+    /// naming nothing at all, which is why this returns an `i32` rather than an
+    /// `Option`: the function is not NULL-for-a-miss the way the size ones are.
+    ///
+    /// **Divergence:** a view is 0 here where PostgreSQL reports 28 for a
+    /// simple, automatically updatable one. This build rewrites no write onto a
+    /// view's base relation, so reporting 28 would advertise a write it then
+    /// refuses — and `information_schema.tables.is_insertable_into` would say
+    /// YES where an INSERT raises.
+    ///
+    /// A served catalog relation is 0 too: it is read-only here.
+    pub fn relation_updatable(&self, oid: u32) -> i32 {
+        const ALL_WRITES: i32 = 8 | 4 | 16;
+        if builtin_relation_ref(oid).is_some() {
+            return 0;
+        }
+        let Some(offset) = oid.checked_sub(FIRST_REL_OID).map(|o| o as usize) else {
+            return 0;
+        };
+        match self.relation_oids().get(offset) {
+            Some((stored, _)) if *stored == oid => match self.relation_kinds()[offset] {
+                RelKind::Table | RelKind::PartitionedTable => ALL_WRITES,
+                RelKind::View | RelKind::Sequence => 0,
+            },
+            _ => 0,
+        }
+    }
+
     /// Indexed positionally, exactly as [`SystemCatalog::relation_ref`] is, and
     /// for the same reason.
     pub fn relation_pages(&self, oid: u32) -> Option<RelationPages> {

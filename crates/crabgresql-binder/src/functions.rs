@@ -727,9 +727,21 @@ pub enum ScalarFn {
     /// asked about and how each argument was spelled, which is exactly what
     /// [`PrivCall`] carries. The executor evaluates them in `acl`.
     HasPrivilege(PrivCall),
-    /// One of the seven `information_schema._pg_*` type-shape helpers, which
-    /// differ only in the question they ask — see [`InfoSchemaTypeAttr`].
+    /// One of the `information_schema._pg_*` type-shape helpers, which differ
+    /// only in the question they ask — see [`InfoSchemaTypeAttr`].
     InfoSchemaTypeAttr(InfoSchemaTypeAttr),
+    /// `pg_relation_is_updatable(regclass, bool) -> int4`: which of INSERT (8),
+    /// UPDATE (4) and DELETE (16) the relation accepts, as a bitmask —
+    /// PostgreSQL reports 28 for an ordinary table and 0 for a relation nothing
+    /// can write (a sequence, an index, a view it cannot rewrite).
+    ///
+    /// The boolean asks whether to count what a rule or an `INSTEAD OF` trigger
+    /// would make possible; this build has neither, so it is accepted and
+    /// ignored.
+    PgRelationIsUpdatable,
+    /// `pg_column_is_updatable(regclass, int2, bool) -> bool`: the same question
+    /// about one column. See [`ScalarFn::PgRelationIsUpdatable`] for the flag.
+    PgColumnIsUpdatable,
     /// `pg_relation_size(regclass[, text]) -> int8`: the relation's own storage
     /// in bytes. The second argument names a fork (`main`, `fsm`, `vm`, `init`)
     /// and defaults to `main`; anything else is `22023`. NULL for an OID no
@@ -1415,10 +1427,12 @@ pub struct PrivCall {
     pub column: Option<ArgForm>,
 }
 
-/// Which shape question one `information_schema._pg_*` call asks. The seven
+/// Which shape question one `information_schema._pg_*` call asks. Seven of them
 /// share a signature — `(typid oid, typmod int4)` — and are STRICT and
 /// IMMUTABLE alike, so the question itself is the only thing that distinguishes
-/// them.
+/// them. The last two take a different pair and are here for the same reason:
+/// they are answered from the same place, so a view column and a direct call
+/// cannot drift apart.
 ///
 /// PostgreSQL declares these in the `information_schema` namespace rather than
 /// `pg_catalog`, so a bare `_pg_char_max_length(...)` does not resolve there
@@ -1437,6 +1451,19 @@ pub enum InfoSchemaTypeAttr {
     DatetimePrecision,
     /// The only one of the seven returning `text` rather than `int4`.
     IntervalType,
+    /// `_pg_truetypid(pg_attribute, pg_type) -> oid`: the type a column's values
+    /// really have — the domain's base when the column is of a domain, else the
+    /// column's own type.
+    ///
+    /// Unlike the seven above it takes two **composites**, which is how
+    /// PostgreSQL declares it and why `information_schema.columns` calls it as
+    /// `_pg_truetypid(a.*, t.*)`. The fields are read by name off the
+    /// [`crabgresql_types::RecordVal`], so any row carrying them answers —
+    /// `PgType::Record` names no shape to check against.
+    TrueTypeId,
+    /// `_pg_truetypmod(pg_attribute, pg_type) -> int4`: the modifier that goes
+    /// with [`InfoSchemaTypeAttr::TrueTypeId`], read off the same pair.
+    TrueTypeMod,
 }
 
 struct Signature {
@@ -2078,6 +2105,10 @@ const NAME: PgType = PgType::Name;
 const NAMEARR: PgType = PgType::Array(crabgresql_types::oid::NAME);
 const UUID: PgType = PgType::Uuid;
 const I2: PgType = PgType::Int2;
+/// The composite a whole-row reference produces; see [`PgType::Record`]. As a
+/// declared argument type it means *any* row — the implementation reads the
+/// fields it needs by name.
+const RECORD: PgType = PgType::Record;
 
 /// How many leading entries of [`SUBSTRING_SIGS`] are the regex-extraction
 /// forms. `substr` is the same list without them.
@@ -3357,6 +3388,19 @@ fn lookup(name: &str) -> &'static [Signature] {
         "_pg_numeric_scale" => info_attr_sig!(InfoSchemaTypeAttr::NumericScale, I4),
         "_pg_datetime_precision" => info_attr_sig!(InfoSchemaTypeAttr::DatetimePrecision, I4),
         "_pg_interval_type" => info_attr_sig!(InfoSchemaTypeAttr::IntervalType, TEXT),
+        // The two composite-taking helpers of the same family. `RECORD` here is
+        // any row: a whole-row reference binds to it whatever relation it came
+        // from, and the implementation reads the fields it needs by name.
+        "_pg_truetypid" => &[Signature {
+            func: ScalarFn::InfoSchemaTypeAttr(InfoSchemaTypeAttr::TrueTypeId),
+            args: &[RECORD, RECORD],
+            ret: OID,
+        }],
+        "_pg_truetypmod" => &[Signature {
+            func: ScalarFn::InfoSchemaTypeAttr(InfoSchemaTypeAttr::TrueTypeMod),
+            args: &[RECORD, RECORD],
+            ret: I4,
+        }],
         "obj_description" => &[
             Signature {
                 func: ScalarFn::ObjDescription,
@@ -4473,6 +4517,11 @@ pub(crate) fn bind_function(func: &ast::Function, scope: &Scope) -> Result<Bindi
         return Ok(binding);
     }
 
+    // And so do the two updatability questions.
+    if let Some(binding) = resolve_relation_updatable(&name, &bindings)? {
+        return Ok(binding);
+    }
+
     // `pg_typeof(any)` accepts every type, so it has no fixed signature either.
     // Only the unary form is ours; any other arity falls through, so a
     // user-defined overload of this name stays reachable.
@@ -5238,6 +5287,33 @@ fn resolve_relation_size(name: &str, bindings: &[Binding]) -> Result<Option<Bind
         let params: Vec<PgType> = std::iter::once(first).chain(tail.iter().copied()).collect();
         if let Ok(args) = single_candidate_args(bindings, &params) {
             return finish_func_call(func, I8, args).map(Some);
+        }
+    }
+    Err(undefined_function(name, bindings))
+}
+
+/// Resolve `pg_relation_is_updatable(relation, bool)` and
+/// `pg_column_is_updatable(relation, int2, bool)`, or `Ok(None)` for any other
+/// name.
+///
+/// PostgreSQL declares only the `regclass` form and reaches the `oid` one by an
+/// implicit cast this build does not model, so the relation parameter is tried
+/// in both spellings for the reason [`resolve_relation_size`] documents —
+/// `information_schema.tables` writes `pg_relation_is_updatable((c.oid)::regclass, false)`
+/// while a client writes `pg_relation_is_updatable('t', false)`.
+fn resolve_relation_updatable(
+    name: &str,
+    bindings: &[Binding],
+) -> Result<Option<Binding>, BindError> {
+    let (func, tail, ret): (_, &[PgType], _) = match (name, bindings.len()) {
+        ("pg_relation_is_updatable", 2) => (ScalarFn::PgRelationIsUpdatable, &[BOOL], I4),
+        ("pg_column_is_updatable", 3) => (ScalarFn::PgColumnIsUpdatable, &[I2, BOOL], BOOL),
+        _ => return Ok(None),
+    };
+    for first in [REGCLASS, OID] {
+        let params: Vec<PgType> = std::iter::once(first).chain(tail.iter().copied()).collect();
+        if let Ok(args) = single_candidate_args(bindings, &params) {
+            return finish_func_call(func, ret, args).map(Some);
         }
     }
     Err(undefined_function(name, bindings))

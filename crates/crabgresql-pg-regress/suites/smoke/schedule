@@ -59,6 +59,7 @@ test: cidr
 test: pg_catalog
 test: information_schema
 test: information_schema_domains
+test: info_schema_helpers
 test: constraints
 test: check_constraint
 test: generated

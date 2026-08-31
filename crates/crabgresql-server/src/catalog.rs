@@ -752,6 +752,10 @@ impl CatalogOps for SessionCatalogOps {
         self.system.has_attribute(oid, attnum)
     }
 
+    fn relation_updatable(&self, oid: u32) -> i32 {
+        self.system.relation_updatable(oid)
+    }
+
     /// A relation is visible when *its own unqualified name reaches it* — PG's
     /// rule, which is about name resolution, not namespace membership: a
     /// relation another one shadows is invisible even though its schema is on
