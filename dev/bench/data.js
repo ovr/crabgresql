@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788168246797,
+  "lastUpdate": 1788168248729,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -64012,6 +64012,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 36331.328599,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6f331539faaf33ec087345b977566a669932cc6f",
+          "message": "feat: Create the information_schema domains in the catalog (#289)",
+          "timestamp": "2026-08-31T10:34:01+02:00",
+          "tree_id": "8b6aa063b23ffbbfd86002e844287966183e29a0",
+          "url": "https://github.com/ovr/crabgresql/commit/6f331539faaf33ec087345b977566a669932cc6f"
+        },
+        "date": 1788168248589,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1183.535518,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 20066.462315,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
