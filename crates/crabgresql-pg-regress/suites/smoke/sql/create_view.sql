@@ -80,6 +80,14 @@ SELECT pg_get_viewdef('v_any'::regclass);
 SELECT pg_get_viewdef('v_any'::regclass, true);
 CREATE VIEW v_any_top AS SELECT * FROM tq WHERE a = ANY (ARRAY[1, 2]);
 SELECT pg_get_viewdef('v_any_top'::regclass, true);
+-- The parentheses around the right operand are the syntax, not a precedence
+-- wrap -- but a *subquery* brings its own, so it gets one pair, not two.
+--
+-- Divergence: PostgreSQL re-deparses the subquery (aliasing the inner range
+-- table and laying it out over lines); this build echoes it as written.
+CREATE VIEW v_any_sub AS SELECT * FROM tq WHERE a <> ALL (SELECT a FROM tq);
+SELECT pg_get_viewdef('v_any_sub'::regclass);
+DROP VIEW v_any_sub;
 DROP VIEW v_any_top;
 DROP VIEW v_any;
 DROP TABLE tq;

@@ -728,6 +728,20 @@ fn top_expr(e: &ast::Expr, cx: Cx) -> String {
     expr(e, cx, 0)
 }
 
+/// The right operand of `ANY`/`ALL`, always parenthesised — that is the syntax,
+/// not a precedence wrap.
+///
+/// A **subquery** brings its own parentheses: nothing here has an arm for one,
+/// so it falls through to the parser's `Display`, which writes `(SELECT …)`.
+/// Wrapping that again printed `= ANY ((SELECT …))`, where PostgreSQL prints one
+/// pair — probed on 18.4 with a stored view over `x <> ALL (SELECT …)`.
+fn quantified_operand(right: &ast::Expr, cx: Cx) -> String {
+    match right {
+        ast::Expr::Subquery(_) => top_expr(right, cx),
+        _ => format!("({})", top_expr(right, cx)),
+    }
+}
+
 /// Binding power, ordered as PG's grammar does. Only the relative order matters:
 /// a child binding *less* tightly than its parent needs parentheses.
 fn precedence(e: &ast::Expr) -> u8 {
@@ -809,9 +823,9 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
             right,
             ..
         } => format!(
-            "{} {compare_op} ANY ({})",
+            "{} {compare_op} ANY {}",
             expr(left, cx, prec),
-            top_expr(right, cx)
+            quantified_operand(right, cx)
         ),
         ast::Expr::AllOp {
             left,
@@ -819,9 +833,9 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
             right,
             ..
         } => format!(
-            "{} {compare_op} ALL ({})",
+            "{} {compare_op} ALL {}",
             expr(left, cx, prec),
-            top_expr(right, cx)
+            quantified_operand(right, cx)
         ),
         // A redundant group in the source is dropped; precedence alone decides
         // where parentheses land in the output.
