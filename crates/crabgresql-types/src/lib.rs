@@ -1601,6 +1601,32 @@ impl RecordVal {
     }
 }
 
+/// `expr IS NULL`, SQL's row-wise rule: a composite is NULL when **every** field
+/// is, and a plain value when it is `Value::Null`.
+///
+/// [`row_is_not_null`] is its counterpart rather than its negation. For a row
+/// the two are not complements — `ROW(1,NULL)` answers *false* to both — because
+/// each asks about every field. Probed on 18.4.
+///
+/// Nested rows recurse, as they do upstream: `ROW(ROW(NULL))` is NULL.
+pub fn row_is_null(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Record(record) => record.fields().iter().all(row_is_null),
+        _ => false,
+    }
+}
+
+/// `expr IS NOT NULL`: a composite qualifies when **no** field is NULL. See
+/// [`row_is_null`] for why this is not its negation.
+pub fn row_is_not_null(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Record(record) => record.fields().iter().all(row_is_not_null),
+        _ => true,
+    }
+}
+
 impl Value {
     /// A one-dimensional array of `elems` at the default lower bound of 1 — the
     /// shape every caller that builds an array flat wants. An empty `elems`

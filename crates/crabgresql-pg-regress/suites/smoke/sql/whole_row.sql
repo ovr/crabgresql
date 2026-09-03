@@ -29,4 +29,25 @@ DROP TABLE wr_sys;
 -- field sorts last.
 SELECT greatest(wr.*) FROM wr ORDER BY 1 DESC LIMIT 1;
 SELECT DISTINCT greatest(wr.*) AS rows FROM wr ORDER BY 1;
+-- `IS NULL` on a row asks about *every* field, and `IS NOT NULL` is not its
+-- negation: a mixed row answers false to both.
+CREATE TABLE wr_null (a int4, b text);
+INSERT INTO wr_null VALUES (1, 'x'), (2, NULL), (NULL, NULL);
+SELECT a, greatest(wr_null.*) IS NULL AS is_null,
+       greatest(wr_null.*) IS NOT NULL AS is_not_null
+  FROM wr_null ORDER BY a NULLS LAST;
+-- The null-extended side of an outer join is NULL as a whole row, which the
+-- same rule answers. Divergence: PostgreSQL *prints* it as NULL where we print
+-- the all-NULL row `()` — telling the two apart needs the join's
+-- null-extension flag on the value, which nothing here carries.
+SELECT greatest(n.*) IS NULL AS extended_is_null, greatest(n.*)::text AS printed
+  FROM wr_null k LEFT JOIN wr_null n ON (false) LIMIT 1;
+-- A `record` cannot be stored: it is a pseudo-type, and the on-disk codec has
+-- no tag for a composite. Divergence: PostgreSQL accepts this, giving the
+-- column the relation's own named composite type — nothing here declares one.
+-- (Left uncommitted on both sides, so the DROP below behaves the same way.)
+BEGIN;
+CREATE TABLE wr_ctas AS SELECT greatest(wr_null.*) FROM wr_null;
+ROLLBACK;
+DROP TABLE wr_null;
 DROP TABLE wr;

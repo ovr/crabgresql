@@ -114,9 +114,15 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             left,
             right,
         } => eval_binary(*op, *arg_ty, *collation, left, right, row, ctx),
+        // Row-wise for a composite, and *not* a pair of complements there: see
+        // `row_is_null`. For every other type the two collapse back to the
+        // single `Value::Null` test they have always been.
         BoundExpr::IsNull { expr, negated } => {
-            let is_null = matches!(eval(expr, row, ctx)?, Value::Null);
-            Ok(Value::Bool(is_null != *negated))
+            let value = eval(expr, row, ctx)?;
+            Ok(Value::Bool(match negated {
+                false => crabgresql_types::row_is_null(&value),
+                true => crabgresql_types::row_is_not_null(&value),
+            }))
         }
         // Also total: the operand is exactly one of true/false/unknown, so
         // every test against it answers yes or no. That relies on the binder's
@@ -1206,13 +1212,21 @@ fn eval_catalog_fn(
         ScalarFn::PgRelationIsUpdatable => Value::Int4(ops.relation_updatable(oid)),
         // PostgreSQL asks for both UPDATE and DELETE on the relation and, for a
         // view, whether the column maps to a base column. A base table answers
-        // for *any* column number, including one it does not have — probed on
-        // 18.4, where `pg_column_is_updatable('t'::regclass, 9, false)` is true
-        // for a two-column `t`. So the column number is read only far enough to
-        // be strict in it.
+        // for *any* **positive** column number, including one it does not have —
+        // probed on 18.4, where `pg_column_is_updatable('t'::regclass, 9, false)`
+        // is true for a two-column `t`, because the column set is consulted only
+        // for a view.
+        //
+        // Zero and the negative system-column numbers are the exception and are
+        // always false: no write reaches a system column. Probed the same way,
+        // for `0` and `-1` alike.
         ScalarFn::PgColumnIsUpdatable => {
             const REQUIRED: i32 = 4 | 16;
-            Value::Bool(ops.relation_updatable(oid) & REQUIRED == REQUIRED)
+            let Value::Int2(attnum) = args[1] else {
+                unreachable!("pg_column_is_updatable column was {:?}", args[1]);
+            };
+            let writable = ops.relation_updatable(oid) & REQUIRED == REQUIRED;
+            Value::Bool(attnum > 0 && writable)
         }
         // The four size functions. Each sums a different part of the same
         // measurement, so they share one catalog call; an OID naming no relation

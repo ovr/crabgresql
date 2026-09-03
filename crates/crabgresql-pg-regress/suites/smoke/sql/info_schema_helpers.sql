@@ -46,6 +46,10 @@ SELECT c.relname, c.relkind, pg_relation_is_updatable(c.oid, false) AS mask,
        pg_column_is_updatable(c.oid, 1::smallint, false) AS col1,
        pg_column_is_updatable(c.oid, 9::smallint, false) AS col9
   FROM pg_class c WHERE c.relname LIKE 'u1%' ORDER BY 1;
+-- Zero and the negative system-column numbers are never updatable, whatever the
+-- relation says.
+SELECT pg_column_is_updatable('u1'::regclass, 0::smallint, false) AS at_zero,
+       pg_column_is_updatable('u1'::regclass, (-1)::smallint, false) AS at_system;
 -- An OID naming nothing is *zero*, not NULL; both functions are STRICT.
 SELECT pg_relation_is_updatable(0::oid, false) AS zero,
        pg_relation_is_updatable(NULL, false) AS null_relation,

@@ -377,6 +377,11 @@ pub fn encode_datum(v: &Value, out: &mut Vec<u8>) {
         // pseudo-type, so no column is of it, and a whole-row reference only
         // ever exists inside one query's expression evaluation. Claiming a tag
         // for a value no page can hold would reserve it against nothing.
+        //
+        // What holds that up is the server's `reject_stored_pseudo_type`, which
+        // refuses a `record` output column where a table's shape is decided —
+        // without it `CREATE TABLE x AS SELECT greatest(t.*) FROM t` reaches
+        // here and this panic takes the connection with it.
         Value::Record(_) => {
             unreachable!("a composite is a query-time value and is never stored")
         }

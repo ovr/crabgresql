@@ -4476,6 +4476,7 @@ fn execute_create_table(
             None => resolve_column_type(type_catalog, &col.data_type)?,
         };
         reject_stored_reg_type(ty, &column_name)?;
+        reject_stored_pseudo_type(ty, &column_name)?;
         reject_system_column_name(&column_name)?;
         let typmod = crabgresql_binder::declared_typmod(ty, &col.data_type)?.unwrap_or(-1);
         let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
@@ -5968,13 +5969,15 @@ fn execute_create_table_as(
     }
 
     // A projected `reg*` cannot be stored, for the same reason a declared one
-    // cannot (see `reject_stored_reg_type`); and a projected column cannot be
-    // named after a system column, for the same reason a declared one cannot
-    // (see `reject_system_column_name`). Both apply to the output names, which
-    // is where an `AS` alias lands: `CREATE TABLE t AS SELECT 1 AS ctid` is the
-    // spelling upstream rejects.
+    // cannot (see `reject_stored_reg_type`); a projected `record` cannot either
+    // (see `reject_stored_pseudo_type`, which this path is the only way to
+    // reach); and a projected column cannot be named after a system column, for
+    // the same reason a declared one cannot (see `reject_system_column_name`).
+    // All three apply to the output names, which is where an `AS` alias lands:
+    // `CREATE TABLE t AS SELECT 1 AS ctid` is the spelling upstream rejects.
     for c in &cols {
         reject_stored_reg_type(c.ty, &c.name)?;
+        reject_stored_pseudo_type(c.ty, &c.name)?;
         reject_system_column_name(&c.name)?;
     }
     let mut schema = TableSchema {
@@ -6650,6 +6653,36 @@ fn reject_stored_reg_type(ty: PgType, column: &str) -> Result<(), PgError> {
              not stable across schema changes yet",
             kind.typname()
         ))),
+    }
+}
+
+/// Refuse to give a stored column a pseudo-type.
+///
+/// `record` is the one this build can produce: a whole-row reference is typed
+/// `PgType::Record`, and `CREATE TABLE x AS SELECT greatest(t.*) FROM t` would
+/// otherwise reach the on-disk codec, which has no tag for a composite and says
+/// so with an `unreachable!` — a panic that takes the connection with it.
+///
+/// PostgreSQL accepts that statement, because there the whole-row reference has
+/// the relation's *named* composite type; nothing here declares one, so the
+/// honest answer is the message PostgreSQL itself gives a pseudo-typed column
+/// (`CREATE TABLE t (a record)`), probed on 18.4 down to its SQLSTATE.
+///
+/// CTAS is the only way in: `map_data_type` has no `record` spelling, so a
+/// declared column cannot be one, and an INSERT or COPY target would have to be
+/// one already.
+fn reject_stored_pseudo_type(ty: PgType, column: &str) -> Result<(), PgError> {
+    let pseudo = match ty {
+        PgType::Record => true,
+        PgType::Array(elem) => matches!(PgType::from_oid(elem), Some(PgType::Record)),
+        _ => false,
+    };
+    match pseudo {
+        false => Ok(()),
+        true => Err(PgError::new(
+            sqlstate::INVALID_TABLE_DEFINITION,
+            format!("column \"{column}\" has pseudo-type record"),
+        )),
     }
 }
 

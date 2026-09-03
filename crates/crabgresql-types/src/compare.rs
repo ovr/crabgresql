@@ -156,10 +156,17 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
         //
         // Each field is compared under *its own* type, read off the value:
         // [`PgType::Record`] names no row type, so there is no field type list
-        // to consult. Two fields of different types cannot be ordered against
-        // each other — PG raises 42883 there — and are called equal rather than
-        // given an arbitrary order, so the comparison stays total for a
-        // defensive caller.
+        // to consult.
+        //
+        // **Divergence.** Two fields of different types cannot be ordered
+        // against each other, and PostgreSQL raises `cannot compare dissimilar
+        // column types` — which this signature cannot: it returns an `Ordering`,
+        // not a `Result`, and every sort, dedup and `min`/`max` in the executor
+        // goes through it. So the pair falls back to the *type OID* order, the
+        // same last resort the `PgType::User` arm below takes for a mixed pair.
+        // Deterministic and total, where calling them equal would silently make
+        // `greatest(m1.*, m2.*)` answer with whichever row came first. Closing
+        // it needs a comparison that can fail.
         PgType::Record => {
             let (a, b) = (record_fields(l), record_fields(r));
             for (x, y) in a.iter().zip(b) {
@@ -171,6 +178,7 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
                         (Some(tx), Some(ty)) if tx == ty => {
                             compare_values_collated(tx, x, y, collation)
                         }
+                        (Some(tx), Some(ty)) => tx.oid().cmp(&ty.oid()),
                         _ => Ordering::Equal,
                     },
                 };
