@@ -30,6 +30,7 @@ test: case
 test: coalesce
 test: nullif
 test: greatest_least
+test: whole_row
 test: bool_test
 test: in
 test: between
@@ -37,6 +38,7 @@ test: transactions
 test: numeric
 test: math
 test: join
+test: join_nested
 test: join_pushdown
 test: generate_series
 test: generate_subscripts
@@ -57,6 +59,7 @@ test: cidr
 test: pg_catalog
 test: information_schema
 test: information_schema_domains
+test: info_schema_helpers
 test: constraints
 test: check_constraint
 test: generated
@@ -111,5 +114,6 @@ test: column_introspection
 test: quantified_vector
 test: lateral
 test: roles
+test: owner
 test: privileges
 test: from_function

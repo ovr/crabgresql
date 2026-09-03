@@ -458,3 +458,105 @@ fn qualified_missing_column_names_the_qualifier() -> anyhow::Result<()> {
     assert_eq!(e.message, "column x.nope does not exist");
     Ok(())
 }
+
+/// A parenthesised join is one join *input* to the chain around it, not a run of
+/// relations spliced into it. The tree shape is what proves it: the right child
+/// of the outer join is itself a `Join`, so a `LEFT JOIN (b JOIN c)` cannot
+/// degenerate into `(a LEFT JOIN b) JOIN c` — which would drop the unmatched
+/// left rows the outer join exists to keep.
+#[test]
+fn a_parenthesised_join_is_one_input_to_the_chain_around_it() -> anyhow::Result<()> {
+    let JoinPlan {
+        source,
+        projections,
+        ..
+    } = bound_join(
+        "SELECT c.z FROM (VALUES (1)) a(x) \
+         LEFT JOIN ((VALUES (1)) b(y) JOIN (VALUES (1)) c(z) ON b.y = c.z) ON a.x = c.z",
+    )?;
+    let JoinExpr::Join {
+        left,
+        right,
+        kind: JoinKind::Left,
+        predicate: Some(predicate),
+    } = source
+    else {
+        bail!("expected a top-level LEFT join");
+    };
+    assert!(matches!(*left, JoinExpr::Input { .. }));
+    assert!(matches!(
+        *right,
+        JoinExpr::Join {
+            kind: JoinKind::Inner,
+            ..
+        }
+    ));
+    // The *enclosing* predicate indexes the enclosing chain's combined row, so
+    // `c.z` is at 2 there — the inner join's own predicate is base-0 to its own
+    // subtree and is not touched by the nesting.
+    assert!(predicate.any_node(&|e| matches!(e, BoundExpr::ColumnRef { index: 2, .. })));
+    assert_eq!(
+        projections[0],
+        BoundExpr::ColumnRef {
+            index: 2,
+            ty: PgType::Int4
+        }
+    );
+    Ok(())
+}
+
+/// The six-level nesting `pg_get_viewdef` prints for `information_schema.columns`
+/// binds, and every relation in it stays addressable by its own alias.
+#[test]
+fn deeply_nested_parenthesised_joins_bind() -> anyhow::Result<()> {
+    let JoinPlan { projections, .. } = bound_join(
+        "SELECT a.w, b.x, c.y, d.z FROM ((((VALUES (1)) a(w) \
+         LEFT JOIN (VALUES (1)) b(x) ON a.w = b.x) \
+         JOIN ((VALUES (1)) c(y) JOIN (VALUES (1)) d(z) ON c.y = d.z) ON a.w = c.y))",
+    )?;
+    let indices: Vec<_> = projections
+        .iter()
+        .map(|e| match e {
+            BoundExpr::ColumnRef { index, .. } => Ok(*index),
+            other => Err(anyhow!("expected a column reference, got {other:?}")),
+        })
+        .collect::<anyhow::Result<_>>()?;
+    assert_eq!(indices, vec![0, 1, 2, 3]);
+    Ok(())
+}
+
+/// A qualifier is unique across the whole FROM clause, parentheses or not — so
+/// the check has to see every relation a nested group contributes, not just its
+/// first.
+#[test]
+fn a_duplicate_qualifier_inside_a_nested_group_is_42712() -> anyhow::Result<()> {
+    let e = bind_err(
+        "SELECT 1 FROM (VALUES (1)) a(x) \
+         JOIN ((VALUES (1)) b(y) JOIN (VALUES (1)) a(z) ON true) ON true",
+    )?;
+    assert_eq!(e.code, "42712");
+    assert_eq!(e.message, "table name \"a\" specified more than once");
+    Ok(())
+}
+
+/// Nothing outside a parenthesised group is in the row its items are fed, so a
+/// `LATERAL` reference out of one hits the same barrier a reference out of a
+/// comma group hits — the enclosing join is spliced in above the whole subtree.
+///
+/// A deliberate divergence: PostgreSQL answers this query, because `a` does
+/// precede the group in the FROM clause. Getting there needs the enclosing row
+/// threaded into the subtree, so the honest answer is 0A000 rather than a
+/// silent bind against a like-named enclosing relation.
+#[test]
+fn a_nested_group_cannot_see_the_chain_it_sits_in() -> anyhow::Result<()> {
+    let e = bind_err(
+        "SELECT 1 FROM (VALUES (1)) a(x) \
+         JOIN ((VALUES (1)) b(y) JOIN LATERAL (SELECT a.x) c ON true) ON true",
+    )?;
+    assert_eq!(e.code, sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        e.message,
+        "LATERAL reference to \"a\" from outside this join chain is not supported yet"
+    );
+    Ok(())
+}

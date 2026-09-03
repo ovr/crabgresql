@@ -150,6 +150,44 @@ pub fn compare_values_collated(ty: PgType, l: &Value, r: &Value, collation: u32)
             }
             compare_elementwise(kind.element(), la, lb)
         }
+        // A composite compares field by field, the shorter row first on a common
+        // prefix, and a NULL field last — PG's `record_cmp`, which is
+        // `array_cmp`'s rule over a heterogeneous row.
+        //
+        // Each field is compared under *its own* type, read off the value:
+        // [`PgType::Record`] names no row type, so there is no field type list
+        // to consult.
+        //
+        // **Divergence.** Two fields of different types cannot be ordered
+        // against each other, and PostgreSQL raises `cannot compare dissimilar
+        // column types` — which this signature cannot: it returns an `Ordering`,
+        // not a `Result`, and every sort, dedup and `min`/`max` in the executor
+        // goes through it. So the pair falls back to the *type OID* order, the
+        // same last resort the `PgType::User` arm below takes for a mixed pair.
+        // Deterministic and total, where calling them equal would silently make
+        // `greatest(m1.*, m2.*)` answer with whichever row came first. Closing
+        // it needs a comparison that can fail.
+        PgType::Record => {
+            let (a, b) = (record_fields(l), record_fields(r));
+            for (x, y) in a.iter().zip(b) {
+                let ordering = match (x, y) {
+                    (Value::Null, Value::Null) => Ordering::Equal,
+                    (Value::Null, _) => Ordering::Greater,
+                    (_, Value::Null) => Ordering::Less,
+                    _ => match (x.pg_type(), y.pg_type()) {
+                        (Some(tx), Some(ty)) if tx == ty => {
+                            compare_values_collated(tx, x, y, collation)
+                        }
+                        (Some(tx), Some(ty)) => tx.oid().cmp(&ty.oid()),
+                        _ => Ordering::Equal,
+                    },
+                };
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
         // Enums are the only user type with a query-time ordering (by
         // definition ordinal), which matches PG: a `CREATE TYPE` base type has
         // no default btree opclass, so ORDER BY on one fails with "could not
@@ -207,6 +245,13 @@ pub fn array_dims(v: &Value) -> &[crate::ArrayDim] {
     match v {
         Value::Array { dims, .. } => dims,
         other => unreachable!("expected array, got {other:?}"),
+    }
+}
+
+fn record_fields(v: &Value) -> &[Value] {
+    match v {
+        Value::Record(record) => record.fields(),
+        other => unreachable!("expected record, got {other:?}"),
     }
 }
 

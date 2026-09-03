@@ -51,8 +51,8 @@ pub use catalogs::extension::{AvailableExtension, available_extensions};
 pub use catalogs::namespace::{is_builtin_namespace, is_system_namespace};
 pub use oids::{BOOTSTRAP_ROLE_OID, PLPGSQL_LANG_OID};
 pub use registry::{
-    builtin_relation_name, builtin_relation_oid, builtin_relation_oid_in, builtin_relation_ref,
-    builtin_view_definition,
+    SystemView, builtin_relation_name, builtin_relation_oid, builtin_relation_oid_in,
+    builtin_relation_ref, builtin_view_definition, system_view,
 };
 pub use source::{
     CatalogBackend, CatalogCursor, CatalogDomain, CatalogDomainCheck, CatalogLock,
@@ -90,7 +90,7 @@ pub use static_table::StaticTable;
 /// renumbers every relation sorting after it — so a client that holds an OID
 /// across DDL can address the wrong relation. Storage owning a persistent OID
 /// per relation is what fixes it.
-const FIRST_REL_OID: u32 = 0x4000_0000;
+pub(crate) const FIRST_REL_OID: u32 = 0x4000_0000;
 
 /// The namespace PostgreSQL keeps TOAST relations in. Never on the search path,
 /// so nothing here is reachable by an unqualified name.
@@ -676,6 +676,7 @@ pub struct SystemCatalog {
     live_relations: OnceLock<Vec<CatalogRelation>>,
     oids: OnceLock<Vec<(u32, TableSchema)>>,
     kinds: OnceLock<Vec<RelKind>>,
+    owners: OnceLock<Vec<u32>>,
     ddl_xids: OnceLock<Vec<Xid>>,
     xmin_by_oid: OnceLock<Arc<std::collections::HashMap<u32, Xid>>>,
     stats: OnceLock<Vec<RelStats>>,
@@ -745,6 +746,7 @@ impl SystemCatalog {
         Self {
             source,
             live_relations: OnceLock::new(),
+            owners: OnceLock::new(),
             oids: OnceLock::new(),
             kinds: OnceLock::new(),
             ddl_xids: OnceLock::new(),
@@ -933,6 +935,44 @@ impl SystemCatalog {
             });
             rels.into_iter().map(|r| r.kind).collect()
         })
+    }
+
+    /// The owning role's OID for each entry of [`SystemCatalog::relation_oids`],
+    /// in the same sorted order — `pg_class.relowner`, and what
+    /// [`SystemCatalog::relation_acl`] reports as the owner.
+    ///
+    /// A relation whose creator was never recorded — one written before owners
+    /// were persisted, or created by an engine with no registry — reports the
+    /// **database owner**, which is what every relation reported before this
+    /// existed. A role that has since been dropped resolves to nothing and falls
+    /// back the same way, so a `pg_authid` join can never lose the row.
+    pub(crate) fn relation_owners(&self) -> &[u32] {
+        self.owners.get_or_init(|| {
+            let mut rels = self.live_relations().to_vec();
+            rels.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            rels.into_iter()
+                .map(|r| self.owner_oid(r.owner.as_deref()))
+                .collect()
+        })
+    }
+
+    /// The OID of the role `name`, or of the database owner when `name` is
+    /// absent or names no role. See [`SystemCatalog::relation_owners`].
+    pub(crate) fn owner_oid(&self, name: Option<&str>) -> u32 {
+        name.and_then(|name| self.role_oid(name))
+            .or_else(|| self.role_oid(self.owner()))
+            .unwrap_or(oids::BOOTSTRAP_ROLE_OID)
+    }
+
+    /// The owning role's OID for the user schema `name` — `pg_namespace.nspowner`
+    /// and what [`SystemCatalog::namespace_acl`] reports. Falls back to the
+    /// database owner exactly as [`SystemCatalog::relation_owners`] does.
+    pub(crate) fn schema_owner_oid(&self, name: &str) -> u32 {
+        self.owner_oid(self.source.schema_owner(name).as_deref())
     }
 
     /// The size estimates for each entry of [`SystemCatalog::relation_oids`], in
@@ -1428,15 +1468,18 @@ impl SystemCatalog {
         // The `information_schema` domain checks are numbered by `initdb`, not
         // by the band below, so they are matched by OID before the positional
         // lookup — which would read their small OIDs as a wild index.
-        if let Some(domain) = info_schema::DOMAINS
-            .iter()
-            .find(|d| d.check.as_ref().is_some_and(|c| c.oid == oid))
+        //
+        // Through the same `info_schema::constraints()` the `pg_constraint` rows
+        // and the `pg_depend` edges are built from, so the three cannot describe
+        // one check differently.
+        if let Some(check) = info_schema::constraints()
+            .into_iter()
+            .find(|c| c.oid == oid)
         {
-            let check = domain.check.as_ref()?;
             return Some(ConstraintDefRow {
-                contype: "c".to_string(),
+                contype: check.contype.to_string(),
                 columns: Vec::new(),
-                expr: Some(check.expr.to_string()),
+                expr: check.expr,
                 is_domain: true,
             });
         }
@@ -1673,7 +1716,7 @@ impl SystemCatalog {
                 return None;
             }
             return Some(ObjectAcl {
-                owner: oids::BOOTSTRAP_ROLE_OID,
+                owner: self.relation_owners()[offset],
                 is_sequence: matches!(self.relation_kinds()[offset], RelKind::Sequence),
                 granted_to_public: false,
             });
@@ -1704,7 +1747,13 @@ impl SystemCatalog {
     /// `pg_toast` and every `CREATE SCHEMA` namespace carry no grant at all.
     pub fn namespace_acl(&self, oid: u32) -> Option<ObjectAcl> {
         self.namespace_name(oid).map(|name| ObjectAcl {
-            owner: oids::BOOTSTRAP_ROLE_OID,
+            // A built-in namespace is `initdb`'s; a `CREATE SCHEMA` one belongs
+            // to the role that ran it, which is what `has_schema_privilege`
+            // answers `true` for.
+            owner: match is_builtin_namespace(&name) {
+                true => oids::BOOTSTRAP_ROLE_OID,
+                false => self.schema_owner_oid(&name),
+            },
             is_sequence: false,
             granted_to_public: matches!(
                 name.as_str(),
@@ -1959,6 +2008,38 @@ impl SystemCatalog {
         (toast.oid == oid).then_some((TOAST_NAMESPACE, toast.name.as_str()))
     }
 
+    /// Which writes the relation `oid` accepts, as `pg_relation_is_updatable`'s
+    /// bitmask: INSERT is 8, UPDATE 4 and DELETE 16, so an ordinary table is 28.
+    ///
+    /// PostgreSQL reports 0 for a relation nothing can write — a sequence, an
+    /// index, a view it cannot rewrite onto a base relation — and 0 for an OID
+    /// naming nothing at all, which is why this returns an `i32` rather than an
+    /// `Option`: the function is not NULL-for-a-miss the way the size ones are.
+    ///
+    /// **Divergence:** a view is 0 here where PostgreSQL reports 28 for a
+    /// simple, automatically updatable one. This build rewrites no write onto a
+    /// view's base relation, so reporting 28 would advertise a write it then
+    /// refuses — and `information_schema.tables.is_insertable_into` would say
+    /// YES where an INSERT raises.
+    ///
+    /// A served catalog relation is 0 too: it is read-only here.
+    pub fn relation_updatable(&self, oid: u32) -> i32 {
+        const ALL_WRITES: i32 = 8 | 4 | 16;
+        if builtin_relation_ref(oid).is_some() {
+            return 0;
+        }
+        let Some(offset) = oid.checked_sub(FIRST_REL_OID).map(|o| o as usize) else {
+            return 0;
+        };
+        match self.relation_oids().get(offset) {
+            Some((stored, _)) if *stored == oid => match self.relation_kinds()[offset] {
+                RelKind::Table | RelKind::PartitionedTable => ALL_WRITES,
+                RelKind::View | RelKind::Sequence => 0,
+            },
+            _ => 0,
+        }
+    }
+
     /// The physical size, in 8 KB pages, of everything the relation `oid`
     /// identifies owns — its own storage, its TOAST relation and its indexes,
     /// kept apart because the four size functions add them up differently
@@ -2151,13 +2232,10 @@ impl SystemCatalog {
         self.build(CatalogNamespace::PgCatalog, name)
     }
 
-    /// The `information_schema` counterpart of [`SystemCatalog::build_pg_catalog`].
-    #[cfg(test)]
-    fn build_information_schema(&self, name: &str) -> Option<(TableSchema, Vec<Vec<Value>>)> {
-        self.build(CatalogNamespace::InformationSchema, name)
-    }
-
-    /// Materialize `namespace.name` from the registry.
+    /// Materialize `namespace.name` from the registry, or `None` when the name
+    /// is not served *or* is a view served by running its own definition — those
+    /// have no builder to call, and their rows come from binding SQL, which is
+    /// two layers above this one.
     ///
     /// TODO(perf): nothing is cached, so `pg_class a, pg_class b` builds the
     /// relation twice and every scan of `pg_proc` rebuilds ~500 rows. The cache
@@ -2173,7 +2251,7 @@ impl SystemCatalog {
         name: &str,
     ) -> Option<(TableSchema, Vec<Vec<Value>>)> {
         let def = registry::lookup(namespace, name)?;
-        Some(((def.schema)(), (def.rows)(self)))
+        Some(((def.schema)(), (def.rows?)(self)))
     }
 
     /// Open a served relation as a [`StaticTable`].
@@ -2185,14 +2263,20 @@ impl SystemCatalog {
     /// cannot outlive — and it costs one relation enumeration on a relation
     /// nothing scans in a hot path. Both snapshots read the same source, so they
     /// assign the same OIDs.
+    ///
+    /// A registry entry with **no** row builder is a view this build serves by
+    /// running its own definition, and is reported here as absent. That is the
+    /// switch: the binder's `TableNotFound` arm is what falls through to view
+    /// resolution, so while this returned a `StaticTable` the name never reached
+    /// it. See [`registry::view_sql`].
     fn open(
         &self,
         namespace: CatalogNamespace,
         name: &str,
     ) -> Result<Arc<dyn TableAm>, StorageError> {
-        let Some(def) = registry::lookup(namespace, name) else {
-            return Err(StorageError::TableNotFound(name.to_string()));
-        };
+        let not_found = || StorageError::TableNotFound(name.to_string());
+        let def = registry::lookup(namespace, name).ok_or_else(not_found)?;
+        let build = def.rows.ok_or_else(not_found)?;
         let schema = (def.schema)();
         let xmin = Xid(self.source.catalog_xmin());
         if !def.deferred {
@@ -2201,11 +2285,10 @@ impl SystemCatalog {
             // A named column the schema does not have degrades to the latter
             // rather than failing the scan — `xmin_columns_exist` is the test
             // that keeps the registry honest.
-            let table = StaticTable::new(schema, (def.rows)(self));
+            let table = StaticTable::new(schema, build(self));
             return Ok(Arc::new(self.with_catalog_xmin(table, def, xmin)));
         }
         let source = Arc::clone(&self.source);
-        let build = def.rows;
         let deferred = StaticTable::deferred(schema, move || {
             build(&SystemCatalog::from_source(Arc::clone(&source)))
         });

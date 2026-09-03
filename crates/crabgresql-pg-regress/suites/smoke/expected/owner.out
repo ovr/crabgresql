@@ -1,0 +1,80 @@
+--
+-- Object ownership
+-- An object is owned by the role that created it, which is what lets that role
+-- find it through `information_schema`: every view of that schema filters on
+-- `pg_has_role(<owner>, 'USAGE') OR has_*_privilege(...)`.
+--
+-- Divergence throughout: this build does not enforce privileges on DDL, so
+-- `own_bob` creates where PostgreSQL refuses it for want of `CREATE` on the
+-- schema (and on the database, for `CREATE SCHEMA`) -- grants this build has no
+-- `GRANT` to express yet. What is pinned below is what happens *after* the
+-- object exists, which is the same question in both.
+--
+CREATE ROLE own_bob LOGIN;
+CREATE TABLE own_theirs (a int4);
+SET ROLE own_bob;
+CREATE TABLE own_bobs (a int4, b text);
+CREATE SCHEMA own_bobsch;
+CREATE VIEW own_bobs_v AS SELECT a FROM own_bobs;
+CREATE SEQUENCE own_bobs_seq;
+-- Only what own_bob made: a table another role owns stays invisible to it, as
+-- in PostgreSQL, because own_bob holds no privilege on it.
+SELECT table_name FROM information_schema.tables
+ WHERE table_schema = 'public' AND table_name LIKE 'own\_%' ORDER BY 1;
+ table_name 
+------------
+ own_bobs
+ own_bobs_v
+(2 rows)
+
+SELECT column_name FROM information_schema.columns
+ WHERE table_name = 'own_bobs' ORDER BY ordinal_position;
+ column_name 
+-------------
+ a
+ b
+(2 rows)
+
+SELECT schema_name FROM information_schema.schemata
+ WHERE schema_name = 'own_bobsch';
+ schema_name 
+-------------
+ own_bobsch
+(1 row)
+
+RESET ROLE;
+-- `relowner`/`nspowner` name the creator. An index and a TOAST relation record
+-- no creator of their own and take the owner of the table they hang off.
+SELECT c.relname, c.relkind, pg_get_userbyid(c.relowner) AS owner
+  FROM pg_class c WHERE c.relname LIKE 'own\_%' ORDER BY 1;
+   relname    | relkind |  owner   
+--------------+---------+----------
+ own_bobs     | r       | own_bob
+ own_bobs_seq | S       | own_bob
+ own_bobs_v   | v       | own_bob
+ own_theirs   | r       | postgres
+(4 rows)
+
+SELECT n.nspname, pg_get_userbyid(n.nspowner) AS owner
+  FROM pg_namespace n WHERE n.nspname = 'own_bobsch';
+  nspname   |  owner  
+------------+---------
+ own_bobsch | own_bob
+(1 row)
+
+-- The privilege functions read the same owner, so they cannot disagree with the
+-- views above about who reaches what.
+SELECT has_table_privilege('own_bob', 'own_bobs', 'SELECT') AS own,
+       has_table_privilege('own_bob', 'own_theirs', 'SELECT') AS theirs,
+       has_schema_privilege('own_bob', 'own_bobsch', 'CREATE') AS own_schema;
+ own | theirs | own_schema 
+-----+--------+------------
+ t   | f      | t
+(1 row)
+
+DROP SEQUENCE own_bobs_seq;
+DROP VIEW own_bobs_v;
+DROP SCHEMA own_bobsch;
+DROP TABLE own_bobs;
+DROP TABLE own_theirs;
+DROP ROLE own_bob;

@@ -47,24 +47,25 @@ pub fn is_system_namespace(name: &str) -> bool {
     is_builtin_namespace(name) && name != "public"
 }
 
-/// All schemas report the bootstrap owner because this build exposes a single
-/// owning role.
+/// A built-in namespace is `initdb`'s and reports the bootstrap role; a
+/// `CREATE SCHEMA` one reports the role that ran it, which is what lets that
+/// role find its own schema through `information_schema.schemata`'s
+/// `pg_has_role(n.nspowner, 'USAGE')`.
 pub(crate) fn pg_namespace_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
-    let user_schemas = cat.user_schemas();
-    let row = |oid: u32, name: &str| {
+    let row = |oid: u32, name: &str, owner: u32| {
         vec![
             Value::Oid(oid),
             Value::Text(name.to_string()),
-            Value::Oid(BOOTSTRAP_ROLE_OID),
+            Value::Oid(owner),
             Value::Null,
         ]
     };
     let mut rows: Vec<Vec<Value>> = BUILTIN_NAMESPACES
         .iter()
-        .map(|(oid, name)| row(*oid, name))
+        .map(|(oid, name)| row(*oid, name, BOOTSTRAP_ROLE_OID))
         .collect();
-    for (name, oid) in user_schemas {
-        rows.push(row(*oid, name));
+    for (name, oid) in cat.user_schemas() {
+        rows.push(row(*oid, name, cat.schema_owner_oid(name)));
     }
     rows
 }

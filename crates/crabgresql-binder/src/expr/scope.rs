@@ -145,10 +145,11 @@ pub(crate) enum LateralBarrier {
     /// row it would reference may not exist at all.
     WrongJoinType,
     /// A `LATERAL` item *anywhere in an explicit join chain* — leading it or
-    /// inside it — referencing a FROM item from an earlier comma-separated
-    /// group. PostgreSQL answers these queries; we do not, because the join tree
-    /// cross-joins the groups *above* the chain, so that item's columns are not
-    /// in the row any node of the chain is fed.
+    /// inside it — referencing a FROM item outside that chain: an earlier
+    /// comma-separated group, or the chain a parenthesised join sits in.
+    /// PostgreSQL answers these queries; we do not, because the join tree joins
+    /// the outside *above* the chain, so that item's columns are not in the row
+    /// any node of the chain is fed.
     ///
     /// A barrier rather than a silent fall-through to the enclosing queries,
     /// which would bind a like-named outer relation and answer a different
@@ -181,7 +182,7 @@ impl LateralBarrier {
                     .to_string(),
             )),
             LateralBarrier::OtherGroup => BindError::feature_not_supported(format!(
-                "LATERAL reference to \"{qualifier}\" from another comma-separated FROM item \
+                "LATERAL reference to \"{qualifier}\" from outside this join chain \
                  is not supported yet"
             )),
         }
@@ -588,6 +589,10 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             nested: *nested,
             ty: *ty,
             elems: elems.iter().map(|a| outerize_columns(a, level)).collect(),
+        },
+        BoundExpr::WholeRow { names, fields } => BoundExpr::WholeRow {
+            names: names.clone(),
+            fields: fields.iter().map(|f| outerize_columns(f, level)).collect(),
         },
         BoundExpr::Subscript { base, indexes, ty } => BoundExpr::Subscript {
             base: Box::new(outerize_columns(base, level)),
@@ -1226,6 +1231,29 @@ impl Scope {
         let mut out = Vec::new();
         self.expand_rel(rel, &mut out)?;
         Ok(out)
+    }
+
+    /// `qualifier.*` in **expression** position: the relation's row as one
+    /// composite value.
+    ///
+    /// The same columns `q.*` expands to in a select list, gathered into one
+    /// value instead of spread across the output — including the rule that a
+    /// system column is not among them, so `t.*` never carries `ctid`.
+    ///
+    /// TODO: only this query level. PostgreSQL resolves `o.*` inside a subquery
+    /// against an enclosing FROM as a correlated whole-row reference; here that
+    /// is "missing FROM-clause entry", because [`Scope::relation`] does not walk
+    /// the outer levels the way [`Scope::resolve_qualified`] does.
+    pub(crate) fn whole_row(&self, qualifier: &str) -> Result<BoundExpr, BindError> {
+        let columns = self.expand_qualified(qualifier)?;
+        let (names, fields): (Vec<String>, Vec<BoundExpr>) = columns
+            .into_iter()
+            .map(|(col, expr)| (col.name, expr))
+            .unzip();
+        Ok(BoundExpr::WholeRow {
+            names: names.into(),
+            fields,
+        })
     }
 
     /// Append every *declared* column of `rel` as an `(output column,

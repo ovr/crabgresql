@@ -967,7 +967,12 @@ fn execute_statement_inner(
                 return execute_create_table(engine, &type_catalog, &catalog_ops, create, session);
             }
             ast::Statement::CreateView(create) => {
-                return execute_create_view(&catalog, &type_catalog, create);
+                return execute_create_view(
+                    &catalog,
+                    &type_catalog,
+                    create,
+                    session.current_user(),
+                );
             }
             ast::Statement::CreateSequence {
                 temporary,
@@ -985,6 +990,7 @@ fn execute_statement_inner(
                     data_type,
                     sequence_options,
                     owned_by,
+                    session.current_user(),
                 );
             }
             ast::Statement::CreateType {
@@ -1026,7 +1032,12 @@ fn execute_statement_inner(
                 if_not_exists,
                 ..
             } => {
-                return execute_create_schema(engine, schema_name, *if_not_exists);
+                return execute_create_schema(
+                    engine,
+                    schema_name,
+                    *if_not_exists,
+                    session.current_user(),
+                );
             }
             ast::Statement::Drop {
                 object_type: ast::ObjectType::Schema,
@@ -4409,6 +4420,7 @@ fn execute_create_table(
             &name,
             parent,
             &session.temp_schema,
+            session.current_user(),
             // A bound may name the session identity (`current_user`,
             // `current_schema`, `pg_my_temp_schema()`), which PostgreSQL folds
             // into the stored bound — so the fold needs this statement's
@@ -4476,6 +4488,7 @@ fn execute_create_table(
             None => resolve_column_type(type_catalog, &col.data_type)?,
         };
         reject_stored_reg_type(ty, &column_name)?;
+        reject_stored_pseudo_type(ty, &column_name)?;
         reject_system_column_name(&column_name)?;
         let typmod = crabgresql_binder::declared_typmod(ty, &col.data_type)?.unwrap_or(-1);
         let mut column = Column::with_typmod(column_name.clone(), ty, typmod);
@@ -4493,6 +4506,7 @@ fn execute_create_table(
             serial_defs.push(SequenceDefinition {
                 name: seq_name,
                 namespace: namespace.clone(),
+                owner: Some(session.current_user().to_string()),
                 data_type: base,
                 start: 1,
                 increment: 1,
@@ -4964,7 +4978,7 @@ fn execute_create_table(
             return Err(e.into());
         }
     }
-    match target.create_table(schema) {
+    match target.create_table_owned(schema, session.current_user()) {
         Ok(_) => {
             for index in indexes {
                 if let Err(e) = target.create_index(&namespace, &name, index) {
@@ -5721,6 +5735,7 @@ fn execute_create_partition(
     name: &str,
     parent_ref: &ast::ObjectName,
     temp_schema: &str,
+    owner: &str,
     ctx: &ExecContext,
 ) -> Result<QueryResult, PgError> {
     // A partition inherits its shape from the parent.
@@ -5845,7 +5860,7 @@ fn execute_create_partition(
         // refused at DDL, so the parent never has any.
         checks: Vec::new(),
     };
-    match engine.create_table(schema) {
+    match engine.create_table_owned(schema, owner) {
         Ok(_) => Ok(QueryResult::command("CREATE TABLE")),
         Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {
             Ok(QueryResult::command("CREATE TABLE"))
@@ -5968,13 +5983,15 @@ fn execute_create_table_as(
     }
 
     // A projected `reg*` cannot be stored, for the same reason a declared one
-    // cannot (see `reject_stored_reg_type`); and a projected column cannot be
-    // named after a system column, for the same reason a declared one cannot
-    // (see `reject_system_column_name`). Both apply to the output names, which
-    // is where an `AS` alias lands: `CREATE TABLE t AS SELECT 1 AS ctid` is the
-    // spelling upstream rejects.
+    // cannot (see `reject_stored_reg_type`); a projected `record` cannot either
+    // (see `reject_stored_pseudo_type`, which this path is the only way to
+    // reach); and a projected column cannot be named after a system column, for
+    // the same reason a declared one cannot (see `reject_system_column_name`).
+    // All three apply to the output names, which is where an `AS` alias lands:
+    // `CREATE TABLE t AS SELECT 1 AS ctid` is the spelling upstream rejects.
     for c in &cols {
         reject_stored_reg_type(c.ty, &c.name)?;
+        reject_stored_pseudo_type(c.ty, &c.name)?;
         reject_system_column_name(&c.name)?;
     }
     let mut schema = TableSchema {
@@ -6017,7 +6034,7 @@ fn execute_create_table_as(
 
     // Create the table first so a name collision short-circuits before the query
     // runs. IF NOT EXISTS on an existing relation runs nothing (PG NOTICE).
-    match target.create_table(schema) {
+    match target.create_table_owned(schema, session.current_user()) {
         Ok(_) => {}
         Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {
             return Ok(QueryResult::Command {
@@ -6650,6 +6667,36 @@ fn reject_stored_reg_type(ty: PgType, column: &str) -> Result<(), PgError> {
              not stable across schema changes yet",
             kind.typname()
         ))),
+    }
+}
+
+/// Refuse to give a stored column a pseudo-type.
+///
+/// `record` is the one this build can produce: a whole-row reference is typed
+/// `PgType::Record`, and `CREATE TABLE x AS SELECT greatest(t.*) FROM t` would
+/// otherwise reach the on-disk codec, which has no tag for a composite and says
+/// so with an `unreachable!` — a panic that takes the connection with it.
+///
+/// PostgreSQL accepts that statement, because there the whole-row reference has
+/// the relation's *named* composite type; nothing here declares one, so the
+/// honest answer is the message PostgreSQL itself gives a pseudo-typed column
+/// (`CREATE TABLE t (a record)`), probed on 18.4 down to its SQLSTATE.
+///
+/// CTAS is the only way in: `map_data_type` has no `record` spelling, so a
+/// declared column cannot be one, and an INSERT or COPY target would have to be
+/// one already.
+fn reject_stored_pseudo_type(ty: PgType, column: &str) -> Result<(), PgError> {
+    let pseudo = match ty {
+        PgType::Record => true,
+        PgType::Array(elem) => matches!(PgType::from_oid(elem), Some(PgType::Record)),
+        _ => false,
+    };
+    match pseudo {
+        false => Ok(()),
+        true => Err(PgError::new(
+            sqlstate::INVALID_TABLE_DEFINITION,
+            format!("column \"{column}\" has pseudo-type record"),
+        )),
     }
 }
 
@@ -7981,6 +8028,7 @@ fn execute_create_view(
     catalog: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
     create: &ast::CreateView,
+    owner: &str,
 ) -> Result<QueryResult, PgError> {
     let (schema_qual, name) = split_object_name(&create.name, "relation")?;
     let namespace = resolve_create_namespace(catalog, schema_qual.as_deref(), &name)?;
@@ -8092,6 +8140,7 @@ fn execute_create_view(
     catalog.create_view(ViewDefinition {
         name,
         namespace,
+        owner: Some(owner.to_string()),
         sql,
         columns: view_columns,
         depends_on,
@@ -8811,6 +8860,8 @@ fn build_sequence_definition(
     Ok(SequenceDefinition {
         name,
         namespace,
+        // Stamped by the caller, which is where the session is.
+        owner: None,
         data_type,
         start,
         increment,
@@ -8839,6 +8890,7 @@ fn execute_create_sequence(
     data_type: &Option<ast::DataType>,
     options: &[ast::SequenceOptions],
     owned_by: &Option<ast::ObjectName>,
+    owner: &str,
 ) -> Result<QueryResult, PgError> {
     if temporary {
         return Err(PgError::feature_not_supported(
@@ -8870,7 +8922,8 @@ fn execute_create_sequence(
             }
         },
     };
-    let def = build_sequence_definition(seq_name.clone(), namespace, data_type, options, None)?;
+    let mut def = build_sequence_definition(seq_name.clone(), namespace, data_type, options, None)?;
+    def.owner = Some(owner.to_string());
     match catalog.create_sequence(def) {
         Ok(()) => Ok(QueryResult::command("CREATE SEQUENCE")),
         Err(StorageError::TableAlreadyExists(_)) if if_not_exists => Ok(QueryResult::Command {
@@ -9130,6 +9183,7 @@ fn execute_create_schema(
     engine: &Arc<dyn TableEngine>,
     schema_name: &ast::SchemaName,
     if_not_exists: bool,
+    owner: &str,
 ) -> Result<QueryResult, PgError> {
     let name = match schema_name {
         ast::SchemaName::Simple(obj) => single_object_name(obj, "schema")?,
@@ -9167,7 +9221,7 @@ fn execute_create_schema(
             format!("schema \"{name}\" already exists"),
         ));
     }
-    engine.create_schema(&name)?;
+    engine.create_schema_owned(&name, owner)?;
     Ok(QueryResult::command("CREATE SCHEMA"))
 }
 

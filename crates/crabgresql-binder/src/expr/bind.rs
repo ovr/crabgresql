@@ -39,6 +39,7 @@ pub fn bind_expr(expr: &ast::Expr, scope: &Scope) -> Result<Binding, BindError> 
         }
         ast::Expr::Identifier(ident) => scope.resolve(&normalize_ident(ident)).map(Binding::Typed),
         ast::Expr::CompoundIdentifier(parts) => bind_compound(parts, scope).map(Binding::Typed),
+        ast::Expr::QualifiedWildcard(name, _) => bind_whole_row(name, scope).map(Binding::Typed),
         ast::Expr::Nested(inner) => bind_expr(inner, scope),
         ast::Expr::UnaryOp { op, expr } => bind_unary(*op, expr, scope),
         ast::Expr::BinaryOp {
@@ -241,6 +242,34 @@ fn bind_collate(
         collation: oid,
         explicit: true,
     }))
+}
+
+/// Bind a whole-row reference `t.*` in **expression** position — the row of `t`
+/// as one `record` value.
+///
+/// Only in expression position: as a select-list item `t.*` still *expands*
+/// into one output column per column of `t`, alias or not, which is what
+/// PostgreSQL does and why the projection path never reaches here. The
+/// composite is what a nested position — a function argument, a parenthesised
+/// `(t.*)` — produces.
+fn bind_whole_row(name: &ast::ObjectName, scope: &Scope) -> Result<BoundExpr, BindError> {
+    // The qualifier a scope knows is a relation's alias, never a schema, so the
+    // schema-qualified spelling is refused exactly as `schema.table.column` is
+    // in `bind_compound`.
+    let [qualifier] = name.0.as_slice() else {
+        return Err(BindError::feature_not_supported(
+            "schema-qualified whole-row references are not supported yet",
+        ));
+    };
+    let ident = qualifier
+        .as_ident()
+        .ok_or_else(|| BindError::feature_not_supported("whole-row reference on an expression"))?;
+    // PG's cursor for `missing FROM-clause entry` sits under the qualifier, not
+    // the star, so the span comes from the name rather than from the star's own
+    // token — which the function-argument path does not carry anyway.
+    scope
+        .whole_row(&normalize_ident(ident))
+        .map_err(|e| e.at_if_unset(name.span()))
 }
 
 /// Bind an `ARRAY[...]` constructor. Elements are bound and unified to a common

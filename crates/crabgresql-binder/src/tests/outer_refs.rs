@@ -289,8 +289,7 @@ fn lateral_into_another_comma_group_is_an_honest_gap() -> anyhow::Result<()> {
         assert_eq!(error.code, "0A000", "for `{sql}`");
         assert_eq!(
             error.message,
-            "LATERAL reference to \"t\" from another comma-separated FROM item is not \
-             supported yet",
+            "LATERAL reference to \"t\" from outside this join chain is not supported yet",
             "for `{sql}`"
         );
     }

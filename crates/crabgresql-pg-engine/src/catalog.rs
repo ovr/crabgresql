@@ -140,6 +140,13 @@ const IKEY_MAGIC: &[u8; 4] = b"IKV1";
 /// the number has to exist for `pg_class.relfilenode`, and a database written
 /// before this tail would otherwise report `0` for a sequence forever.
 const SQREL_MAGIC: &[u8; 4] = b"SQR1";
+/// Marks the ownership section, appended after the [`SQREL_MAGIC`] block — an
+/// eighteenth backward-compatible tail carrying the role that created each
+/// schema, relation, view and sequence, in the same order the [`NSP_MAGIC`]
+/// block writes them. A reader that predates it stops above and leaves every
+/// owner empty, which the catalog reads as the database owner — exactly what
+/// every object reported before ownership was recorded at all.
+const OWN_MAGIC: &[u8; 4] = b"OWN1";
 struct PersistCol {
     name: String,
     oid: u32,
@@ -192,6 +199,9 @@ struct PersistRel {
     name: String,
     namespace: String,
     rel: u32,
+    /// The role that ran the `CREATE`, persisted in the [`OWN_MAGIC`] tail.
+    /// Empty for a relation written before it existed.
+    owner: String,
     cols: Vec<PersistCol>,
     indexes: Vec<PersistIndex>,
     /// How the relation is stored. A `Temporary` table is held in the in-memory
@@ -247,6 +257,8 @@ struct PersistView {
     name: String,
     namespace: String,
     sql: String,
+    /// See [`PersistRel::owner`].
+    owner: String,
     cols: Vec<PersistCol>,
     depends_on: Vec<String>,
 }
@@ -259,6 +271,8 @@ struct PersistView {
 struct PersistSequence {
     name: String,
     namespace: String,
+    /// See [`PersistRel::owner`].
+    owner: String,
     /// The sequence's relfilenode, persisted in the [`SQREL_MAGIC`] tail.
     ///
     /// It names no file — the counter above *is* the sequence's storage — but
@@ -285,9 +299,10 @@ struct State {
     rels: Vec<PersistRel>,
     views: Vec<PersistView>,
     sequences: Vec<PersistSequence>,
-    /// User-created schemas (`CREATE SCHEMA`), name → OID. Built-in namespaces
-    /// are not tracked here.
-    schemas: Vec<(String, u32)>,
+    /// User-created schemas (`CREATE SCHEMA`) as `(name, oid, owner)`. Built-in
+    /// namespaces are not tracked here. The owner is persisted in the
+    /// [`OWN_MAGIC`] tail and is empty for a schema written before it existed.
+    schemas: Vec<(String, u32, String)>,
     /// Next OID for a `CREATE SCHEMA`. Monotonic — never reused after a drop.
     next_nsp: u32,
 }
@@ -413,8 +428,9 @@ impl RelCatalog {
     }
 
     /// Allocate a fresh relfilenode for `schema`, persist the catalog, and return
-    /// the new node. The table's namespace rides on `schema.namespace`.
-    pub fn create(&self, schema: &TableSchema) -> std::io::Result<RelFileNode> {
+    /// the new node. The table's namespace rides on `schema.namespace`; `owner`
+    /// is the role that ran the DDL, empty when the caller has none to name.
+    pub fn create(&self, schema: &TableSchema, owner: &str) -> std::io::Result<RelFileNode> {
         let mut state = self
             .state
             .lock()
@@ -424,6 +440,7 @@ impl RelCatalog {
         state.rels.push(PersistRel {
             name: schema.name.clone(),
             namespace: schema.namespace.clone(),
+            owner: owner.to_string(),
             rel,
             cols: schema
                 .columns
@@ -486,17 +503,19 @@ impl RelCatalog {
     /// Register a user schema, returning the OID allocated for it, or
     /// `SchemaAlreadyExists`-shaped `None` when it already exists (caller maps
     /// the error). Persisted immediately.
-    pub fn create_schema(&self, name: &str) -> std::io::Result<Option<u32>> {
+    pub fn create_schema(&self, name: &str, owner: &str) -> std::io::Result<Option<u32>> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        if state.schemas.iter().any(|(n, _)| n == name) {
+        if state.schemas.iter().any(|(n, ..)| n == name) {
             return Ok(None);
         }
         let oid = state.next_nsp;
         state.next_nsp += 1;
-        state.schemas.push((name.to_string(), oid));
+        state
+            .schemas
+            .push((name.to_string(), oid, owner.to_string()));
         self.persist(&state)?;
         Ok(Some(oid))
     }
@@ -507,7 +526,7 @@ impl RelCatalog {
             .state
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"));
-        let Some(pos) = state.schemas.iter().position(|(n, _)| n == name) else {
+        let Some(pos) = state.schemas.iter().position(|(n, ..)| n == name) else {
             return Ok(false);
         };
         state.schemas.remove(pos);
@@ -521,7 +540,35 @@ impl RelCatalog {
             .lock()
             .unwrap_or_else(|_| panic!("mutex poisoned"))
             .schemas
-            .clone()
+            .iter()
+            .map(|(name, oid, _)| (name.clone(), *oid))
+            .collect()
+    }
+
+    /// The role that created the relation `namespace.name`, or `None` when the
+    /// relation is unknown or predates the [`OWN_MAGIC`] tail.
+    pub fn relation_owner(&self, namespace: &str, name: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .rels
+            .iter()
+            .find(|r| r.namespace == namespace && r.name == name)
+            .map(|r| r.owner.clone())
+            .filter(|owner| !owner.is_empty())
+    }
+
+    /// The role that created the user schema `name`, or `None` when the schema
+    /// is unknown or predates the [`OWN_MAGIC`] tail.
+    pub fn schema_owner(&self, name: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|_| panic!("mutex poisoned"))
+            .schemas
+            .iter()
+            .find(|(n, ..)| n == name)
+            .map(|(_, _, owner)| owner.clone())
+            .filter(|owner| !owner.is_empty())
     }
 
     /// Allocate a fresh relfilenode WITHOUT persisting the catalog. Used by a
@@ -1054,6 +1101,7 @@ impl RelCatalog {
         state.views.push(PersistView {
             name: def.name.clone(),
             namespace: def.namespace.clone(),
+            owner: def.owner.clone().unwrap_or_default(),
             sql: def.sql.clone(),
             cols: def
                 .columns
@@ -1151,6 +1199,7 @@ impl RelCatalog {
         state.sequences.push(PersistSequence {
             name: def.name.clone(),
             namespace: def.namespace.clone(),
+            owner: def.owner.clone().unwrap_or_default(),
             rel,
             type_oid: def.data_type.oid(),
             start: def.start,
@@ -1430,7 +1479,7 @@ fn encode(state: &State) -> Vec<u8> {
     out.extend_from_slice(NSP_MAGIC);
     out.extend_from_slice(&state.next_nsp.to_le_bytes());
     out.extend_from_slice(&(state.schemas.len() as u32).to_le_bytes());
-    for (name, oid) in &state.schemas {
+    for (name, oid, _) in &state.schemas {
         put_str(&mut out, name);
         out.extend_from_slice(&oid.to_le_bytes());
     }
@@ -1633,6 +1682,26 @@ fn encode(state: &State) -> Vec<u8> {
     for s in &state.sequences {
         out.extend_from_slice(&s.rel.to_le_bytes());
     }
+    // Ownership: an eighteenth backward-compatible tail, one role name per
+    // schema, relation, view and sequence — the same four runs the `NSP1` block
+    // writes namespaces for, in the same order, so a reader zips them back on.
+    out.extend_from_slice(OWN_MAGIC);
+    out.extend_from_slice(&(state.schemas.len() as u32).to_le_bytes());
+    for (_, _, owner) in &state.schemas {
+        put_str(&mut out, owner);
+    }
+    out.extend_from_slice(&(rels.len() as u32).to_le_bytes());
+    for r in &rels {
+        put_str(&mut out, &r.owner);
+    }
+    out.extend_from_slice(&(state.views.len() as u32).to_le_bytes());
+    for v in &state.views {
+        put_str(&mut out, &v.owner);
+    }
+    out.extend_from_slice(&(state.sequences.len() as u32).to_le_bytes());
+    for s in &state.sequences {
+        put_str(&mut out, &s.owner);
+    }
     out
 }
 
@@ -1802,6 +1871,8 @@ fn decode(bytes: &[u8]) -> State {
             name,
             // Default to `public`; overridden below from the NSP1 tail when present.
             namespace: "public".to_string(),
+            // Overridden below from the OWN1 tail when present.
+            owner: String::new(),
             rel,
             cols,
             indexes: Vec::new(),
@@ -1912,6 +1983,7 @@ fn decode(bytes: &[u8]) -> State {
             views.push(PersistView {
                 name,
                 namespace: "public".to_string(),
+                owner: String::new(),
                 sql,
                 cols,
                 depends_on,
@@ -1937,6 +2009,7 @@ fn decode(bytes: &[u8]) -> State {
             sequences.push(PersistSequence {
                 name,
                 namespace: "public".to_string(),
+                owner: String::new(),
                 type_oid,
                 start,
                 increment,
@@ -1955,7 +2028,7 @@ fn decode(bytes: &[u8]) -> State {
     }
     // Namespace tail: the user schema registry and each object's namespace,
     // overriding the `public` defaults set above. Absent in a pre-schema file.
-    let mut schemas = Vec::new();
+    let mut schemas: Vec<(String, u32, String)> = Vec::new();
     let mut next_nsp = FIRST_NORMAL_OBJECT_ID;
     if d.remaining().starts_with(NSP_MAGIC) {
         d.p += NSP_MAGIC.len();
@@ -1964,7 +2037,7 @@ fn decode(bytes: &[u8]) -> State {
         for _ in 0..nschemas {
             let name = d.s();
             let oid = d.u32();
-            schemas.push((name, oid));
+            schemas.push((name, oid, String::new()));
         }
         let nrels = d.u32();
         for r in rels.iter_mut().take(nrels as usize) {
@@ -2209,6 +2282,27 @@ fn decode(bytes: &[u8]) -> State {
             s.rel = d.u32();
         }
     }
+    // Ownership tail: absent means nothing recorded an owner, so every object
+    // keeps the empty string the catalog reads as the database owner.
+    if d.remaining().starts_with(OWN_MAGIC) {
+        d.p += OWN_MAGIC.len();
+        let nschemas = d.u32();
+        for schema in schemas.iter_mut().take(nschemas as usize) {
+            schema.2 = d.s();
+        }
+        let nrels = d.u32();
+        for r in rels.iter_mut().take(nrels as usize) {
+            r.owner = d.s();
+        }
+        let nviews = d.u32();
+        for v in views.iter_mut().take(nviews as usize) {
+            v.owner = d.s();
+        }
+        let nseqs = d.u32();
+        for s in sequences.iter_mut().take(nseqs as usize) {
+            s.owner = d.s();
+        }
+    }
     State {
         next,
         rels,
@@ -2232,6 +2326,7 @@ fn persist_sequence_to_definition(s: &PersistSequence) -> SequenceDefinition {
         cache: s.cache,
         cycle: s.cycle,
         owned_by: s.owned_by.clone(),
+        owner: Some(s.owner.clone()).filter(|o| !o.is_empty()),
     }
 }
 
@@ -2253,6 +2348,7 @@ fn persist_view_to_definition(v: &PersistView) -> ViewDefinition {
             })
             .collect(),
         depends_on: v.depends_on.clone(),
+        owner: Some(v.owner.clone()).filter(|o| !o.is_empty()),
     }
 }
 
@@ -2277,7 +2373,7 @@ mod tests {
         let mut id = Column::new("id", PgType::Int4);
         id.nullable = false;
         id.default = Some("1 + 2".to_string());
-        catalog.create(&TableSchema::new("t", vec![id]))?;
+        catalog.create(&TableSchema::new("t", vec![id]), "")?;
         let index_rel = catalog.alloc_relfilenode();
         catalog.add_index_in(
             "public",
@@ -2343,10 +2439,10 @@ mod tests {
             kind: Generation::Virtual,
             expr: "(a + 1)".to_string(),
         });
-        catalog.create(&TableSchema::new(
-            "t",
-            vec![Column::new("a", PgType::Int4), stored, virt],
-        ))?;
+        catalog.create(
+            &TableSchema::new("t", vec![Column::new("a", PgType::Int4), stored, virt]),
+            "",
+        )?;
         drop(catalog);
 
         let loaded = RelCatalog::load(dir.path())?;
@@ -2396,14 +2492,17 @@ mod tests {
     fn set_column_not_null_persists_and_is_addressed_by_position() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new(
-            "t",
-            vec![
-                Column::new("a", PgType::Int4),
-                Column::new("b", PgType::Int4),
-                Column::new("c", PgType::Int4),
-            ],
-        ))?;
+        catalog.create(
+            &TableSchema::new(
+                "t",
+                vec![
+                    Column::new("a", PgType::Int4),
+                    Column::new("b", PgType::Int4),
+                    Column::new("c", PgType::Int4),
+                ],
+            ),
+            "",
+        )?;
         catalog.set_column_not_null("public", "t", &[0, 2])?;
         drop(catalog);
 
@@ -2437,10 +2536,10 @@ mod tests {
         let catalog = RelCatalog::load(dir.path())?;
         let mut schema = TableSchema::new("events", vec![Column::new("id", PgType::Int4)]);
         schema.access_method = TableAccessMethod::Parquet;
-        catalog.create(&schema)?;
+        catalog.create(&schema, "")?;
         let mut buffered = TableSchema::new("staging", vec![Column::new("id", PgType::Int4)]);
         buffered.access_method = TableAccessMethod::Buffer;
-        catalog.create(&buffered)?;
+        catalog.create(&buffered, "")?;
         drop(catalog);
 
         let loaded = RelCatalog::load(dir.path())?;
@@ -2493,7 +2592,7 @@ mod tests {
                 Column::new("b", PgType::Int4),
             ],
         );
-        catalog.create(&schema)?;
+        catalog.create(&schema, "")?;
         let index = |name: &str, descending: bool| IndexMetadata {
             name: name.into(),
             method: IndexMethod::BTree,
@@ -2564,7 +2663,10 @@ mod tests {
     fn a_metadata_only_index_has_no_filenode() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new("t", vec![Column::new("a", PgType::Int4)]))?;
+        catalog.create(
+            &TableSchema::new("t", vec![Column::new("a", PgType::Int4)]),
+            "",
+        )?;
         catalog.add_index_in(
             "public",
             "t",
@@ -2628,11 +2730,11 @@ mod tests {
                 nulls_first: true,
             },
         ];
-        catalog.create(&schema)?;
-        catalog.create(&TableSchema::new(
-            "plain",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        catalog.create(&schema, "")?;
+        catalog.create(
+            &TableSchema::new("plain", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         drop(catalog);
 
         let loaded = RelCatalog::load(dir.path())?;
@@ -2701,11 +2803,11 @@ mod tests {
                 inhcount: 0,
             },
         ];
-        catalog.create(&schema)?;
-        catalog.create(&TableSchema::new(
-            "plain",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        catalog.create(&schema, "")?;
+        catalog.create(
+            &TableSchema::new("plain", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         drop(catalog);
 
         let loaded = RelCatalog::load(dir.path())?;
@@ -2746,14 +2848,14 @@ mod tests {
     {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new(
-            "wide",
-            vec![Column::new("body", PgType::Text)],
-        ))?;
-        catalog.create(&TableSchema::new(
-            "narrow",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        catalog.create(
+            &TableSchema::new("wide", vec![Column::new("body", PgType::Text)]),
+            "",
+        )?;
+        catalog.create(
+            &TableSchema::new("narrow", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         catalog.set_toast_rel("public", "wide", RelFileNode(77))?;
         drop(catalog);
 
@@ -2802,10 +2904,10 @@ mod tests {
     -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new(
-            "t",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        catalog.create(
+            &TableSchema::new("t", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         let index_rel = catalog.alloc_relfilenode();
         catalog.add_index_in(
             "public",
@@ -2846,10 +2948,10 @@ mod tests {
         // A pre-B-tree catalog (truncated at the IXR1 marker) keeps the index
         // metadata but decodes it as metadata-only (rel == 0).
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new(
-            "u",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        catalog.create(
+            &TableSchema::new("u", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         let u_index_rel = catalog.alloc_relfilenode();
         catalog.add_index_in(
             "public",
@@ -2893,16 +2995,17 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
         // A table plus two views, one depending on the other.
-        catalog.create(&TableSchema::new(
-            "t",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        catalog.create(
+            &TableSchema::new("t", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         assert!(catalog.create_view(&ViewDefinition {
             name: "v".to_string(),
             namespace: "public".to_string(),
             sql: "SELECT id FROM t".to_string(),
             columns: vec![Column::new("id", PgType::Int4)],
             depends_on: vec!["t".to_string()],
+            owner: None,
         })?);
         assert!(catalog.create_view(&ViewDefinition {
             name: "w".to_string(),
@@ -2910,6 +3013,7 @@ mod tests {
             sql: "SELECT id FROM v".to_string(),
             columns: vec![Column::with_typmod("id", PgType::Int4, -1)],
             depends_on: vec!["v".to_string()],
+            owner: None,
         })?);
         // A duplicate is rejected without persisting.
         assert!(!catalog.create_view(&ViewDefinition {
@@ -2918,6 +3022,7 @@ mod tests {
             sql: "SELECT 1".to_string(),
             columns: vec![Column::new("x", PgType::Int4)],
             depends_on: Vec::new(),
+            owner: None,
         })?);
         drop(catalog);
 
@@ -2969,6 +3074,7 @@ mod tests {
             cache: 1,
             cycle: false,
             owned_by: None,
+            owner: None,
         }
     }
 
@@ -3023,10 +3129,10 @@ mod tests {
         // A pre-sequence catalog file (truncated at the sequence marker) still
         // loads, with no sequences.
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new(
-            "t",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        catalog.create(
+            &TableSchema::new("t", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         catalog.create_sequence(&seq("s2"))?;
         drop(catalog);
         let path = dir.path().join(CATALOG_SUBDIR).join(CATALOG_FILE);
@@ -3059,7 +3165,7 @@ mod tests {
             strategy: PartitionStrategy::Range,
             key_columns: vec![1],
         });
-        catalog.create(&parent)?;
+        catalog.create(&parent, "")?;
         let mut child = TableSchema::new(
             "m_2024",
             vec![
@@ -3077,7 +3183,7 @@ mod tests {
                 to: vec![PartitionBoundDatum::MaxValue],
             },
         });
-        catalog.create(&child)?;
+        catalog.create(&child, "")?;
         drop(catalog);
 
         // Reload: both the parent's key and the child's parent link + bound survive.
@@ -3137,15 +3243,14 @@ mod tests {
         let catalog = RelCatalog::load(dir.path())?;
         // Two roots and a child of both, so the *order* of the parent list — the
         // thing `inhseqno` is derived from — has something to be wrong about.
-        catalog.create(&TableSchema::new(
-            "person",
-            vec![Column::new("name", PgType::Text)],
-        ))?;
-        catalog.create(&TableSchema::in_namespace(
-            "student",
-            "app",
-            vec![Column::new("gpa", PgType::Float8)],
-        ))?;
+        catalog.create(
+            &TableSchema::new("person", vec![Column::new("name", PgType::Text)]),
+            "",
+        )?;
+        catalog.create(
+            &TableSchema::in_namespace("student", "app", vec![Column::new("gpa", PgType::Float8)]),
+            "",
+        )?;
         let mut child = TableSchema::new(
             "stud_emp",
             vec![
@@ -3163,7 +3268,7 @@ mod tests {
                 name: "student".to_string(),
             },
         ];
-        catalog.create(&child)?;
+        catalog.create(&child, "")?;
         drop(catalog);
 
         let loaded = RelCatalog::load(dir.path())?;
@@ -3210,19 +3315,18 @@ mod tests {
         let catalog = RelCatalog::load(dir.path())?;
         // A user schema plus a table in it and one in `public`.
         let app_oid = catalog
-            .create_schema("app")?
+            .create_schema("app", "")?
             .ok_or_else(|| anyhow::anyhow!("create_schema returned None"))?;
         // A duplicate schema is rejected without persisting.
-        assert!(catalog.create_schema("app")?.is_none());
-        catalog.create(&TableSchema::in_namespace(
-            "item",
-            "app",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
-        catalog.create(&TableSchema::new(
-            "item",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        assert!(catalog.create_schema("app", "")?.is_none());
+        catalog.create(
+            &TableSchema::in_namespace("item", "app", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
+        catalog.create(
+            &TableSchema::new("item", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         drop(catalog);
 
         // Reload: the schema, its OID, and each table's namespace all survive.
@@ -3247,7 +3351,7 @@ mod tests {
         assert!(loaded.remove_schema("app")?);
         assert!(!loaded.remove_schema("app")?);
         let next_oid = loaded
-            .create_schema("app2")?
+            .create_schema("app2", "")?
             .ok_or_else(|| anyhow::anyhow!("create_schema returned None"))?;
         assert!(next_oid > app_oid);
         drop(loaded);
@@ -3278,14 +3382,14 @@ mod tests {
     {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new(
-            "t",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
-        catalog.create(&TableSchema::new(
-            "untouched",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        catalog.create(
+            &TableSchema::new("t", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
+        catalog.create(
+            &TableSchema::new("untouched", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         // A fresh relation has never been analyzed.
         assert!(catalog.stats_in("public", "t").is_none());
         // A fractional row count exercises the float encoding: a sampled
@@ -3325,14 +3429,14 @@ mod tests {
     fn a_relfilenode_swap_clears_the_persisted_statistics() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new(
-            "t",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
-        catalog.create(&TableSchema::new(
-            "other",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        catalog.create(
+            &TableSchema::new("t", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
+        catalog.create(
+            &TableSchema::new("other", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         assert!(catalog.set_stats("public", "t", &measured(17, 1234.0))?);
         assert!(catalog.set_stats("public", "other", &measured(3, 9.0))?);
 
@@ -3362,10 +3466,10 @@ mod tests {
     {
         let dir = tempfile::tempdir()?;
         let catalog = RelCatalog::load(dir.path())?;
-        catalog.create(&TableSchema::new(
-            "t",
-            vec![Column::new("id", PgType::Int4)],
-        ))?;
+        catalog.create(
+            &TableSchema::new("t", vec![Column::new("id", PgType::Int4)]),
+            "",
+        )?;
         assert!(catalog.create_sequence(&sequence("s1"))?);
         assert!(catalog.create_sequence(&sequence("s2"))?);
 
@@ -3429,6 +3533,7 @@ mod tests {
             cache: 1,
             cycle: false,
             owned_by: None,
+            owner: None,
         }
     }
 

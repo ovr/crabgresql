@@ -152,6 +152,11 @@ pub trait CatalogOps: Send + Sync {
     /// Whether the relation `oid` identifies is reachable by an unqualified
     /// name, or `None` if there is no such relation.
     fn table_is_visible(&self, oid: u32) -> Option<bool>;
+    /// Which writes relation `oid` accepts, as `pg_relation_is_updatable`'s
+    /// bitmask — INSERT 8, UPDATE 4, DELETE 16. Zero both for a relation nothing
+    /// can write and for an OID naming nothing, which is why this is not an
+    /// `Option`: neither of those is NULL at the SQL surface.
+    fn relation_updatable(&self, oid: u32) -> i32;
     /// The `(namespace, name)` of the relation `oid` identifies, or `None` if
     /// there is no such relation. Backs `regclass` output and the `regclass`
     /// spelling of the sequence functions.
@@ -1433,6 +1438,7 @@ fn resolve_expr(
             resolve_exprs(args, ctx, txn)?;
         }
         BoundExpr::ArrayCtor { elems, .. } => resolve_exprs(elems, ctx, txn)?,
+        BoundExpr::WholeRow { fields, .. } => resolve_exprs(fields, ctx, txn)?,
         BoundExpr::Subscript { base, indexes, .. } => {
             resolve_expr(base, ctx, txn)?;
             resolve_exprs(indexes, ctx, txn)?;

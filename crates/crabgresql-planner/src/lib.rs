@@ -1902,7 +1902,8 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
         // An outer (correlated) reference is only a `Const` after `substitute_outer`
         // rewrites it per outer row; unresolved here it must not be hoisted as a
         // once-evaluated index key.
-        BoundExpr::ColumnRef { .. }
+        BoundExpr::WholeRow { .. }
+        | BoundExpr::ColumnRef { .. }
         | BoundExpr::Param { .. }
         | BoundExpr::OuterColumnRef { .. }
         | BoundExpr::FuncCall { .. }

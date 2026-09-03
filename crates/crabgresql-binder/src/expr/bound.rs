@@ -268,6 +268,23 @@ pub enum BoundExpr {
         ty: PgType,
         elems: Vec<BoundExpr>,
     },
+    /// A whole-row reference (`t.*`) in expression position: the row of `t` as
+    /// one composite value, [`PgType::Record`].
+    ///
+    /// The fields are held as ordinary child expressions — one `ColumnRef` per
+    /// column of the relation — rather than as a list of row indices, so every
+    /// walker that already knows how to find a column reference finds these
+    /// too: projection pushdown keeps their columns, decorrelation sees them,
+    /// and a whole-row reference to an *outer* relation rewrites into
+    /// `OuterColumnRef`s with no arm of its own.
+    ///
+    /// `names` pairs positionally with `fields` and travels into
+    /// [`crabgresql_types::RecordVal`], which is what lets a function read a
+    /// field by name.
+    WholeRow {
+        names: std::sync::Arc<[String]>,
+        fields: Vec<BoundExpr>,
+    },
     /// Array element access (`a[i]`, `a[i][j]`). `base` is an array expression
     /// and `indexes` holds one int4 per subscript written; the result type `ty`
     /// is the element type. A NULL or out-of-range subscript yields NULL (PG
@@ -714,6 +731,7 @@ impl BoundExpr {
             BoundExpr::CoerceToDomain { domain, .. } => PgType::User(domain.oid),
             BoundExpr::FuncCall { ret, .. } | BoundExpr::Routine { ret, .. } => *ret,
             BoundExpr::ArrayCtor { ty, .. } => *ty,
+            BoundExpr::WholeRow { .. } => PgType::Record,
             BoundExpr::Subscript { ty, .. } => *ty,
             BoundExpr::Case { ty, .. } => *ty,
             BoundExpr::Coalesce { ty, .. } | BoundExpr::MinMax { ty, .. } => *ty,
@@ -756,6 +774,7 @@ impl BoundExpr {
                     || spec.exprs().any(BoundExpr::contains_srf)
             }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_srf),
+            BoundExpr::WholeRow { fields, .. } => fields.iter().any(BoundExpr::contains_srf),
             BoundExpr::Subscript { base, indexes, .. } => {
                 base.contains_srf() || indexes.iter().any(BoundExpr::contains_srf)
             }
@@ -814,6 +833,7 @@ impl BoundExpr {
                 kind.args().iter().any(any) || spec.exprs().any(any)
             }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(any),
+            BoundExpr::WholeRow { fields, .. } => fields.iter().any(any),
             BoundExpr::Subscript { base, indexes, .. } => any(base) || indexes.iter().any(any),
             BoundExpr::Case { whens, else_, .. } => {
                 whens
@@ -868,6 +888,7 @@ impl BoundExpr {
             | BoundExpr::Coalesce { args, .. }
             | BoundExpr::MinMax { args, .. } => args.iter().any(BoundExpr::contains_aggregate),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_aggregate),
+            BoundExpr::WholeRow { fields, .. } => fields.iter().any(BoundExpr::contains_aggregate),
             BoundExpr::Subscript { base, indexes, .. } => {
                 base.contains_aggregate() || indexes.iter().any(BoundExpr::contains_aggregate)
             }
@@ -938,6 +959,7 @@ impl BoundExpr {
                 agg_args, order_by, ..
             } => Self::agg_exprs(agg_args, order_by).any(BoundExpr::contains_window),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_window),
+            BoundExpr::WholeRow { fields, .. } => fields.iter().any(BoundExpr::contains_window),
             BoundExpr::Subscript { base, indexes, .. } => {
                 base.contains_window() || indexes.iter().any(BoundExpr::contains_window)
             }
@@ -995,6 +1017,7 @@ impl BoundExpr {
             | BoundExpr::Coalesce { args, .. }
             | BoundExpr::MinMax { args, .. } => first(args),
             BoundExpr::ArrayCtor { elems, .. } => first(elems),
+            BoundExpr::WholeRow { fields, .. } => first(fields),
             BoundExpr::Subscript { base, indexes, .. } => {
                 base.first_agg_or_window().or_else(|| first(indexes))
             }
@@ -1085,6 +1108,9 @@ impl BoundExpr {
                     || spec.exprs().any(BoundExpr::contains_volatile_fn)
             }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_volatile_fn),
+            BoundExpr::WholeRow { fields, .. } => {
+                fields.iter().any(BoundExpr::contains_volatile_fn)
+            }
             BoundExpr::Subscript { base, indexes, .. } => {
                 base.contains_volatile_fn() || indexes.iter().any(BoundExpr::contains_volatile_fn)
             }
@@ -1161,6 +1187,7 @@ impl BoundExpr {
                     || spec.exprs().any(BoundExpr::contains_subquery)
             }
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(BoundExpr::contains_subquery),
+            BoundExpr::WholeRow { fields, .. } => fields.iter().any(BoundExpr::contains_subquery),
             BoundExpr::Subscript { base, indexes, .. } => {
                 base.contains_subquery() || indexes.iter().any(BoundExpr::contains_subquery)
             }
@@ -1204,6 +1231,9 @@ impl BoundExpr {
             | BoundExpr::Srf { args, .. } => args.iter().map(|a| a.count_param_refs(index)).sum(),
             BoundExpr::ArrayCtor { elems, .. } => {
                 elems.iter().map(|a| a.count_param_refs(index)).sum()
+            }
+            BoundExpr::WholeRow { fields, .. } => {
+                fields.iter().map(|f| f.count_param_refs(index)).sum()
             }
             BoundExpr::Subscript { base, indexes, .. } => {
                 base.count_param_refs(index)
@@ -1282,6 +1312,7 @@ impl BoundExpr {
                     args.iter().for_each(|a| fold(a, acc));
                 }
                 BoundExpr::ArrayCtor { elems, .. } => elems.iter().for_each(|a| fold(a, acc)),
+                BoundExpr::WholeRow { fields, .. } => fields.iter().for_each(|f| fold(f, acc)),
                 BoundExpr::Subscript { base, indexes, .. } => {
                     fold(base, acc);
                     indexes.iter().for_each(|i| fold(i, acc));
@@ -1384,6 +1415,7 @@ impl BoundExpr {
                 agg_args, order_by, ..
             } => Self::agg_exprs(agg_args, order_by).all(|a| a.collect_column_refs(out)),
             BoundExpr::ArrayCtor { elems, .. } => Self::collect_all(elems, out),
+            BoundExpr::WholeRow { fields, .. } => Self::collect_all(fields, out),
             BoundExpr::Subscript { base, indexes, .. } => {
                 let mut complete = base.collect_column_refs(out);
                 for i in indexes {
@@ -1510,6 +1542,9 @@ impl BoundExpr {
             }
             BoundExpr::ArrayCtor { elems, .. } => {
                 elems.iter_mut().for_each(|e| e.shift_column_refs(delta));
+            }
+            BoundExpr::WholeRow { fields, .. } => {
+                fields.iter_mut().for_each(|f| f.shift_column_refs(delta));
             }
             BoundExpr::Subscript { base, indexes, .. } => {
                 base.shift_column_refs(delta);

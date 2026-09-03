@@ -1,0 +1,103 @@
+--
+-- The four `information_schema` helpers its view definitions call
+-- `_pg_truetypid` / `_pg_truetypmod` over a pair of catalog rows, and the two
+-- updatability questions.
+--
+CREATE DOMAIN tt_dom AS varchar(7);
+CREATE TABLE tt (a int4, b varchar(10), c numeric(8,2), d tt_dom, e text);
+-- A column of a domain reports the *base* type and the domain's own modifier;
+-- everything else reports the column's own pair.
+SELECT at.attname,
+       information_schema._pg_truetypid(at.*, t.*) AS truetypid,
+       information_schema._pg_truetypmod(at.*, t.*) AS truetypmod
+  FROM pg_attribute at
+  JOIN pg_type t ON t.oid = at.atttypid
+  JOIN pg_class c ON c.oid = at.attrelid
+ WHERE c.relname = 'tt' AND at.attnum > 0
+ ORDER BY at.attnum;
+ attname | truetypid | truetypmod 
+---------+-----------+------------
+ a       |        23 |         -1
+ b       |      1043 |         14
+ c       |      1700 |     524294
+ d       |      1043 |         11
+ e       |        25 |         -1
+(5 rows)
+
+-- The pair feeds the seven type-shape helpers, which is the whole reason
+-- `information_schema.columns` calls it: the domain column reports varchar(7).
+SELECT at.attname,
+       information_schema._pg_char_max_length(
+         information_schema._pg_truetypid(at.*, t.*),
+         information_schema._pg_truetypmod(at.*, t.*)) AS char_max_length
+  FROM pg_attribute at
+  JOIN pg_type t ON t.oid = at.atttypid
+  JOIN pg_class c ON c.oid = at.attrelid
+ WHERE c.relname = 'tt' AND at.attnum > 0
+ ORDER BY at.attnum;
+ attname | char_max_length 
+---------+-----------------
+ a       |                
+ b       |              10
+ c       |                
+ d       |               7
+ e       |                
+(5 rows)
+
+DROP TABLE tt;
+DROP DOMAIN tt_dom;
+--
+-- pg_relation_is_updatable / pg_column_is_updatable
+--
+CREATE TABLE u1 (a int4, b int4);
+CREATE VIEW u1v AS SELECT a FROM u1;
+CREATE SEQUENCE u1s;
+CREATE TABLE u1p (a int4) PARTITION BY RANGE (a);
+-- Divergence: a view reports 0 where PostgreSQL reports 28 for a simple,
+-- automatically updatable one. Nothing here rewrites a write onto a view's base
+-- relation, so 28 would advertise an INSERT that then raises.
+--
+-- A base table answers `pg_column_is_updatable` for *any* column number,
+-- including one it does not have (`col9` on a two-column table) — probed on
+-- 18.4, where the column set is only consulted for a view.
+SELECT c.relname, c.relkind, pg_relation_is_updatable(c.oid, false) AS mask,
+       pg_column_is_updatable(c.oid, 1::smallint, false) AS col1,
+       pg_column_is_updatable(c.oid, 9::smallint, false) AS col9
+  FROM pg_class c WHERE c.relname LIKE 'u1%' ORDER BY 1;
+ relname | relkind | mask | col1 | col9 
+---------+---------+------+------+------
+ u1      | r       |   28 | t    | t
+ u1p     | p       |   28 | t    | t
+ u1s     | S       |    0 | f    | f
+ u1v     | v       |    0 | f    | f
+(4 rows)
+
+-- Zero and the negative system-column numbers are never updatable, whatever the
+-- relation says.
+SELECT pg_column_is_updatable('u1'::regclass, 0::smallint, false) AS at_zero,
+       pg_column_is_updatable('u1'::regclass, (-1)::smallint, false) AS at_system;
+ at_zero | at_system 
+---------+-----------
+ f       | f
+(1 row)
+
+-- An OID naming nothing is *zero*, not NULL; both functions are STRICT.
+SELECT pg_relation_is_updatable(0::oid, false) AS zero,
+       pg_relation_is_updatable(NULL, false) AS null_relation,
+       pg_relation_is_updatable('u1'::regclass, NULL) AS null_flag;
+ zero | null_relation | null_flag 
+------+---------------+-----------
+    0 |               |          
+(1 row)
+
+-- The relation argument is accepted in either spelling.
+SELECT pg_relation_is_updatable('u1', false) AS by_name;
+ by_name 
+---------
+      28
+(1 row)
+
+DROP VIEW u1v;
+DROP TABLE u1;
+DROP SEQUENCE u1s;
+DROP TABLE u1p;

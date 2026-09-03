@@ -116,6 +116,11 @@ fn fold_children(
                 changed |= fold(elem, fmt, on_subplan);
             }
         }
+        BoundExpr::WholeRow { fields, .. } => {
+            for field in fields {
+                changed |= fold(field, fmt, on_subplan);
+            }
+        }
         BoundExpr::Subscript { base, indexes, .. } => {
             changed |= fold(base, fmt, on_subplan);
             for i in indexes {
@@ -215,9 +220,14 @@ fn eval_const(expr: &BoundExpr, fmt: &FmtCtx) -> Option<Value> {
             left,
             right,
         } => eval_binary(*op, *arg_ty, *collation, left, right, fmt),
+        // Through the same row-wise helpers the executor uses, so a folded
+        // `IS NULL` over a composite cannot disagree with an evaluated one.
         BoundExpr::IsNull { expr, negated } => {
-            let is_null = matches!(eval_const(expr, fmt)?, Value::Null);
-            Some(Value::Bool(is_null != *negated))
+            let value = eval_const(expr, fmt)?;
+            Some(Value::Bool(match negated {
+                false => crabgresql_types::row_is_null(&value),
+                true => crabgresql_types::row_is_not_null(&value),
+            }))
         }
         BoundExpr::BoolTest {
             expr,
@@ -309,7 +319,8 @@ fn eval_const(expr: &BoundExpr, fmt: &FmtCtx) -> Option<Value> {
             }
             Some(best)
         }
-        BoundExpr::ColumnRef { .. }
+        BoundExpr::WholeRow { .. }
+        | BoundExpr::ColumnRef { .. }
         | BoundExpr::Param { .. }
         | BoundExpr::OuterColumnRef { .. }
         | BoundExpr::FuncCall { .. }

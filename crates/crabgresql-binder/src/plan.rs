@@ -625,6 +625,7 @@ fn subst_expr(expr: &mut BoundExpr, params: &[Value]) {
         | BoundExpr::Coalesce { args, .. }
         | BoundExpr::MinMax { args, .. } => subst_exprs(args, params),
         BoundExpr::ArrayCtor { elems, .. } => subst_exprs(elems, params),
+        BoundExpr::WholeRow { fields, .. } => subst_exprs(fields, params),
         BoundExpr::Subscript { base, indexes, .. } => {
             subst_expr(base, params);
             for i in indexes {
@@ -986,6 +987,11 @@ fn subst_outer_expr(expr: &mut BoundExpr, outer: &[Value], depth: usize) {
         BoundExpr::ArrayCtor { elems, .. } => {
             for a in elems.iter_mut() {
                 subst_outer_expr(a, outer, depth);
+            }
+        }
+        BoundExpr::WholeRow { fields, .. } => {
+            for f in fields.iter_mut() {
+                subst_outer_expr(f, outer, depth);
             }
         }
         BoundExpr::Subscript { base, indexes, .. } => {
@@ -1428,6 +1434,9 @@ pub(crate) fn for_each_subexpr(
         }
         BoundExpr::ArrayCtor { elems, .. } => {
             elems.iter().for_each(|e| for_each_subexpr(e, depth, f));
+        }
+        BoundExpr::WholeRow { fields, .. } => {
+            fields.iter().for_each(|e| for_each_subexpr(e, depth, f));
         }
         BoundExpr::Subscript { base, indexes, .. } => {
             for_each_subexpr(base, depth, f);
@@ -2791,7 +2800,7 @@ struct BoundFromItem {
 ///
 /// A leftmost FROM item gets [`Preceding::none`]: nothing precedes it, so
 /// `LATERAL` on it is legal and inert.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct Preceding<'a> {
     reachable: &'a [ScopeItem],
     visible: Option<&'a [VisibleColumn]>,
@@ -2999,6 +3008,41 @@ impl Drop for ViewExpansionGuard {
     }
 }
 
+/// Parsed view bodies, keyed on the **SQL text**.
+///
+/// Keyed on the text rather than on the view's name so `CREATE OR REPLACE VIEW`
+/// invalidates the entry by construction: a replaced body is a different key,
+/// and the stale one is simply never looked up again.
+///
+/// The cache exists because a system view is expanded on every statement that
+/// names it, and its definition is large — `information_schema.columns` is a
+/// six-way nested join over sixty projected columns. Re-parsing that per
+/// statement is the same cost the catalog's own build-per-resolve once was,
+/// which measured 2.1 s against 0.03 s.
+static PARSED_VIEW_BODIES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, Arc<Vec<ast::Statement>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// How many bodies [`PARSED_VIEW_BODIES`] keeps. A process serves a fixed
+/// handful of system views plus whatever a session creates, so this is a
+/// backstop against a generator emitting endless one-off `CREATE OR REPLACE
+/// VIEW` texts, not a working-set estimate — which is why reaching it may
+/// simply clear the map: rebuilding costs one re-parse per view still in play.
+const MAX_PARSED_VIEW_BODIES: usize = 512;
+
+fn parse_view_body(sql: &str) -> Result<Arc<Vec<ast::Statement>>, crabgresql_parser::ParseError> {
+    let mut cache = PARSED_VIEW_BODIES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(parsed) = cache.get(sql) {
+        return Ok(Arc::clone(parsed));
+    }
+    let parsed = Arc::new(crabgresql_parser::parse(sql)?);
+    if cache.len() >= MAX_PARSED_VIEW_BODIES {
+        cache.clear();
+    }
+    cache.insert(sql.to_string(), Arc::clone(&parsed));
+    Ok(parsed)
+}
+
 /// Bind a stored view's query into a logical plan. The SQL text is re-parsed and
 /// bound in a fresh scope (no outer CTEs, no outer `$n` parameters — a view body
 /// references neither). A parse/shape failure is an internal invariant violation
@@ -3014,7 +3058,7 @@ fn bind_view_query(
     view: &ViewDefinition,
 ) -> Result<LogicalPlan, BindError> {
     let _guard = ViewExpansionGuard::enter(params, view)?;
-    let stmts = crabgresql_parser::parse(&view.sql).map_err(|e| {
+    let stmts = parse_view_body(&view.sql).map_err(|e| {
         BindError::new(
             sqlstate::INTERNAL_ERROR,
             format!(
@@ -3643,8 +3687,11 @@ fn bind_from_clause(
             ctes,
             outer_scope,
             windows,
-            &relations,
-            visible.as_deref(),
+            &Preceding {
+                reachable: &relations,
+                visible: visible.as_deref(),
+                ..Preceding::none()
+            },
             demand,
         )?;
         for rel in &group_relations {
@@ -3691,6 +3738,94 @@ fn shift_visible(mut col: VisibleColumn, delta: usize) -> VisibleColumn {
     col
 }
 
+/// The visible columns a join's *right* factor contributes, laid out from `base`
+/// in the enclosing chain's combined row.
+///
+/// A parenthesised factor carries its own merged `USING`/`NATURAL` view, in
+/// which a join column appears **once**; every other factor has none and gets
+/// the plain one-`ColumnRef`-per-column layout. Going through
+/// [`default_visible`] unconditionally would republish both physical copies of
+/// an inner merged column — which `SELECT *` would show twice and
+/// [`lookup_join_column`] would call ambiguous.
+fn right_view(
+    right: &BoundFrom,
+    base: usize,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Vec<VisibleColumn>, BindError> {
+    match &right.visible {
+        Some(view) => Ok(view
+            .iter()
+            .cloned()
+            .map(|col| shift_visible(col, base))
+            .collect()),
+        None => default_visible(&right.relations, base, catalog),
+    }
+}
+
+/// One FROM factor as a whole [`BoundFrom`] — a single relation for most of
+/// them, a subtree for a **parenthesised join**.
+///
+/// The SQL standard lets a join expression be nested in parentheses, and
+/// `pg_get_viewdef` prints every join that way, so `information_schema.columns`
+/// arrives as six levels of `((((((a LEFT JOIN … ) JOIN (c JOIN nc ON …) ON …)`.
+/// Returning a `BoundFrom` rather than a single [`BoundFromItem`] is what makes
+/// the nesting cost nothing: an inner group's relations and join tree join the
+/// enclosing chain exactly as one relation's do.
+///
+/// The inner group's own join predicates index its own combined row, base 0 —
+/// which is right, because the enclosing chain puts that whole subtree in as one
+/// join input. Only the *enclosing* chain's predicates count across the boundary,
+/// and those are bound against `bound.relations` after the subtree is folded in.
+#[allow(clippy::too_many_arguments)]
+fn bind_from_factor(
+    engine: &Arc<dyn TableEngine>,
+    catalog: &Arc<dyn TypeCatalog>,
+    params: &ParamCtx,
+    factor: &ast::TableFactor,
+    ctes: &CteEnv,
+    preceding: &Preceding<'_>,
+    outer_scope: &[OuterLevel],
+    windows: &NamedWindows,
+    demand: &SystemDemand,
+) -> Result<BoundFrom, BindError> {
+    let ast::TableFactor::NestedJoin {
+        table_with_joins,
+        alias,
+    } = factor
+    else {
+        return Ok(bind_from_item(
+            engine,
+            catalog,
+            params,
+            factor,
+            ctes,
+            preceding,
+            outer_scope,
+            demand,
+        )?
+        .into_bound_from());
+    };
+    // TODO: `FROM (a JOIN b USING (c)) AS x` — PostgreSQL collapses the subtree
+    // into one relation named `x`, hiding the inner qualifiers. Nothing here
+    // renames a whole join tree yet, and no system view definition writes one.
+    if alias.is_some() {
+        return Err(BindError::feature_not_supported(
+            "an alias on a parenthesised join is not supported yet",
+        ));
+    }
+    bind_table_with_joins(
+        engine,
+        catalog,
+        params,
+        table_with_joins,
+        ctes,
+        outer_scope,
+        windows,
+        preceding,
+        demand,
+    )
+}
+
 /// Bind one left-associative explicit join chain. Each ON/USING clause sees the
 /// accumulated left side and the newly-added right factor, but no relations
 /// from other comma-delimited FROM groups. A `USING`/`NATURAL` join also builds
@@ -3705,34 +3840,35 @@ fn bind_table_with_joins(
     ctes: &CteEnv,
     outer_scope: &[OuterLevel],
     windows: &NamedWindows,
-    siblings: &[ScopeItem],
-    // The merged `USING`/`NATURAL` view accumulated over `siblings`, so a
-    // `LATERAL` leading item resolves such a join column the way PostgreSQL
-    // does — once, rather than ambiguously across both physical sides.
-    siblings_visible: Option<&[VisibleColumn]>,
+    // What precedes this whole group: the other comma groups at the top level,
+    // or the accumulated left side when this group is a *parenthesised* factor
+    // inside an enclosing chain. Its merged `USING`/`NATURAL` view travels with
+    // it, so a `LATERAL` leading item resolves such a join column the way
+    // PostgreSQL does — once, rather than ambiguously across both sides.
+    outer: &Preceding<'_>,
     demand: &SystemDemand,
 ) -> Result<BoundFrom, BindError> {
-    // Whether the preceding comma groups are in the row this group's *leading*
-    // item is fed.
+    // Everything outside this group, reachable or not. A chain puts its leading
+    // item at the bottom left, with any join to the outside spliced in *above*
+    // it, so from inside the chain none of it is in reach.
+    let outside: Vec<ScopeItem> = outer.items().collect();
+    // Whether what precedes this group is in the row its *leading* item is fed.
     //
-    // With no joins, the group *is* that item, and `bind_from_clause` makes it
-    // the right child of the cross join with those groups — their columns are
-    // exactly its left row. With a chain, the item becomes the chain's
-    // bottom-left leaf and the cross join is spliced in *above* it, so there is
-    // no left row under it at all: marking it lateral would leave `level: 1`
-    // references no join node can fill.
+    // With no joins, the group *is* that item, and the caller makes it the right
+    // child of the join with what precedes — those columns are exactly its left
+    // row. With a chain, the item becomes the chain's bottom-left leaf and the
+    // join is spliced in *above* it, so there is no left row under it at all:
+    // marking it lateral would leave `level: 1` references no join node can
+    // fill.
     let leading = match table.joins.is_empty() {
-        true => Preceding {
-            reachable: siblings,
-            visible: siblings_visible,
-            ..Preceding::none()
-        },
+        true => *outer,
         false => Preceding {
-            out_of_reach: siblings,
+            out_of_reach: &outside,
+            right_of_outer_join: outer.right_of_outer_join,
             ..Preceding::none()
         },
     };
-    let mut bound = bind_from_item(
+    let mut bound = bind_from_factor(
         engine,
         catalog,
         params,
@@ -3740,9 +3876,9 @@ fn bind_table_with_joins(
         ctes,
         &leading,
         outer_scope,
+        windows,
         demand,
-    )?
-    .into_bound_from();
+    )?;
     let mut seen: HashSet<String> = bound
         .relations
         .iter()
@@ -3754,7 +3890,13 @@ fn bind_table_with_joins(
     // The merged-column view over the accumulated left side, indexed into this
     // group's combined row (base 0). Materialized only once a USING/NATURAL join
     // needs it; an all-`ON`/`CROSS` chain leaves it `None` and allocates nothing.
-    let mut visible: Option<Vec<VisibleColumn>> = None;
+    //
+    // **Taken from the leading factor**, not started empty: a parenthesised
+    // group is one factor and brings its own merged view, already base-0 to its
+    // own subtree — which is base-0 to this group too, since it sits at offset
+    // 0. Starting empty would republish `(a JOIN b USING (x))`'s two physical
+    // `x` columns and make a bare `x` ambiguous.
+    let mut visible: Option<Vec<VisibleColumn>> = bound.visible.take();
 
     for join in &table.joins {
         if join.global {
@@ -3767,7 +3909,7 @@ fn bind_table_with_joins(
         // `LATERAL` reference across a RIGHT or FULL join, where the left row
         // it would read is not guaranteed to exist.
         let binding = join_kind_and_constraint(&join.join_operator)?;
-        let right = bind_from_item(
+        let right = bind_from_factor(
             engine,
             catalog,
             params,
@@ -3775,26 +3917,36 @@ fn bind_table_with_joins(
             ctes,
             &Preceding {
                 // The accumulated left side of *this* chain, in the layout of
-                // the row this join node is fed. Items from earlier comma
-                // groups precede it too, but the tree cross-joins those above
-                // the chain, so they never reach that row.
+                // the row this join node is fed. Items from outside the group
+                // precede it too, but the tree joins those above the chain, so
+                // they never reach that row.
                 reachable: &bound.relations,
                 visible: visible.as_deref(),
-                out_of_reach: siblings,
+                out_of_reach: &outside,
                 right_of_outer_join: matches!(binding.kind(), JoinKind::Right | JoinKind::Full),
             },
             outer_scope,
+            windows,
             demand,
-        )?
-        .into_bound_from();
-        let right_qualifier = &right.relations[0].qualifier;
-        ensure_unique_qualifier(&mut seen, right_qualifier)?;
+        )?;
+        for rel in &right.relations {
+            ensure_unique_qualifier(&mut seen, &rel.qualifier)?;
+        }
         let right_width = right.source.width();
+        let right_visible = right_view(&right, left_width, catalog)?;
+        // Whether the accumulated view has to be materialized even though no
+        // join on *this* side merged anything: a right factor with a merged view
+        // of its own is a second reason the plain layout is wrong for this
+        // group, so promote the left side the way `bind_from_clause` promotes a
+        // comma group that meets one.
+        if visible.is_none() && right.visible.is_some() {
+            visible = Some(default_visible(&bound.relations, 0, catalog)?);
+        }
 
         let (kind, predicate) = match binding {
             JoinBinding::Cross => {
                 if let Some(v) = &mut visible {
-                    v.extend(default_visible(&right.relations, left_width, catalog)?);
+                    v.extend(right_visible);
                 }
                 (JoinKind::Cross, None)
             }
@@ -3806,7 +3958,7 @@ fn bind_table_with_joins(
                 let on_visible = match visible.as_ref() {
                     Some(v) => {
                         let mut ov = v.clone();
-                        ov.extend(default_visible(&right.relations, left_width, catalog)?);
+                        ov.extend(right_visible.iter().cloned());
                         Some(ov)
                     }
                     None => None,
@@ -3821,7 +3973,7 @@ fn bind_table_with_joins(
                     reject_agg_or_window(expr, "JOIN conditions")?;
                 }
                 if let Some(v) = &mut visible {
-                    v.extend(default_visible(&right.relations, left_width, catalog)?);
+                    v.extend(right_visible);
                 }
                 (kind, Some(to_bool_operand(binding, "JOIN/ON", on.span())?))
             }
@@ -3831,7 +3983,7 @@ fn bind_table_with_joins(
                     None => default_visible(&bound.relations, 0, catalog)?,
                 };
                 let (predicate, new_visible) =
-                    build_merged_join(kind, &names, &left_view, &right, left_width, catalog)?;
+                    build_merged_join(kind, &names, &left_view, right_visible, catalog)?;
                 visible = Some(new_visible);
                 (kind, predicate)
             }
@@ -3840,9 +3992,9 @@ fn bind_table_with_joins(
                     Some(view) => view,
                     None => default_visible(&bound.relations, 0, catalog)?,
                 };
-                let names = natural_join_names(&left_view, &right);
+                let names = natural_join_names(&left_view, &right_visible);
                 let (predicate, new_visible) =
-                    build_merged_join(kind, &names, &left_view, &right, left_width, catalog)?;
+                    build_merged_join(kind, &names, &left_view, right_visible, catalog)?;
                 visible = Some(new_visible);
                 (kind, predicate)
             }
@@ -3899,13 +4051,8 @@ pub(crate) fn default_visible(
 /// The columns a `NATURAL` join equates: every name present in both the
 /// accumulated left view and the right input, in left-to-right order, once
 /// each. An empty result means no common columns — a plain cross product.
-fn natural_join_names(left: &[VisibleColumn], right: &BoundFrom) -> Vec<String> {
-    let right_names: HashSet<&str> = right
-        .relations
-        .iter()
-        .flat_map(|rel| rel.declared().iter())
-        .map(|c| c.name.as_str())
-        .collect();
+fn natural_join_names(left: &[VisibleColumn], right: &[VisibleColumn]) -> Vec<String> {
+    let right_names: HashSet<&str> = right.iter().map(|c| c.name.as_str()).collect();
     let mut names: Vec<String> = Vec::new();
     for col in left {
         if right_names.contains(col.name.as_str()) && !names.iter().any(|n| n == &col.name) {
@@ -3946,11 +4093,12 @@ fn build_merged_join(
     kind: JoinKind,
     names: &[String],
     left: &[VisibleColumn],
-    right: &BoundFrom,
-    left_width: usize,
+    // Already laid out in the enclosing chain's combined row; see [`right_view`],
+    // which is what makes a *nested* group's merged column arrive here once
+    // rather than as both of its physical copies.
+    right_visible: Vec<VisibleColumn>,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(Option<BoundExpr>, Vec<VisibleColumn>), BindError> {
-    let right_visible = default_visible(&right.relations, left_width, catalog)?;
     let mut predicate: Option<BoundExpr> = None;
     let mut merged_cols: Vec<VisibleColumn> = Vec::new();
 
@@ -5537,6 +5685,10 @@ fn rewrite_over_window(
             ty,
             elems: rewrite_all_over_window(elems, input_width, groups)?,
         }),
+        BoundExpr::WholeRow { names, fields } => Ok(BoundExpr::WholeRow {
+            names,
+            fields: rewrite_all_over_window(fields, input_width, groups)?,
+        }),
         BoundExpr::Coalesce { args, ty } => Ok(BoundExpr::Coalesce {
             args: rewrite_all_over_window(args, input_width, groups)?,
             ty,
@@ -5966,6 +6118,18 @@ fn rewrite_over_aggregate(
                 elems,
             })
         }
+        // Under GROUP BY, a whole-row reference is legal only as a whole group
+        // key, which the equality check above already answered. Reaching here
+        // means it was not one, so each field is rewritten on its own and the
+        // bare `ColumnRef` inside raises "must appear in the GROUP BY clause" —
+        // naming a column of the row, which is what PostgreSQL blames too.
+        BoundExpr::WholeRow { names, fields } => {
+            let fields = fields
+                .into_iter()
+                .map(|f| rewrite_over_aggregate(f, group_exprs, aggregates, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::WholeRow { names, fields })
+        }
         BoundExpr::Coalesce { args, ty } => {
             let args = args
                 .into_iter()
@@ -6109,8 +6273,31 @@ enum SelectField<'a> {
 }
 
 fn classify_select_item(item: &ast::SelectItem) -> Result<SelectField<'_>, BindError> {
+    // A select-list item that *is* `q.*`, however many parentheses it wears and
+    // whatever it is aliased to, expands into that relation's columns — PG
+    // strips the parentheses before it decides, so `SELECT (q.*) AS x` is the
+    // same three columns as `SELECT q.*`. Only a `q.*` some larger expression
+    // consumes (a function argument, a cast, `IS NULL`) is the composite
+    // `bind_whole_row` builds.
+    fn star_of(expr: &ast::Expr) -> Option<&ast::ObjectName> {
+        let mut expr = expr;
+        while let ast::Expr::Nested(inner) = expr {
+            expr = inner;
+        }
+        match expr {
+            ast::Expr::QualifiedWildcard(name, _) => Some(name),
+            _ => None,
+        }
+    }
     match item {
         ast::SelectItem::Wildcard(_) => Ok(SelectField::Wildcard),
+        ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. }
+            if let Some(name) = star_of(expr) =>
+        {
+            Ok(SelectField::QualifiedWildcard(object_name_to_table_name(
+                name,
+            )?))
+        }
         ast::SelectItem::UnnamedExpr(expr) => Ok(SelectField::Expr(expr, None)),
         ast::SelectItem::ExprWithAlias { expr, alias } => {
             Ok(SelectField::Expr(expr, Some(normalize_ident(alias))))

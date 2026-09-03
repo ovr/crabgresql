@@ -13,7 +13,7 @@ use crabgresql_pg_wire::sqlstate;
 use crabgresql_storage_api::{ProcInfo, SqlBody};
 use crabgresql_txn::{TxnContext, XactStatus};
 use crabgresql_types::text::quote_ident;
-use crabgresql_types::{Interval, PgType, Value, arith, cast};
+use crabgresql_types::{Interval, PgType, RecordVal, Value, arith, cast};
 
 // The comparator and the `Value` accessors it is built from live in
 // `crabgresql-types`, where the engine (column statistics) and the planner
@@ -114,9 +114,15 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             left,
             right,
         } => eval_binary(*op, *arg_ty, *collation, left, right, row, ctx),
+        // Row-wise for a composite, and *not* a pair of complements there: see
+        // `row_is_null`. For every other type the two collapse back to the
+        // single `Value::Null` test they have always been.
         BoundExpr::IsNull { expr, negated } => {
-            let is_null = matches!(eval(expr, row, ctx)?, Value::Null);
-            Ok(Value::Bool(is_null != *negated))
+            let value = eval(expr, row, ctx)?;
+            Ok(Value::Bool(match negated {
+                false => crabgresql_types::row_is_null(&value),
+                true => crabgresql_types::row_is_not_null(&value),
+            }))
         }
         // Also total: the operand is exactly one of true/false/unknown, so
         // every test against it answers yes or no. That relies on the binder's
@@ -282,6 +288,13 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
             } else {
                 Ok(Value::array_1d(*elem, values))
             }
+        }
+        BoundExpr::WholeRow { names, fields } => {
+            let values = fields
+                .iter()
+                .map(|f| eval(f, row, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Record(RecordVal::new(names.clone(), values)))
         }
         // `a[i]` / `a[i][j]`: element access. A NULL base or NULL/out-of-range
         // subscript yields NULL (PG semantics), never an error.
@@ -1057,6 +1070,8 @@ fn eval_catalog_fn(
         func,
         ScalarFn::PgGetUserById
             | ScalarFn::PgTableIsVisible
+            | ScalarFn::PgRelationIsUpdatable
+            | ScalarFn::PgColumnIsUpdatable
             | ScalarFn::PgRelationSize
             | ScalarFn::PgTableSize
             | ScalarFn::PgIndexesSize
@@ -1106,6 +1121,8 @@ fn eval_catalog_fn(
             | ScalarFn::PgIndexHasProperty
             | ScalarFn::PgIndexColumnHasProperty
             | ScalarFn::PgRelationSize
+            | ScalarFn::PgRelationIsUpdatable
+            | ScalarFn::PgColumnIsUpdatable
     ) && args.iter().any(|arg| matches!(arg, Value::Null))
     {
         return Some(Ok(Value::Null));
@@ -1185,6 +1202,28 @@ fn eval_catalog_fn(
         ),
         // ... whereas an OID no relation has is NULL, not false.
         ScalarFn::PgTableIsVisible => ops.table_is_visible(oid).map_or(Value::Null, Value::Bool),
+        // The two updatability questions. An OID naming nothing is *zero* here,
+        // not NULL — unlike the size functions, which is why the catalog answers
+        // with a plain `i32`.
+        ScalarFn::PgRelationIsUpdatable => Value::Int4(ops.relation_updatable(oid)),
+        // PostgreSQL asks for both UPDATE and DELETE on the relation and, for a
+        // view, whether the column maps to a base column. A base table answers
+        // for *any* **positive** column number, including one it does not have —
+        // probed on 18.4, where `pg_column_is_updatable('t'::regclass, 9, false)`
+        // is true for a two-column `t`, because the column set is consulted only
+        // for a view.
+        //
+        // Zero and the negative system-column numbers are the exception and are
+        // always false: no write reaches a system column. Probed the same way,
+        // for `0` and `-1` alike.
+        ScalarFn::PgColumnIsUpdatable => {
+            const REQUIRED: i32 = 4 | 16;
+            let Value::Int2(attnum) = args[1] else {
+                unreachable!("pg_column_is_updatable column was {:?}", args[1]);
+            };
+            let writable = ops.relation_updatable(oid) & REQUIRED == REQUIRED;
+            Value::Bool(attnum > 0 && writable)
+        }
         // The four size functions. Each sums a different part of the same
         // measurement, so they share one catalog call; an OID naming no relation
         // is NULL for all of them, which is distinct from the zero a view (no
@@ -2326,6 +2365,9 @@ mod format_type_tests {
             }
             fn has_attribute(&self, _oid: u32, _attnum: i16) -> bool {
                 false
+            }
+            fn relation_updatable(&self, _oid: u32) -> i32 {
+                0
             }
             fn table_is_visible(&self, _oid: u32) -> Option<bool> {
                 None

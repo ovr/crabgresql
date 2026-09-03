@@ -298,6 +298,8 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // it is not STRICT, so the NULL short-circuit above would be wrong for it.
         ScalarFn::PgGetUserById
         | ScalarFn::PgTableIsVisible
+        | ScalarFn::PgRelationIsUpdatable
+        | ScalarFn::PgColumnIsUpdatable
         | ScalarFn::PgRelationSize
         | ScalarFn::PgTableSize
         | ScalarFn::PgIndexesSize
@@ -327,6 +329,13 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
         // `CREATE TYPE` type falls out as NULL through `PgType::from_oid`
         // without the catalog being asked. STRICT, so the NULL short-circuit
         // above has already handled a NULL argument.
+        // The two composite-taking members of the family answer from the two
+        // rows rather than from a `(typid, typmod)` pair, so they branch off
+        // before the decode below.
+        ScalarFn::InfoSchemaTypeAttr(
+            attr @ (crabgresql_binder::InfoSchemaTypeAttr::TrueTypeId
+            | crabgresql_binder::InfoSchemaTypeAttr::TrueTypeMod),
+        ) => return Ok(true_type_of(attr, &args[0], &args[1])),
         ScalarFn::InfoSchemaTypeAttr(attr) => {
             let ty = PgType::from_oid(crabgresql_types::compare::oid_of(&args[0]));
             let typmod = i4(&args[1]);
@@ -354,6 +363,9 @@ pub fn eval_scalar(func: ScalarFn, args: &[Value], fmt: &FmtCtx) -> Result<Value
                 Attr::IntervalType => {
                     Ok(shape::interval_type(ty, typmod).map_or(Value::Null, Value::Text))
                 }
+                // Split off by the arm above, which is what makes the
+                // `(typid, typmod)` decode this arm opens with sound.
+                Attr::TrueTypeId | Attr::TrueTypeMod => Ok(Value::Null),
             };
         }
         // Likewise the deparse/formatting functions, dispatched by `eval` because
@@ -3093,6 +3105,41 @@ fn i4(v: &Value) -> i32 {
     match v {
         Value::Int4(n) => *n,
         other => unreachable!("expected int4 arg, got {other:?}"),
+    }
+}
+
+/// `_pg_truetypid` / `_pg_truetypmod`: the type a column's values really have,
+/// and the modifier that goes with it.
+///
+/// PostgreSQL declares both over `(pg_attribute, pg_type)` and defines them as
+/// one `CASE` — a column of a **domain** reports the domain's base type and the
+/// domain's own modifier, everything else reports the column's:
+///
+/// ```text
+/// CASE WHEN ($2).typtype = 'd' THEN ($2).typbasetype ELSE ($1).atttypid END
+/// CASE WHEN ($2).typtype = 'd' THEN ($2).typtypmod   ELSE ($1).atttypmod END
+/// ```
+///
+/// The fields are read **by name**, so any row carrying them answers:
+/// [`PgType::Record`] names no shape, and a whole-row reference is bound to it
+/// whatever relation it came from. A row missing a field reports NULL rather
+/// than failing — a caller handing over some other relation's row asked a
+/// question that has no answer, not one with a wrong answer.
+fn true_type_of(attr: crabgresql_binder::InfoSchemaTypeAttr, att: &Value, typ: &Value) -> Value {
+    use crabgresql_binder::InfoSchemaTypeAttr as Attr;
+    let field = |v: &Value, name: &str| match v {
+        Value::Record(record) => record.field(name).cloned(),
+        _ => None,
+    };
+    let is_domain = matches!(field(typ, "typtype"), Some(Value::Char(b'd')));
+    let from = |row: &Value, name: &str| field(row, name).unwrap_or(Value::Null);
+    match (attr, is_domain) {
+        (Attr::TrueTypeId, true) => from(typ, "typbasetype"),
+        (Attr::TrueTypeId, false) => from(att, "atttypid"),
+        (Attr::TrueTypeMod, true) => from(typ, "typtypmod"),
+        (Attr::TrueTypeMod, false) => from(att, "atttypmod"),
+        // The other seven never reach here; see the call site.
+        _ => Value::Null,
     }
 }
 

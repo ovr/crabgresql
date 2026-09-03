@@ -419,6 +419,10 @@ pub fn inline_params(expr: BoundExpr, args: &[BoundExpr]) -> BoundExpr {
             ty,
             elems: elems.into_iter().map(|a| inline_params(a, args)).collect(),
         },
+        BoundExpr::WholeRow { names, fields } => BoundExpr::WholeRow {
+            names,
+            fields: fields.into_iter().map(|f| inline_params(f, args)).collect(),
+        },
         BoundExpr::Subscript { base, indexes, ty } => BoundExpr::Subscript {
             base: Box::new(inline_params(*base, args)),
             indexes: indexes

@@ -101,6 +101,10 @@ pub struct CatalogRelation {
     /// generation. See [`crate::StaticTable::with_xmin`] for why a state number
     /// is the honest answer here at all.
     pub ddl_xid: u64,
+    /// The role that created the relation, or `None` when nothing recorded one.
+    /// Read as the database owner — every relation reported that before an owner
+    /// was recorded at all, and a built-in namespace's contents still do.
+    pub owner: Option<String>,
     /// What the storage engine really allocated, which is not always what
     /// `pg_class.relfilenode` reports — a partitioned parent holds a heap file
     /// here and still reports `0`. See `pg_class_rows` for that decision.
@@ -136,6 +140,7 @@ impl CatalogRelation {
             index_stats: Vec::new(),
             definition: None,
             ddl_xid: 0,
+            owner: None,
             filenodes: RelationFilenodes::default(),
         }
     }
@@ -155,6 +160,7 @@ impl CatalogRelation {
             index_stats: metadata.index_stats,
             definition: None,
             ddl_xid: 0,
+            owner: metadata.owner,
             filenodes: metadata.filenodes,
         }
     }
@@ -174,6 +180,7 @@ impl CatalogRelation {
             index_stats: Vec::new(),
             definition: None,
             ddl_xid: 0,
+            owner: None,
             filenodes: RelationFilenodes::default(),
         }
     }
@@ -196,6 +203,7 @@ impl CatalogRelation {
             index_stats: Vec::new(),
             definition,
             ddl_xid: 0,
+            owner: None,
             filenodes: RelationFilenodes::default(),
         }
     }
@@ -231,6 +239,7 @@ impl CatalogRelation {
             index_stats: Vec::new(),
             definition: None,
             ddl_xid: 0,
+            owner: None,
             filenodes: RelationFilenodes::default(),
         }
     }
@@ -483,6 +492,13 @@ pub trait CatalogSource: Send + Sync {
     /// into `pg_namespace` and `information_schema.schemata`.
     fn schemas(&self) -> Vec<(String, u32)> {
         Vec::new()
+    }
+
+    /// The role that created the user schema `name`, or `None` when nothing
+    /// recorded one — read as the database owner, exactly as
+    /// [`CatalogRelation::owner`] is.
+    fn schema_owner(&self, _name: &str) -> Option<String> {
+        None
     }
 
     /// The cluster's roles, to reflect into `pg_authid` and the five relations
