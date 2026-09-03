@@ -1428,15 +1428,18 @@ impl SystemCatalog {
         // The `information_schema` domain checks are numbered by `initdb`, not
         // by the band below, so they are matched by OID before the positional
         // lookup — which would read their small OIDs as a wild index.
-        if let Some(domain) = info_schema::DOMAINS
-            .iter()
-            .find(|d| d.check.as_ref().is_some_and(|c| c.oid == oid))
+        //
+        // Through the same `info_schema::constraints()` the `pg_constraint` rows
+        // and the `pg_depend` edges are built from, so the three cannot describe
+        // one check differently.
+        if let Some(check) = info_schema::constraints()
+            .into_iter()
+            .find(|c| c.oid == oid)
         {
-            let check = domain.check.as_ref()?;
             return Some(ConstraintDefRow {
-                contype: "c".to_string(),
+                contype: check.contype.to_string(),
                 columns: Vec::new(),
-                expr: Some(check.expr.to_string()),
+                expr: check.expr,
                 is_domain: true,
             });
         }

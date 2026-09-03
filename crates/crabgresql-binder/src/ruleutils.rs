@@ -948,14 +948,13 @@ fn expr(e: &ast::Expr, cx: Cx, parent: u8) -> String {
     // `AT TIME ZONE` / `AT LOCAL` are the one construct PG parenthesises even
     // when pretty-printing, so they are wrapped unconditionally.
     let always = matches!(e, ast::Expr::AtTimeZone { .. } | ast::Expr::AtLocal { .. });
-    // PostgreSQL's `isSimpleNode` has no arm for a `ScalarArrayOpExpr`, so it
-    // falls to the default and a quantified comparison is never *simple*:
-    // wherever `get_rule_expr_paren` renders it — under `AND`, `OR`, `NOT`, or
-    // another operator — it takes parentheses even in pretty mode, while at a
-    // clause boundary, which goes through plain `get_rule_expr`, it takes none.
-    // Probed on 18.4: `WHERE a = ANY (ARRAY[1, 2])` bare, but
+    // A quantified comparison takes parentheses wherever something encloses it —
+    // under `AND`, `OR`, `NOT`, or another operator — even in pretty mode, and
+    // none at a clause boundary. Probed on 18.4 by reading views back:
+    // `WHERE a = ANY (ARRAY[1, 2])` bare, but
     // `WHERE (a = ANY (ARRAY[1, 2])) AND (b <> ALL (ARRAY['x'::text]))` and
-    // `WHERE NOT (a = ANY (ARRAY[1, 2]))` wrapped.
+    // `WHERE NOT (a = ANY (ARRAY[1, 2]))` wrapped. Nothing else this deparser
+    // renders is unconditional that way, so it needs a flag of its own.
     let never_simple = matches!(e, ast::Expr::AnyOp { .. } | ast::Expr::AllOp { .. });
     let wrap = if cx.pretty {
         always || prec < parent || (never_simple && parent > 0)

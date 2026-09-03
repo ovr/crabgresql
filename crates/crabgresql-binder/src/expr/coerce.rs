@@ -400,8 +400,8 @@ pub(crate) fn type_label(ty: PgType, catalog: &dyn TypeCatalog) -> String {
     }
 }
 
-/// The common type of two column entries (`VALUES` rows / `UNION` arms),
-/// approximating PG's `select_common_type`: `a` is the candidate and `b` the type
+/// The common type of two column entries (`VALUES` rows / `UNION` arms), as
+/// PostgreSQL resolves one: `a` is the candidate and `b` the type
 /// considered next, and the candidate is replaced only when it casts implicitly to
 /// `b` and `b` does not cast back (so `real` + `int4` -> `real`, not `float8`; and
 /// `varchar` + `text` -> `varchar`, because PG lists that pair in both directions).
@@ -435,7 +435,7 @@ pub(crate) fn merge_types(a: PgType, b: PgType) -> Option<PgType> {
     }
 }
 
-/// Implicit castability as `select_common_type` needs to see it: PG's `pg_cast`
+/// Implicit castability as *common-type resolution* needs to see it: PG's `pg_cast`
 /// lists text/varchar/bpchar in **both** directions and text/varchar/bpchar -> name
 /// implicitly, which is what makes the string family resolve to whichever type comes
 /// first.
@@ -471,10 +471,9 @@ pub(crate) fn unify_value_column(
     label: &str,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(PgType, Vec<BoundExpr>), BindError> {
-    // A domain survives only on PG's fast path through `select_common_type`,
-    // which asks whether *every* input already has the same type; anything else
-    // falls into the full algorithm, and that one opens with
-    // `ptype = getBaseType(ptype)`.
+    // A domain survives common-type resolution only when *every* input already
+    // has that same domain type; the moment one does not, the result is the
+    // domain's base.
     //
     // An unknown literal is not "the same type" — it has none yet — so a single
     // `NULL` or `'z'` in the set is enough to send it to the base. Probed on
