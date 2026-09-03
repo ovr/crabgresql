@@ -4902,14 +4902,14 @@ fn bind_aggregate(
         }
     };
 
-    let has_wildcard = list.args.iter().any(|a| {
-        matches!(
-            a,
-            ast::FunctionArg::Unnamed(
-                ast::FunctionArgExpr::Wildcard | ast::FunctionArgExpr::QualifiedWildcard(_)
-            )
-        )
-    });
+    // The **bare** star only. `t.*` is a whole-row reference, which is an
+    // ordinary argument to an aggregate: `count(t.*)` counts the rows,
+    // `count(DISTINCT t.*)` and `min(t.*)` bind too. `positional_arg_exprs`
+    // restates it as the expression the binder already knows.
+    let has_wildcard = list
+        .args
+        .iter()
+        .any(|a| matches!(a, ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)));
     // `ALL`/`DISTINCT` only apply to expression arguments; PostgreSQL rejects
     // `count(DISTINCT *)` during parsing. Our parser retains this form, so keep
     // the observable syntax error at bind time.

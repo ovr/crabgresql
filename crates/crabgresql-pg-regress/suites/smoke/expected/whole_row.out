@@ -93,6 +93,23 @@ SELECT DISTINCT greatest(wr.*) AS rows FROM wr ORDER BY 1;
  (4,"q""r\\s",t)
 (4 rows)
 
+-- An aggregate takes a whole-row reference as an ordinary argument: only the
+-- bare `*` is the row wildcard, so `count(t.*)`, `count(DISTINCT t.*)` and
+-- `min(t.*)` all bind. A record is never NULL as a datum, so `count(t.*)`
+-- matches `count(*)` even for an all-NULL row.
+SELECT count(wr.*) AS rows, count(DISTINCT wr.*) AS distinct_rows,
+       count(*) AS star FROM wr;
+ rows | distinct_rows | star 
+------+---------------+------
+    4 |             4 |    4
+(1 row)
+
+SELECT min(wr.*) AS smallest FROM wr;
+  smallest   
+-------------
+ (1,"x y",t)
+(1 row)
+
 -- `IS NULL` on a row asks about *every* field, and `IS NOT NULL` is not its
 -- negation: a mixed row answers false to both.
 CREATE TABLE wr_null (a int4, b text);

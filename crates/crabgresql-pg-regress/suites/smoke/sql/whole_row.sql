@@ -29,6 +29,13 @@ DROP TABLE wr_sys;
 -- field sorts last.
 SELECT greatest(wr.*) FROM wr ORDER BY 1 DESC LIMIT 1;
 SELECT DISTINCT greatest(wr.*) AS rows FROM wr ORDER BY 1;
+-- An aggregate takes a whole-row reference as an ordinary argument: only the
+-- bare `*` is the row wildcard, so `count(t.*)`, `count(DISTINCT t.*)` and
+-- `min(t.*)` all bind. A record is never NULL as a datum, so `count(t.*)`
+-- matches `count(*)` even for an all-NULL row.
+SELECT count(wr.*) AS rows, count(DISTINCT wr.*) AS distinct_rows,
+       count(*) AS star FROM wr;
+SELECT min(wr.*) AS smallest FROM wr;
 -- `IS NULL` on a row asks about *every* field, and `IS NOT NULL` is not its
 -- negation: a mixed row answers false to both.
 CREATE TABLE wr_null (a int4, b text);
