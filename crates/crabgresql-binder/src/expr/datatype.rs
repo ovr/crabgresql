@@ -323,7 +323,15 @@ pub fn custom_type_key(dt: &ast::DataType) -> Option<String> {
         .collect::<Option<Vec<_>>>()?;
     match parts.as_slice() {
         [name] => Some(name.clone()),
-        [schema, name] if schema == "public" || schema == "pg_catalog" => Some(name.clone()),
+        // `public.` is dropped because that is where an unqualified `CREATE TYPE`
+        // puts its type, so the two spellings name the same one.
+        //
+        // `pg_catalog.` is **not**: no user type lives there, and dropping it let
+        // `pg_catalog.mood` reach a `mood` enum in `public`, which PostgreSQL
+        // reports as 42704. The built-ins spelled that way — `pg_catalog.numeric`
+        // — never get here: `map_data_type` resolves them before
+        // [`resolve_data_type`] falls back to the catalog.
+        [schema, name] if schema == "public" => Some(name.clone()),
         [schema, name] => Some(format!("{schema}.{name}")),
         _ => None,
     }

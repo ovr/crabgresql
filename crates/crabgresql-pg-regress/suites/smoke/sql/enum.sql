@@ -90,6 +90,16 @@ ALTER TYPE nonesuch RENAME TO int4;
 ALTER TYPE int4 ADD VALUE 'x';
 ALTER TYPE text RENAME VALUE 'a' TO 'b';
 --
+-- A user type answers to its bare name and to `public.`, which is where an
+-- unqualified CREATE TYPE puts it -- but not to `pg_catalog.`, where no user
+-- type lives. (A built-in spelled that way still resolves: it never reaches the
+-- catalog lookup.)
+--
+CREATE TABLE enum_qual (a public.rainbow);
+DROP TABLE enum_qual;
+CREATE TABLE enum_qual (a pg_catalog.rainbow);
+SELECT 'x'::pg_catalog.text AS builtin_qualified;
+--
 -- Cleanup.
 --
 DROP TABLE solar;
