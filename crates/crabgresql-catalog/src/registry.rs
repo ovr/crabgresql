@@ -36,7 +36,6 @@ use crate::catalogs::{
 use crate::cols::no_rows;
 use crate::views::{definitions, information_schema};
 
-/// How one served relation's rows are produced from a catalog snapshot.
 pub(crate) type RowBuilder = fn(&SystemCatalog) -> Vec<Vec<Value>>;
 
 /// Which schema a served relation lives in. Ordered as declared, because both

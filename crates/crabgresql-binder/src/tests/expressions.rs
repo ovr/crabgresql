@@ -901,7 +901,6 @@ fn whole_row_is_a_composite_in_expression_position() -> anyhow::Result<()> {
     );
     assert_eq!(args[0].ty(), PgType::Record);
 
-    // Every select-list spelling of the star itself still expands.
     for sql in [
         "SELECT t.* FROM t",
         "SELECT t.* AS ignored FROM t",

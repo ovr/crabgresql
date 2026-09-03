@@ -1767,7 +1767,6 @@ impl Value {
             // A vector prints space-separated and unbraced (`oidvectorout`).
             // Zone-independent: its elements are `oid`/`int2`.
             Value::Vector { elems, .. } => Some(vector::format(elems)),
-            // A composite prints in PG's `(...)` form (`record_out`).
             Value::Record(record) => Some(record_out(record, fmt)),
         }
     }

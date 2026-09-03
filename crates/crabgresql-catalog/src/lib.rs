@@ -1959,26 +1959,6 @@ impl SystemCatalog {
         (toast.oid == oid).then_some((TOAST_NAMESPACE, toast.name.as_str()))
     }
 
-    /// The physical size, in 8 KB pages, of everything the relation `oid`
-    /// identifies owns — its own storage, its TOAST relation and its indexes,
-    /// kept apart because the four size functions add them up differently
-    /// (`pg_relation_size` is `main` alone, `pg_table_size` adds `toast`,
-    /// `pg_total_relation_size` adds `indexes` on top).
-    ///
-    /// `None` means "no such relation", which those functions report as NULL.
-    /// It is distinct from a relation with nothing to measure, which answers
-    /// zeros — as PostgreSQL does for a view, a partitioned parent, and (here
-    /// only) a served catalog relation, which exists but has no file behind it.
-    ///
-    /// A **live** count where the engine can give one: the page count comes from
-    /// [`RelStats::curpages`], not the `relpages` frozen at the last `ANALYZE`
-    /// that `pg_class` must report. `pg_relation_size` is a physical question,
-    /// and PostgreSQL answers it by measuring the file rather than reading the
-    /// catalog.
-    ///
-    /// A sequence is one page from creation, matching both PostgreSQL's 8192 and
-    /// the `relpages = 1` this catalog already publishes for it.
-    ///
     /// Which writes the relation `oid` accepts, as `pg_relation_is_updatable`'s
     /// bitmask: INSERT is 8, UPDATE 4 and DELETE 16, so an ordinary table is 28.
     ///
@@ -2011,6 +1991,26 @@ impl SystemCatalog {
         }
     }
 
+    /// The physical size, in 8 KB pages, of everything the relation `oid`
+    /// identifies owns — its own storage, its TOAST relation and its indexes,
+    /// kept apart because the four size functions add them up differently
+    /// (`pg_relation_size` is `main` alone, `pg_table_size` adds `toast`,
+    /// `pg_total_relation_size` adds `indexes` on top).
+    ///
+    /// `None` means "no such relation", which those functions report as NULL.
+    /// It is distinct from a relation with nothing to measure, which answers
+    /// zeros — as PostgreSQL does for a view, a partitioned parent, and (here
+    /// only) a served catalog relation, which exists but has no file behind it.
+    ///
+    /// A **live** count where the engine can give one: the page count comes from
+    /// [`RelStats::curpages`], not the `relpages` frozen at the last `ANALYZE`
+    /// that `pg_class` must report. `pg_relation_size` is a physical question,
+    /// and PostgreSQL answers it by measuring the file rather than reading the
+    /// catalog.
+    ///
+    /// A sequence is one page from creation, matching both PostgreSQL's 8192 and
+    /// the `relpages = 1` this catalog already publishes for it.
+    ///
     /// Indexed positionally, exactly as [`SystemCatalog::relation_ref`] is, and
     /// for the same reason.
     pub fn relation_pages(&self, oid: u32) -> Option<RelationPages> {
