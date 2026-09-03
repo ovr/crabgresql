@@ -90,7 +90,7 @@ pub use static_table::StaticTable;
 /// renumbers every relation sorting after it — so a client that holds an OID
 /// across DDL can address the wrong relation. Storage owning a persistent OID
 /// per relation is what fixes it.
-const FIRST_REL_OID: u32 = 0x4000_0000;
+pub(crate) const FIRST_REL_OID: u32 = 0x4000_0000;
 
 /// The namespace PostgreSQL keeps TOAST relations in. Never on the search path,
 /// so nothing here is reachable by an unqualified name.
@@ -676,6 +676,7 @@ pub struct SystemCatalog {
     live_relations: OnceLock<Vec<CatalogRelation>>,
     oids: OnceLock<Vec<(u32, TableSchema)>>,
     kinds: OnceLock<Vec<RelKind>>,
+    owners: OnceLock<Vec<u32>>,
     ddl_xids: OnceLock<Vec<Xid>>,
     xmin_by_oid: OnceLock<Arc<std::collections::HashMap<u32, Xid>>>,
     stats: OnceLock<Vec<RelStats>>,
@@ -745,6 +746,7 @@ impl SystemCatalog {
         Self {
             source,
             live_relations: OnceLock::new(),
+            owners: OnceLock::new(),
             oids: OnceLock::new(),
             kinds: OnceLock::new(),
             ddl_xids: OnceLock::new(),
@@ -933,6 +935,44 @@ impl SystemCatalog {
             });
             rels.into_iter().map(|r| r.kind).collect()
         })
+    }
+
+    /// The owning role's OID for each entry of [`SystemCatalog::relation_oids`],
+    /// in the same sorted order — `pg_class.relowner`, and what
+    /// [`SystemCatalog::relation_acl`] reports as the owner.
+    ///
+    /// A relation whose creator was never recorded — one written before owners
+    /// were persisted, or created by an engine with no registry — reports the
+    /// **database owner**, which is what every relation reported before this
+    /// existed. A role that has since been dropped resolves to nothing and falls
+    /// back the same way, so a `pg_authid` join can never lose the row.
+    pub(crate) fn relation_owners(&self) -> &[u32] {
+        self.owners.get_or_init(|| {
+            let mut rels = self.live_relations().to_vec();
+            rels.sort_by(|a, b| {
+                a.namespace
+                    .cmp(&b.namespace)
+                    .then_with(|| a.schema.name.cmp(&b.schema.name))
+            });
+            rels.into_iter()
+                .map(|r| self.owner_oid(r.owner.as_deref()))
+                .collect()
+        })
+    }
+
+    /// The OID of the role `name`, or of the database owner when `name` is
+    /// absent or names no role. See [`SystemCatalog::relation_owners`].
+    pub(crate) fn owner_oid(&self, name: Option<&str>) -> u32 {
+        name.and_then(|name| self.role_oid(name))
+            .or_else(|| self.role_oid(self.owner()))
+            .unwrap_or(oids::BOOTSTRAP_ROLE_OID)
+    }
+
+    /// The owning role's OID for the user schema `name` — `pg_namespace.nspowner`
+    /// and what [`SystemCatalog::namespace_acl`] reports. Falls back to the
+    /// database owner exactly as [`SystemCatalog::relation_owners`] does.
+    pub(crate) fn schema_owner_oid(&self, name: &str) -> u32 {
+        self.owner_oid(self.source.schema_owner(name).as_deref())
     }
 
     /// The size estimates for each entry of [`SystemCatalog::relation_oids`], in
@@ -1676,7 +1716,7 @@ impl SystemCatalog {
                 return None;
             }
             return Some(ObjectAcl {
-                owner: oids::BOOTSTRAP_ROLE_OID,
+                owner: self.relation_owners()[offset],
                 is_sequence: matches!(self.relation_kinds()[offset], RelKind::Sequence),
                 granted_to_public: false,
             });
@@ -1707,7 +1747,13 @@ impl SystemCatalog {
     /// `pg_toast` and every `CREATE SCHEMA` namespace carry no grant at all.
     pub fn namespace_acl(&self, oid: u32) -> Option<ObjectAcl> {
         self.namespace_name(oid).map(|name| ObjectAcl {
-            owner: oids::BOOTSTRAP_ROLE_OID,
+            // A built-in namespace is `initdb`'s; a `CREATE SCHEMA` one belongs
+            // to the role that ran it, which is what `has_schema_privilege`
+            // answers `true` for.
+            owner: match is_builtin_namespace(&name) {
+                true => oids::BOOTSTRAP_ROLE_OID,
+                false => self.schema_owner_oid(&name),
+            },
             is_sequence: false,
             granted_to_public: matches!(
                 name.as_str(),

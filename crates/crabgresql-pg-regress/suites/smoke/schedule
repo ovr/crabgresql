@@ -114,5 +114,6 @@ test: column_introspection
 test: quantified_vector
 test: lateral
 test: roles
+test: owner
 test: privileges
 test: from_function

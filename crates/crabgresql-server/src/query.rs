@@ -967,7 +967,12 @@ fn execute_statement_inner(
                 return execute_create_table(engine, &type_catalog, &catalog_ops, create, session);
             }
             ast::Statement::CreateView(create) => {
-                return execute_create_view(&catalog, &type_catalog, create);
+                return execute_create_view(
+                    &catalog,
+                    &type_catalog,
+                    create,
+                    session.current_user(),
+                );
             }
             ast::Statement::CreateSequence {
                 temporary,
@@ -985,6 +990,7 @@ fn execute_statement_inner(
                     data_type,
                     sequence_options,
                     owned_by,
+                    session.current_user(),
                 );
             }
             ast::Statement::CreateType {
@@ -1026,7 +1032,12 @@ fn execute_statement_inner(
                 if_not_exists,
                 ..
             } => {
-                return execute_create_schema(engine, schema_name, *if_not_exists);
+                return execute_create_schema(
+                    engine,
+                    schema_name,
+                    *if_not_exists,
+                    session.current_user(),
+                );
             }
             ast::Statement::Drop {
                 object_type: ast::ObjectType::Schema,
@@ -4409,6 +4420,7 @@ fn execute_create_table(
             &name,
             parent,
             &session.temp_schema,
+            session.current_user(),
             // A bound may name the session identity (`current_user`,
             // `current_schema`, `pg_my_temp_schema()`), which PostgreSQL folds
             // into the stored bound — so the fold needs this statement's
@@ -4494,6 +4506,7 @@ fn execute_create_table(
             serial_defs.push(SequenceDefinition {
                 name: seq_name,
                 namespace: namespace.clone(),
+                owner: Some(session.current_user().to_string()),
                 data_type: base,
                 start: 1,
                 increment: 1,
@@ -4965,7 +4978,7 @@ fn execute_create_table(
             return Err(e.into());
         }
     }
-    match target.create_table(schema) {
+    match target.create_table_owned(schema, session.current_user()) {
         Ok(_) => {
             for index in indexes {
                 if let Err(e) = target.create_index(&namespace, &name, index) {
@@ -5722,6 +5735,7 @@ fn execute_create_partition(
     name: &str,
     parent_ref: &ast::ObjectName,
     temp_schema: &str,
+    owner: &str,
     ctx: &ExecContext,
 ) -> Result<QueryResult, PgError> {
     // A partition inherits its shape from the parent.
@@ -5846,7 +5860,7 @@ fn execute_create_partition(
         // refused at DDL, so the parent never has any.
         checks: Vec::new(),
     };
-    match engine.create_table(schema) {
+    match engine.create_table_owned(schema, owner) {
         Ok(_) => Ok(QueryResult::command("CREATE TABLE")),
         Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {
             Ok(QueryResult::command("CREATE TABLE"))
@@ -6020,7 +6034,7 @@ fn execute_create_table_as(
 
     // Create the table first so a name collision short-circuits before the query
     // runs. IF NOT EXISTS on an existing relation runs nothing (PG NOTICE).
-    match target.create_table(schema) {
+    match target.create_table_owned(schema, session.current_user()) {
         Ok(_) => {}
         Err(StorageError::TableAlreadyExists(_)) if create.if_not_exists => {
             return Ok(QueryResult::Command {
@@ -8014,6 +8028,7 @@ fn execute_create_view(
     catalog: &Arc<dyn TableEngine>,
     type_catalog: &Arc<dyn TypeCatalog>,
     create: &ast::CreateView,
+    owner: &str,
 ) -> Result<QueryResult, PgError> {
     let (schema_qual, name) = split_object_name(&create.name, "relation")?;
     let namespace = resolve_create_namespace(catalog, schema_qual.as_deref(), &name)?;
@@ -8125,6 +8140,7 @@ fn execute_create_view(
     catalog.create_view(ViewDefinition {
         name,
         namespace,
+        owner: Some(owner.to_string()),
         sql,
         columns: view_columns,
         depends_on,
@@ -8844,6 +8860,8 @@ fn build_sequence_definition(
     Ok(SequenceDefinition {
         name,
         namespace,
+        // Stamped by the caller, which is where the session is.
+        owner: None,
         data_type,
         start,
         increment,
@@ -8872,6 +8890,7 @@ fn execute_create_sequence(
     data_type: &Option<ast::DataType>,
     options: &[ast::SequenceOptions],
     owned_by: &Option<ast::ObjectName>,
+    owner: &str,
 ) -> Result<QueryResult, PgError> {
     if temporary {
         return Err(PgError::feature_not_supported(
@@ -8903,7 +8922,8 @@ fn execute_create_sequence(
             }
         },
     };
-    let def = build_sequence_definition(seq_name.clone(), namespace, data_type, options, None)?;
+    let mut def = build_sequence_definition(seq_name.clone(), namespace, data_type, options, None)?;
+    def.owner = Some(owner.to_string());
     match catalog.create_sequence(def) {
         Ok(()) => Ok(QueryResult::command("CREATE SEQUENCE")),
         Err(StorageError::TableAlreadyExists(_)) if if_not_exists => Ok(QueryResult::Command {
@@ -9163,6 +9183,7 @@ fn execute_create_schema(
     engine: &Arc<dyn TableEngine>,
     schema_name: &ast::SchemaName,
     if_not_exists: bool,
+    owner: &str,
 ) -> Result<QueryResult, PgError> {
     let name = match schema_name {
         ast::SchemaName::Simple(obj) => single_object_name(obj, "schema")?,
@@ -9200,7 +9221,7 @@ fn execute_create_schema(
             format!("schema \"{name}\" already exists"),
         ));
     }
-    engine.create_schema(&name)?;
+    engine.create_schema_owned(&name, owner)?;
     Ok(QueryResult::command("CREATE SCHEMA"))
 }
 

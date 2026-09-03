@@ -56,6 +56,8 @@ fn system_view_definition(namespace: &str, name: &str) -> Option<ViewDefinition>
             .map(|name| crabgresql_storage_api::Column::new(name, crabgresql_types::PgType::Text))
             .collect(),
         depends_on: Vec::new(),
+        // `initdb` made it; the bootstrap role owns every served relation.
+        owner: None,
     })
 }
 
@@ -408,14 +410,17 @@ impl CatalogSource for SessionCatalogSource {
             let column_names: Vec<_> = view.columns.iter().map(|c| c.name.clone()).collect();
             let definition =
                 crabgresql_binder::ruleutils::view_definition(&view.sql, false, &column_names);
-            CatalogRelation::view(
+            let mut relation = CatalogRelation::view(
                 TableSchema::in_namespace(view.name, view.namespace, view.columns),
                 definition,
-            )
+            );
+            relation.owner = view.owner;
+            relation
         }));
         // Sequences reflect into pg_class as relkind='S' and feed
         // pg_catalog.pg_sequence.
         rels.extend(self.engine.sequences().into_iter().map(|seq| {
+            let owner = seq.owner.clone();
             // The counter is only reportable once `is_called` — see
             // `CatalogSequence::last_value`.
             let last_value = self
@@ -439,6 +444,7 @@ impl CatalogSource for SessionCatalogSource {
                 },
             );
             relation.filenodes.rel = relfilenode;
+            relation.owner = owner;
             relation
         }));
         // Stamp each relation with the generation of the DDL that last changed
@@ -629,6 +635,9 @@ impl CatalogSource for SessionCatalogSource {
         schemas
     }
 
+    fn schema_owner(&self, name: &str) -> Option<String> {
+        self.engine.schema_owner(name)
+    }
     fn cursors(&self) -> Vec<CatalogCursor> {
         self.cursors.clone()
     }
@@ -1230,6 +1239,10 @@ impl TableEngine for SessionCatalog {
 
     fn schemas(&self) -> Vec<(String, u32)> {
         self.global.schemas()
+    }
+
+    fn schema_owner(&self, name: &str) -> Option<String> {
+        self.global.schema_owner(name)
     }
 
     fn schema_exists(&self, name: &str) -> bool {

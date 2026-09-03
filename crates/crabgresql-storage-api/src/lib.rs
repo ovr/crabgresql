@@ -666,6 +666,11 @@ pub struct RelationMetadata {
     /// out another index's size instead. An engine that sizes nothing leaves it
     /// empty.
     pub index_stats: Vec<(String, RelStats)>,
+    /// The role that created the relation, or `None` when nothing recorded one
+    /// — a relation written before owners were persisted, or an engine that
+    /// keeps no registry. The catalog reads `None` as the database owner, which
+    /// is what every relation reported before this field existed.
+    pub owner: Option<String>,
 }
 
 /// How a relation is stored, mirroring PostgreSQL's `pg_class.relpersistence`.
@@ -953,6 +958,9 @@ pub struct ViewDefinition {
     pub sql: String,
     pub columns: Vec<Column>,
     pub depends_on: Vec<String>,
+    /// The role that ran the `CREATE VIEW`; see [`RelationMetadata::owner`] for
+    /// what `None` means.
+    pub owner: Option<String>,
 }
 
 impl TableSchema {
@@ -981,6 +989,10 @@ pub struct SequenceDefinition {
     pub cache: i64,
     pub cycle: bool,
     pub owned_by: Option<String>,
+    /// The role that ran the `CREATE SEQUENCE` — distinct from `owned_by`,
+    /// which names the *table* a `serial` column made it for. See
+    /// [`RelationMetadata::owner`] for what `None` means.
+    pub owner: Option<String>,
 }
 
 impl SequenceDefinition {
@@ -1734,6 +1746,22 @@ pub trait TableAm: Send + Sync {
 pub trait TableEngine: Send + Sync {
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError>;
 
+    /// [`TableEngine::create_table`] recording who ran the DDL, so `relowner`
+    /// and the privilege functions can answer for a role that is not the
+    /// database owner.
+    ///
+    /// A companion rather than a parameter on `TableSchema`: that struct is
+    /// built literally in well over a hundred places, and none of them knows a
+    /// role. The default ignores the owner, which is right for every engine
+    /// with no registry to record it in.
+    fn create_table_owned(
+        &self,
+        schema: TableSchema,
+        _owner: &str,
+    ) -> Result<Arc<dyn TableAm>, StorageError> {
+        self.create_table(schema)
+    }
+
     fn open_table(&self, name: &str) -> Result<Arc<dyn TableAm>, StorageError>;
 
     /// Flush all data and record a clean shutdown, so a durable engine does NOT
@@ -1782,6 +1810,12 @@ pub trait TableEngine: Send + Sync {
         Err(StorageError::SchemaNotFound(name.to_string()))
     }
 
+    /// [`TableEngine::create_schema`] recording the owner; see
+    /// [`TableEngine::create_table_owned`].
+    fn create_schema_owned(&self, name: &str, _owner: &str) -> Result<u32, StorageError> {
+        self.create_schema(name)
+    }
+
     /// Remove a user schema. The caller has already verified it is empty (or is
     /// dropping its contents first, for CASCADE). `SchemaNotFound` if absent.
     fn drop_schema(&self, name: &str) -> Result<(), StorageError> {
@@ -1792,6 +1826,12 @@ pub trait TableEngine: Send + Sync {
     /// (`public`, `pg_catalog`, …) are not included. The default is empty.
     fn schemas(&self) -> Vec<(String, u32)> {
         Vec::new()
+    }
+
+    /// The owner of the user schema `name`, or `None` when nothing recorded one
+    /// — read as the database owner, exactly as [`RelationMetadata::owner`] is.
+    fn schema_owner(&self, _name: &str) -> Option<String> {
+        None
     }
 
     /// Whether a user schema by this name exists.
@@ -1996,6 +2036,7 @@ pub trait TableEngine: Send + Sync {
                 toast: None,
                 filenodes: RelationFilenodes::default(),
                 index_stats: Vec::new(),
+                owner: None,
             })
             .collect()
     }

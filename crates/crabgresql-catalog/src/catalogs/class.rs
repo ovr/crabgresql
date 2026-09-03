@@ -265,6 +265,7 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
         cat.relation_kinds(),
         cat.relation_stats(),
     );
+    let owners = cat.relation_owners();
     let filenodes = cat.relation_filenodes();
     let (indexes, toasts, namespace_oids) =
         (cat.index_oids(), cat.toast_oids(), cat.namespace_oids());
@@ -280,7 +281,8 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
         .zip(kinds)
         .zip(stats)
         .zip(filenodes)
-        .map(|((((oid, schema), kind), stats), filenodes)| {
+        .zip(owners)
+        .map(|(((((oid, schema), kind), stats), filenodes), owner)| {
             // A partitioned parent has no access method (`relam = 0`) and holds no
             // storage of its own.
             let (relam, relkind) = match kind {
@@ -324,7 +326,7 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
                 Value::Oid(0),
                 // reloftype: crabgresql has no typed tables.
                 Value::Oid(0),
-                Value::Oid(BOOTSTRAP_ROLE_OID),
+                Value::Oid(*owner),
                 Value::Oid(relam),
                 Value::Oid(relfilenode),
                 // reltablespace: default tablespace.
@@ -377,6 +379,17 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             ]
         })
         .collect();
+    // An index and a TOAST relation are owned by the table they hang off, as in
+    // PostgreSQL: neither is created by a DDL of its own, so neither records a
+    // creator. Looked up positionally, the way every other per-relation answer
+    // in this file is.
+    let owner_of = |table_oid: u32| {
+        table_oid
+            .checked_sub(crate::FIRST_REL_OID)
+            .and_then(|offset| owners.get(offset as usize))
+            .copied()
+            .unwrap_or(BOOTSTRAP_ROLE_OID)
+    };
     rows.extend(indexes.iter().map(|index| {
         vec![
             Value::Oid(index.oid),
@@ -385,7 +398,7 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             Value::Oid(nsp_oid(&index.table_schema.namespace)),
             Value::Oid(0),
             Value::Oid(0),
-            Value::Oid(BOOTSTRAP_ROLE_OID),
+            Value::Oid(owner_of(index.table_oid)),
             Value::Oid(match index.metadata.method {
                 IndexMethod::BTree => BTREE_AM_OID,
                 IndexMethod::Hash => HASH_AM_OID,
@@ -444,7 +457,7 @@ pub(crate) fn pg_class_rows(cat: &SystemCatalog) -> Vec<Vec<Value>> {
             ),
             Value::Oid(0),
             Value::Oid(0),
-            Value::Oid(BOOTSTRAP_ROLE_OID),
+            Value::Oid(owner_of(toast.table_oid)),
             Value::Oid(HEAP_AM_OID),
             Value::Oid(toast.relfilenode),
             Value::Oid(0),

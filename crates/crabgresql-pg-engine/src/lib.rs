@@ -1926,6 +1926,14 @@ impl TableEngine for PgEngine {
     }
 
     fn create_table(&self, schema: TableSchema) -> Result<Arc<dyn TableAm>, StorageError> {
+        self.create_table_owned(schema, "")
+    }
+
+    fn create_table_owned(
+        &self,
+        schema: TableSchema,
+        owner: &str,
+    ) -> Result<Arc<dyn TableAm>, StorageError> {
         // The server rejects these at bind time for the message; re-asserting them
         // here makes them invariants of the engine rather than of one caller.
         if schema.access_method.is_engine_managed() {
@@ -2007,7 +2015,7 @@ impl TableEngine for PgEngine {
         }
         let rel = self
             .catalog
-            .create(&schema)
+            .create(&schema, owner)
             .expect("relation catalog write failed");
         // A `Temporary` table is RAM-backed: register its relfilenode with the
         // storage manager so every page op routes to memory, never a file. An
@@ -2522,10 +2530,18 @@ impl TableEngine for PgEngine {
     }
 
     fn create_schema(&self, name: &str) -> Result<u32, StorageError> {
+        self.create_schema_owned(name, "")
+    }
+
+    fn create_schema_owned(&self, name: &str, owner: &str) -> Result<u32, StorageError> {
         self.catalog
-            .create_schema(name)
+            .create_schema(name, owner)
             .expect("relation catalog write failed")
             .ok_or_else(|| StorageError::SchemaAlreadyExists(name.to_string()))
+    }
+
+    fn schema_owner(&self, name: &str) -> Option<String> {
+        self.catalog.schema_owner(name)
     }
 
     fn drop_schema(&self, name: &str) -> Result<(), StorageError> {
@@ -2628,6 +2644,7 @@ impl TableEngine for PgEngine {
                     toast: t.toast_statistics(),
                     filenodes,
                     index_stats,
+                    owner: self.catalog.relation_owner(&schema.namespace, &schema.name),
                     schema,
                 }
             })
