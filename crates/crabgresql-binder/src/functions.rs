@@ -3388,9 +3388,6 @@ fn lookup(name: &str) -> &'static [Signature] {
         "_pg_numeric_scale" => info_attr_sig!(InfoSchemaTypeAttr::NumericScale, I4),
         "_pg_datetime_precision" => info_attr_sig!(InfoSchemaTypeAttr::DatetimePrecision, I4),
         "_pg_interval_type" => info_attr_sig!(InfoSchemaTypeAttr::IntervalType, TEXT),
-        // The two composite-taking helpers of the same family. `RECORD` here is
-        // any row: a whole-row reference binds to it whatever relation it came
-        // from, and the implementation reads the fields it needs by name.
         "_pg_truetypid" => &[Signature {
             func: ScalarFn::InfoSchemaTypeAttr(InfoSchemaTypeAttr::TrueTypeId),
             args: &[RECORD, RECORD],

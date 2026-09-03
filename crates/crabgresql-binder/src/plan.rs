@@ -3025,13 +3025,11 @@ static PARSED_VIEW_BODIES: std::sync::LazyLock<
 
 /// How many bodies [`PARSED_VIEW_BODIES`] keeps. A process serves a fixed
 /// handful of system views plus whatever a session creates, so this is a
-/// backstop against a generator producing endless one-off `CREATE OR REPLACE
-/// VIEW` texts, not a working-set estimate. Reaching it clears the map rather
-/// than evicting by age: nothing here tracks use, and a rebuild is one re-parse
-/// per view still in play.
+/// backstop against a generator emitting endless one-off `CREATE OR REPLACE
+/// VIEW` texts, not a working-set estimate — which is why reaching it may
+/// simply clear the map: rebuilding costs one re-parse per view still in play.
 const MAX_PARSED_VIEW_BODIES: usize = 512;
 
-/// [`crabgresql_parser::parse`] through [`PARSED_VIEW_BODIES`].
 fn parse_view_body(sql: &str) -> Result<Arc<Vec<ast::Statement>>, crabgresql_parser::ParseError> {
     let mut cache = PARSED_VIEW_BODIES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(parsed) = cache.get(sql) {
@@ -3940,8 +3938,6 @@ fn bind_table_with_joins(
             ensure_unique_qualifier(&mut seen, &rel.qualifier)?;
         }
         let right_width = right.source.width();
-        // What the right factor publishes, in this chain's layout: its own
-        // merged view when it is a parenthesised group, else the plain one.
         let right_visible = right_view(&right, left_width, catalog)?;
         // Whether the accumulated view has to be materialized even though no
         // join on *this* side merged anything: a right factor with a merged view

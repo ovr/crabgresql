@@ -590,9 +590,6 @@ fn outerize_columns(expr: &BoundExpr, level: usize) -> BoundExpr {
             ty: *ty,
             elems: elems.iter().map(|a| outerize_columns(a, level)).collect(),
         },
-        // A whole-row reference outerizes field by field, because its fields are
-        // the plain `ColumnRef`s the first arm already handles — this is the
-        // whole reason it holds expressions rather than a list of row indices.
         BoundExpr::WholeRow { names, fields } => BoundExpr::WholeRow {
             names: names.clone(),
             fields: fields.iter().map(|f| outerize_columns(f, level)).collect(),

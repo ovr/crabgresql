@@ -289,10 +289,6 @@ pub fn eval(expr: &BoundExpr, row: &[Value], ctx: &ExecContext) -> Result<Value,
                 Ok(Value::array_1d(*elem, values))
             }
         }
-        // `t.*`: the row as one composite. The field names travel with the value
-        // (see `RecordVal`) because `PgType::Record` names no row type — a
-        // function reading `atttypid` out of a `pg_attribute` row has nothing
-        // else to read it by.
         BoundExpr::WholeRow { names, fields } => {
             let values = fields
                 .iter()

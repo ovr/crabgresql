@@ -1785,8 +1785,6 @@ fn record_out(record: &RecordVal, fmt: &FmtCtx) -> String {
         if i > 0 {
             out.push(',');
         }
-        // `encode_text_with` returns `None` for NULL, which contributes the
-        // empty string unquoted.
         if let Some(text) = field.encode_text_with(fmt) {
             out.push_str(&record_field_out(&text));
         }
@@ -2290,8 +2288,6 @@ mod tests {
                 .expect("a composite is never NULL")
         };
         assert_eq!(out(vec![Value::Int4(1), Value::Text("x".into())]), "(1,x)");
-        // A NULL field contributes nothing; an empty string quotes so the two
-        // stay distinguishable.
         assert_eq!(
             out(vec![Value::Null, Value::Text(String::new())]),
             "(,\"\")"
@@ -2299,15 +2295,11 @@ mod tests {
         assert_eq!(out(vec![Value::Text("x y".into())]), "(\"x y\")");
         assert_eq!(out(vec![Value::Text("a,b".into())]), "(\"a,b\")");
         assert_eq!(out(vec![Value::Text("(p)".into())]), "(\"(p)\")");
-        // `"` and `\` are **doubled** inside the quotes — `record_out`'s rule,
-        // not `array_out`'s backslash escape. Probed on 18.4: `q"r\s` prints as
-        // `"q""r\\s"`.
         assert_eq!(
             out(vec![Value::Text("q\"r\\s".into())]),
             "(\"q\"\"r\\\\s\")"
         );
-        // Any whitespace forces quoting, not just a space: a tab would be eaten
-        // on the way back in too.
+        // Any whitespace, not just a space: a tab would be eaten on input too.
         assert_eq!(out(vec![Value::Text("a\tb".into())]), "(\"a\tb\")");
         assert_eq!(out(Vec::new()), "()");
     }

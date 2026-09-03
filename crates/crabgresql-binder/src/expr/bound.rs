@@ -1415,9 +1415,6 @@ impl BoundExpr {
                 agg_args, order_by, ..
             } => Self::agg_exprs(agg_args, order_by).all(|a| a.collect_column_refs(out)),
             BoundExpr::ArrayCtor { elems, .. } => Self::collect_all(elems, out),
-            // Every field is a `ColumnRef`, so a whole-row reference reports the
-            // columns it reads like any other node — which is what keeps
-            // projection pushdown from pruning a column only the composite uses.
             BoundExpr::WholeRow { fields, .. } => Self::collect_all(fields, out),
             BoundExpr::Subscript { base, indexes, .. } => {
                 let mut complete = base.collect_column_refs(out);

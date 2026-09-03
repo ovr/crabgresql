@@ -116,9 +116,6 @@ fn fold_children(
                 changed |= fold(elem, fmt, on_subplan);
             }
         }
-        // Folded into, but never folded *away*: a whole-row reference's fields
-        // are column references, so it is never constant, and `is_foldable`
-        // below leaves it out.
         BoundExpr::WholeRow { fields, .. } => {
             for field in fields {
                 changed |= fold(field, fmt, on_subplan);
@@ -322,8 +319,6 @@ fn eval_const(expr: &BoundExpr, fmt: &FmtCtx) -> Option<Value> {
             }
             Some(best)
         }
-        // A whole-row reference reads the row, so it is no more constant than
-        // the `ColumnRef`s it is built from.
         BoundExpr::WholeRow { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::Param { .. }

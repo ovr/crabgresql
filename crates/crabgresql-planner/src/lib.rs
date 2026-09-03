@@ -1902,8 +1902,6 @@ fn is_row_constant(expr: &BoundExpr) -> bool {
         // An outer (correlated) reference is only a `Const` after `substitute_outer`
         // rewrites it per outer row; unresolved here it must not be hoisted as a
         // once-evaluated index key.
-        // A whole-row reference reads the row, so it is never row-constant —
-        // for the same reason the `ColumnRef`s it is built from are not.
         BoundExpr::WholeRow { .. }
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::Param { .. }

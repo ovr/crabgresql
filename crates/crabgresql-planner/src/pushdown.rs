@@ -335,10 +335,6 @@ pub(crate) fn is_relocatable(expr: &BoundExpr) -> bool {
                 agg_args, order_by, ..
             } => BoundExpr::agg_exprs(agg_args, order_by).any(opaque),
             BoundExpr::ArrayCtor { elems, .. } => elems.iter().any(opaque),
-            // Transparent, because its fields are: a whole-row reference over
-            // one relation's columns relocates exactly as far as those columns
-            // do, and the field walk is what an outer reference inside it would
-            // be caught by.
             BoundExpr::WholeRow { fields, .. } => fields.iter().any(opaque),
             BoundExpr::Subscript { base, indexes, .. } => {
                 opaque(base) || indexes.iter().any(opaque)
