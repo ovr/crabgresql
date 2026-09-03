@@ -3740,6 +3740,30 @@ fn shift_visible(mut col: VisibleColumn, delta: usize) -> VisibleColumn {
     col
 }
 
+/// The visible columns a join's *right* factor contributes, laid out from `base`
+/// in the enclosing chain's combined row.
+///
+/// A parenthesised factor carries its own merged `USING`/`NATURAL` view, in
+/// which a join column appears **once**; every other factor has none and gets
+/// the plain one-`ColumnRef`-per-column layout. Going through
+/// [`default_visible`] unconditionally would republish both physical copies of
+/// an inner merged column — which `SELECT *` would show twice and
+/// [`lookup_join_column`] would call ambiguous.
+fn right_view(
+    right: &BoundFrom,
+    base: usize,
+    catalog: &Arc<dyn TypeCatalog>,
+) -> Result<Vec<VisibleColumn>, BindError> {
+    match &right.visible {
+        Some(view) => Ok(view
+            .iter()
+            .cloned()
+            .map(|col| shift_visible(col, base))
+            .collect()),
+        None => default_visible(&right.relations, base, catalog),
+    }
+}
+
 /// One FROM factor as a whole [`BoundFrom`] — a single relation for most of
 /// them, a subtree for a **parenthesised join**.
 ///
@@ -3873,7 +3897,13 @@ fn bind_table_with_joins(
     // The merged-column view over the accumulated left side, indexed into this
     // group's combined row (base 0). Materialized only once a USING/NATURAL join
     // needs it; an all-`ON`/`CROSS` chain leaves it `None` and allocates nothing.
-    let mut visible: Option<Vec<VisibleColumn>> = None;
+    //
+    // **Taken from the leading factor**, not started empty: a parenthesised
+    // group is one factor and brings its own merged view, already base-0 to its
+    // own subtree — which is base-0 to this group too, since it sits at offset
+    // 0. Starting empty would republish `(a JOIN b USING (x))`'s two physical
+    // `x` columns and make a bare `x` ambiguous.
+    let mut visible: Option<Vec<VisibleColumn>> = bound.visible.take();
 
     for join in &table.joins {
         if join.global {
@@ -3910,11 +3940,22 @@ fn bind_table_with_joins(
             ensure_unique_qualifier(&mut seen, &rel.qualifier)?;
         }
         let right_width = right.source.width();
+        // What the right factor publishes, in this chain's layout: its own
+        // merged view when it is a parenthesised group, else the plain one.
+        let right_visible = right_view(&right, left_width, catalog)?;
+        // Whether the accumulated view has to be materialized even though no
+        // join on *this* side merged anything: a right factor with a merged view
+        // of its own is a second reason the plain layout is wrong for this
+        // group, so promote the left side the way `bind_from_clause` promotes a
+        // comma group that meets one.
+        if visible.is_none() && right.visible.is_some() {
+            visible = Some(default_visible(&bound.relations, 0, catalog)?);
+        }
 
         let (kind, predicate) = match binding {
             JoinBinding::Cross => {
                 if let Some(v) = &mut visible {
-                    v.extend(default_visible(&right.relations, left_width, catalog)?);
+                    v.extend(right_visible);
                 }
                 (JoinKind::Cross, None)
             }
@@ -3926,7 +3967,7 @@ fn bind_table_with_joins(
                 let on_visible = match visible.as_ref() {
                     Some(v) => {
                         let mut ov = v.clone();
-                        ov.extend(default_visible(&right.relations, left_width, catalog)?);
+                        ov.extend(right_visible.iter().cloned());
                         Some(ov)
                     }
                     None => None,
@@ -3941,7 +3982,7 @@ fn bind_table_with_joins(
                     reject_agg_or_window(expr, "JOIN conditions")?;
                 }
                 if let Some(v) = &mut visible {
-                    v.extend(default_visible(&right.relations, left_width, catalog)?);
+                    v.extend(right_visible);
                 }
                 (kind, Some(to_bool_operand(binding, "JOIN/ON", on.span())?))
             }
@@ -3951,7 +3992,7 @@ fn bind_table_with_joins(
                     None => default_visible(&bound.relations, 0, catalog)?,
                 };
                 let (predicate, new_visible) =
-                    build_merged_join(kind, &names, &left_view, &right, left_width, catalog)?;
+                    build_merged_join(kind, &names, &left_view, right_visible, catalog)?;
                 visible = Some(new_visible);
                 (kind, predicate)
             }
@@ -3960,9 +4001,9 @@ fn bind_table_with_joins(
                     Some(view) => view,
                     None => default_visible(&bound.relations, 0, catalog)?,
                 };
-                let names = natural_join_names(&left_view, &right);
+                let names = natural_join_names(&left_view, &right_visible);
                 let (predicate, new_visible) =
-                    build_merged_join(kind, &names, &left_view, &right, left_width, catalog)?;
+                    build_merged_join(kind, &names, &left_view, right_visible, catalog)?;
                 visible = Some(new_visible);
                 (kind, predicate)
             }
@@ -4019,13 +4060,8 @@ pub(crate) fn default_visible(
 /// The columns a `NATURAL` join equates: every name present in both the
 /// accumulated left view and the right input, in left-to-right order, once
 /// each. An empty result means no common columns — a plain cross product.
-fn natural_join_names(left: &[VisibleColumn], right: &BoundFrom) -> Vec<String> {
-    let right_names: HashSet<&str> = right
-        .relations
-        .iter()
-        .flat_map(|rel| rel.declared().iter())
-        .map(|c| c.name.as_str())
-        .collect();
+fn natural_join_names(left: &[VisibleColumn], right: &[VisibleColumn]) -> Vec<String> {
+    let right_names: HashSet<&str> = right.iter().map(|c| c.name.as_str()).collect();
     let mut names: Vec<String> = Vec::new();
     for col in left {
         if right_names.contains(col.name.as_str()) && !names.iter().any(|n| n == &col.name) {
@@ -4066,11 +4102,12 @@ fn build_merged_join(
     kind: JoinKind,
     names: &[String],
     left: &[VisibleColumn],
-    right: &BoundFrom,
-    left_width: usize,
+    // Already laid out in the enclosing chain's combined row; see [`right_view`],
+    // which is what makes a *nested* group's merged column arrive here once
+    // rather than as both of its physical copies.
+    right_visible: Vec<VisibleColumn>,
     catalog: &Arc<dyn TypeCatalog>,
 ) -> Result<(Option<BoundExpr>, Vec<VisibleColumn>), BindError> {
-    let right_visible = default_visible(&right.relations, left_width, catalog)?;
     let mut predicate: Option<BoundExpr> = None;
     let mut merged_cols: Vec<VisibleColumn> = Vec::new();
 

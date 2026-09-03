@@ -32,6 +32,21 @@ SELECT a.id, b.bv, c.cv
 -- USING inside a nested group, and a nested group alongside a comma group
 SELECT a.id, d.dv FROM (pj_a a JOIN pj_d d USING (id)) ORDER BY a.id;
 SELECT count(*) FROM pj_a x, (pj_b b JOIN pj_c c ON (b.id = c.id));
+-- A nested group's merged USING column has to travel out with it: `id` appears
+-- once in `*` and resolves unqualified. Republishing both physical copies would
+-- show two `id` columns and make the bare name ambiguous.
+SELECT * FROM (pj_a a JOIN pj_b b USING (id)) ORDER BY id;
+SELECT id FROM (pj_a a JOIN pj_b b USING (id)) ORDER BY id;
+-- The same when the merged group is the *right* operand: the enclosing chain
+-- has merged nothing itself, so its own view has to be materialized to hold the
+-- inner one. `pj_a.id` and the group's merged `id` are then two columns.
+SELECT * FROM (pj_a a JOIN (pj_b b JOIN pj_c c USING (id)) ON (true))
+ ORDER BY a.id, b.id LIMIT 2;
+-- ... and on the left, where the merge is already in hand.
+SELECT * FROM ((pj_a a JOIN pj_b b USING (id)) JOIN pj_c c ON (true))
+ ORDER BY a.id, c.id LIMIT 2;
+-- NATURAL against a nested merged group matches the merged column, once.
+SELECT * FROM pj_a a NATURAL JOIN (pj_b b JOIN pj_c c USING (id)) ORDER BY id;
 -- a qualifier is unique across the whole FROM clause, parentheses or not
 SELECT 1 FROM (pj_a a JOIN pj_b a ON (true));
 -- Divergence: PostgreSQL collapses an aliased join tree into one relation named
