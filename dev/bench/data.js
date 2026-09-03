@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788478124476,
+  "lastUpdate": 1788478126509,
   "repoUrl": "https://github.com/ovr/crabgresql",
   "entries": {
     "ClickBench (parquet)": [
@@ -64660,6 +64660,42 @@ window.BENCHMARK_DATA = {
           {
             "name": "read-only",
             "value": 20066.462315,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "talk@dmtry.me",
+            "name": "Dmitry Patsura",
+            "username": "ovr"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "735e30cb45798ae5100173f71762a83c46ec0d05",
+          "message": "feat: Serve the information_schema views by running their own SQL (#290)",
+          "timestamp": "2026-09-04T00:36:55+02:00",
+          "tree_id": "6ab9c59e7b05f1f2d12c47800c02f33583c3f51f",
+          "url": "https://github.com/ovr/crabgresql/commit/735e30cb45798ae5100173f71762a83c46ec0d05"
+        },
+        "date": 1788478126375,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "tpcb-like",
+            "value": 1262.975496,
+            "unit": "tps",
+            "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
+          },
+          {
+            "name": "read-only",
+            "value": 18250.277815,
             "unit": "tps",
             "extra": "scale 10, 4 clients, 60s, shared_buffers=2GB"
           }
