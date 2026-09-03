@@ -2800,7 +2800,7 @@ struct BoundFromItem {
 ///
 /// A leftmost FROM item gets [`Preceding::none`]: nothing precedes it, so
 /// `LATERAL` on it is legal and inert.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct Preceding<'a> {
     reachable: &'a [ScopeItem],
     visible: Option<&'a [VisibleColumn]>,
@@ -3861,12 +3861,7 @@ fn bind_table_with_joins(
     // marking it lateral would leave `level: 1` references no join node can
     // fill.
     let leading = match table.joins.is_empty() {
-        true => Preceding {
-            reachable: outer.reachable,
-            visible: outer.visible,
-            out_of_reach: outer.out_of_reach,
-            right_of_outer_join: outer.right_of_outer_join,
-        },
+        true => *outer,
         false => Preceding {
             out_of_reach: &outside,
             right_of_outer_join: outer.right_of_outer_join,
@@ -6297,9 +6292,8 @@ fn classify_select_item(item: &ast::SelectItem) -> Result<SelectField<'_>, BindE
     match item {
         ast::SelectItem::Wildcard(_) => Ok(SelectField::Wildcard),
         ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. }
-            if star_of(expr).is_some() =>
+            if let Some(name) = star_of(expr) =>
         {
-            let name = star_of(expr).expect("just matched");
             Ok(SelectField::QualifiedWildcard(object_name_to_table_name(
                 name,
             )?))

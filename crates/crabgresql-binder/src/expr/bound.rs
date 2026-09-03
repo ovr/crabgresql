@@ -282,7 +282,7 @@ pub enum BoundExpr {
     /// [`crabgresql_types::RecordVal`], which is what lets a function read a
     /// field by name.
     WholeRow {
-        names: Vec<String>,
+        names: std::sync::Arc<[String]>,
         fields: Vec<BoundExpr>,
     },
     /// Array element access (`a[i]`, `a[i][j]`). `base` is an array expression

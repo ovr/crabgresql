@@ -877,7 +877,7 @@ fn whole_row_is_a_composite_in_expression_position() -> anyhow::Result<()> {
     let [BoundExpr::WholeRow { names, fields }] = args.as_slice() else {
         bail!("expected a whole-row argument, got {args:?}");
     };
-    assert_eq!(names, &["id", "big", "name", "flag"]);
+    assert_eq!(&names[..], ["id", "big", "name", "flag"]);
     assert_eq!(
         fields,
         &[

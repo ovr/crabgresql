@@ -1246,11 +1246,14 @@ impl Scope {
     /// the outer levels the way [`Scope::resolve_qualified`] does.
     pub(crate) fn whole_row(&self, qualifier: &str) -> Result<BoundExpr, BindError> {
         let columns = self.expand_qualified(qualifier)?;
-        let (names, fields) = columns
+        let (names, fields): (Vec<String>, Vec<BoundExpr>) = columns
             .into_iter()
             .map(|(col, expr)| (col.name, expr))
             .unzip();
-        Ok(BoundExpr::WholeRow { names, fields })
+        Ok(BoundExpr::WholeRow {
+            names: names.into(),
+            fields,
+        })
     }
 
     /// Append every *declared* column of `rel` as an `(output column,

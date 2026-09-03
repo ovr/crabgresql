@@ -1564,16 +1564,21 @@ pub enum Value {
 ///
 /// `names` and `fields` are positionally paired and always the same length;
 /// build one with [`RecordVal::new`] rather than by hand.
+///
+/// The names are shared rather than owned: one row shape serves every row of a
+/// scan, so a `Vec<String>` here would re-allocate `pg_attribute`'s whole name
+/// list on each of them — twice over, since `_pg_truetypid` and `_pg_truetypmod`
+/// are separate calls against the same pair of rows.
 #[derive(deepsize::DeepSizeOf, Clone, Debug, PartialEq)]
 pub struct RecordVal {
-    names: Vec<String>,
+    names: std::sync::Arc<[String]>,
     fields: Vec<Value>,
 }
 
 impl RecordVal {
     /// # Panics
     /// If `names` and `fields` differ in length.
-    pub fn new(names: Vec<String>, fields: Vec<Value>) -> RecordVal {
+    pub fn new(names: std::sync::Arc<[String]>, fields: Vec<Value>) -> RecordVal {
         assert_eq!(
             names.len(),
             fields.len(),
@@ -2278,8 +2283,8 @@ mod tests {
     #[test]
     fn a_composite_prints_the_way_record_out_does() {
         let record = |fields: Vec<Value>| {
-            let names = (0..fields.len()).map(|i| format!("f{i}")).collect();
-            Value::Record(RecordVal::new(names, fields))
+            let names: Vec<String> = (0..fields.len()).map(|i| format!("f{i}")).collect();
+            Value::Record(RecordVal::new(names.into(), fields))
         };
         let out = |fields: Vec<Value>| {
             record(fields)
@@ -2308,8 +2313,8 @@ mod tests {
     #[test]
     fn composites_compare_field_by_field() {
         let record = |fields: Vec<Value>| {
-            let names = (0..fields.len()).map(|i| format!("f{i}")).collect();
-            Value::Record(RecordVal::new(names, fields))
+            let names: Vec<String> = (0..fields.len()).map(|i| format!("f{i}")).collect();
+            Value::Record(RecordVal::new(names.into(), fields))
         };
         let cmp = |a: Vec<Value>, b: Vec<Value>| {
             crate::compare::compare_values(PgType::Record, &record(a), &record(b))
@@ -2346,7 +2351,7 @@ mod tests {
     #[test]
     fn a_composite_field_is_read_by_name() {
         let record = RecordVal::new(
-            vec!["atttypid".into(), "atttypmod".into()],
+            ["atttypid".to_string(), "atttypmod".to_string()].into(),
             vec![Value::Oid(1043), Value::Int4(14)],
         );
         assert_eq!(record.field("atttypid"), Some(&Value::Oid(1043)));
